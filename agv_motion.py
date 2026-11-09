@@ -68,7 +68,9 @@ def check_pose(i,base,poses,payload=None,pickup=None):
         if name!=pickup:
             # Fork clearance from neighbouring goods, and payload clearance.
             for part in moving[1:]+[rect(rigid(base,1.6),.8,.38)]:
-                if overlaps(part,obstacle): raise RuntimeError(f'AGV {i+1} load/forks intersect {name}')
+                if overlaps(part,obstacle):
+                    print(f'DEBUG_COLLISION agv={i+1} base={base} payload={payload} pickup={pickup} obstacle={name}:{p} part={part}',flush=True)
+                    raise RuntimeError(f'AGV {i+1} load/forks intersect {name}')
     # Conveyor rails begin at y=-3.5. Only forks/load may enter the transfer area.
     for port in LAYOUT.data['ports']['in']:
         x,y=port['infeed']
