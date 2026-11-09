@@ -58,7 +58,10 @@ def check_pose(i,base,poses,payload=None,pickup=None):
             if any(overlaps(a,b,.25) for b in peer_parts):
                 raise RuntimeError(f'Unsafe route: AGV {i+1} intersects parked AGV {peer+1}')
     for name,p in poses.items():
-        if not name.startswith('pallet_') or name==payload or p[2]>1.0: continue
+        # Pallets with z=-5 are staged off-scene until their inbound arrival.
+        # Ignore only those hidden staging poses; keep floor-level and stored pallets
+        # in the swept-envelope collision checks.
+        if not name.startswith('pallet_') or name==payload or p[2] < -1.0 or p[2]>1.0: continue
         obstacle=rect(p,.6,.5)
         # The chassis is never permitted to enter even the intended pickup load.
         if overlaps(body,obstacle): raise RuntimeError(f'AGV {i+1} chassis intersects {name}')
