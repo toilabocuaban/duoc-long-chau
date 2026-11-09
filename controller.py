@@ -18,6 +18,7 @@ from agv_traffic import Plan,compatible
 ROOT=Path(__file__).resolve().parent
 C=json.loads((ROOT/'config.json').read_text())
 INBOUND_PICKUP_SLOTS=[tuple(slot) for slot in C.get('inbound_pickup_slots', [])]
+pickup_occupancy=[None for _ in INBOUND_PICKUP_SLOTS]
 
 def inbound_pickup_position(job):
     if not INBOUND_PICKUP_SLOTS:
@@ -194,7 +195,11 @@ async def arrivals(total):
     global max_pending
     for job in range(total):
         await engine.until(job*C['inbound_interval_s'])
-        p=f'pallet_{job}';send({p:inbound_pickup_position(job)},transmit=not args.fast)
+        slot=job % len(INBOUND_PICKUP_SLOTS)
+        while pickup_occupancy[slot] is not None:
+            await engine.until(scheduler.time + 0.5)
+        p=f'pallet_{job}';pickup_occupancy[slot]=job
+        send({p:inbound_pickup_position(job)},transmit=not args.fast)
         event(job,'INBOUND_ARRIVAL');await in_queue.put(job)
         max_pending=max(max_pending,in_queue.qsize())
     for _ in range(2):await in_queue.put(None)
@@ -214,6 +219,7 @@ async def agv_worker(lane):
         await engine.move({il:(ix,iy,.3)},C['lift_speed'])
         await settled(job,il,.3)
         await follow_async(job,lane,route_to_pickup(lane,job,inbound_pickup_position(job)),pickup=p)
+        pickup_occupancy[job % len(INBOUND_PICKUP_SLOTS)]=None
         await engine.move(assembly(lane,poses[f'agv_{lane}'],.2,p),.4)
         event(job,'AGV_CARRY_TO_INBOUND',agv=lane+1)
         await follow_async(job,lane,route_to_gate(lane,ix),.2,p)
