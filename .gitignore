@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+*.log
+events.jsonl
+status.json
+test-*.json
+motion-check.json
+validation.json
+cad-route-log.json
+warehouse.sdf
+equipment-detail.sdf
+assets/*.stl

@@ -1,0 +1,8 @@
+Time-space AGV traffic revision, 2026-11-07.
+25 unit tests passed; relocated 18 inbound / 18 outbound integration passed.
+Same-lane, same-direction simultaneous movement verified: 4663 frames.
+122,840 AGV swept-pose checks; 88,012 rail checks.
+Loaded vehicles, forks, following distance, crossings and final parked turns checked.
+Acceleration/jerk limits and lift settling interlocks retained.
+Default following clearance 1m; configurable minimum 0.25m.
+Kinematic demonstration, not physical safety certification. Clean second-PC install not executed.

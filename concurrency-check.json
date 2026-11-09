@@ -1,0 +1,19 @@
+{
+  "complete": 18,
+  "inbound_stored": 18,
+  "remaining_stored": 9,
+  "jobs_requested": 18,
+  "events": 756,
+  "swept_pose_checks": 122840,
+  "rail_contact_checks": 88012,
+  "max_concurrent_motions": 6,
+  "dual_agv_motion_ticks": 52083,
+  "same_direction_following_ticks": 4663,
+  "multiple_shuttle_motion_ticks": 30264,
+  "inbound_outbound_overlap_ticks": 35590,
+  "inbound_interval_s": 15,
+  "outbound_interval_s": 15,
+  "max_pending_inbound": 15,
+  "mode": "Concurrent CAD constrained kinematic",
+  "demo_duration_s": 2361.1666666651768
+}
