@@ -219,11 +219,12 @@ async def agv_worker(lane):
         await engine.move({il:(ix,iy,.3)},C['lift_speed'])
         await settled(job,il,.3)
         await follow_async(job,lane,route_to_pickup(lane,job,inbound_pickup_position(job)),pickup=p)
-        pickup_occupancy[job % len(INBOUND_PICKUP_SLOTS)]=None
         await engine.move(assembly(lane,poses[f'agv_{lane}'],.2,p),.4)
         event(job,'AGV_CARRY_TO_INBOUND',agv=lane+1)
         await follow_async(job,lane,route_to_gate(lane,ix),.2,p)
         event(job,'AGV_HANDOVER_CHAIN',agv=lane+1)
+        # The pickup slot remains occupied until the pallet has cleared the AGV forks.
+        pickup_occupancy[job % len(INBOUND_PICKUP_SLOTS)]=None
         agv_load[lane]=None;pickups[lane]=p
         await drive_async(lane,(ix,inp['drop'][1]-.5-.12-2.4,0,math.pi/2),.2,pickup=p)
         event(job,'FORKS_CLEAR')
