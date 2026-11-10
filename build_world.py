@@ -14,52 +14,7 @@ COLORS = {'rack': '.65 .69 .72 1', 'beam': '.18 .34 .57 1', 'floor': '.48 .51 .5
 STEEL='.45 .49 .52 1'; DARK='.10 .13 .15 1'; WHITE='.80 .83 .82 1'; TEAL='.08 .32 .35 1'
 ORANGE='.95 .28 .025 1'; BLUE='.035 .24 .68 1'; CARTON='.82 .70 .43 1'
 
-def box(name, x, y, z, sx, sy, sz, color, yaw=0):
-    return f'<visual name="{name}"><pose>{x} {y} {z} 0 0 {yaw}</pose><geometry><box><size>{sx} {sy} {sz}</size></box></geometry><material><ambient>{color}</ambient><diffuse>{color}</diffuse></material></visual>'
-
-def cylinder(name,x,y,z,r,length,color,roll=0,pitch=0):
-    return f'<visual name="{name}"><pose>{x} {y} {z} {roll} {pitch} 0</pose><geometry><cylinder><radius>{r}</radius><length>{length}</length></cylinder></geometry><material><ambient>{color}</ambient><diffuse>{color}</diffuse><specular>.25 .25 .25 1</specular></material></visual>'
-
-def strut(name,a,b,width,color):
-    dx,dy,dz=[b[i]-a[i] for i in range(3)]
-    length=math.sqrt(dx*dx+dy*dy+dz*dz)
-    yaw=math.atan2(dy,dx);pitch=-math.atan2(dz,math.hypot(dx,dy))
-    v=box(name,*[(a[i]+b[i])/2 for i in range(3)],length,width,width,color)
-    return v.replace(f'0 0 0</pose>',f'0 {pitch} {yaw}</pose>')
-
-def merge_boxes(name,visuals):
-    """Batch thousands of structural members by material for responsive rendering."""
-    import xml.etree.ElementTree as ET
-    import struct
-    groups={}
-    for visual in visuals:
-        e=ET.fromstring(visual);size=e.find('geometry/box/size')
-        if size is None: raise ValueError('Box geometry required for structural batching')
-        sx,sy,sz=map(float,size.text.split());px,py,pz,r,p,y=map(float,e.find('pose').text.split())
-        cr,sr,cp,sp,cy,syaw=math.cos(r),math.sin(r),math.cos(p),math.sin(p),math.cos(y),math.sin(y)
-        points=[]
-        for xx,yy,zz in [(-1,-1,-1),(1,-1,-1),(1,1,-1),(-1,1,-1),(-1,-1,1),(1,-1,1),(1,1,1),(-1,1,1)]:
-            x0,y0,z0=xx*sx/2,yy*sy/2,zz*sz/2
-            y1,z1=cr*y0-sr*z0,sr*y0+cr*z0
-            x2,z2=cp*x0+sp*z1,-sp*x0+cp*z1
-            points.append((px+cy*x2-syaw*y1,py+syaw*x2+cy*y1,pz+z2))
-        color=e.find('material/diffuse').text
-        tris=groups.setdefault(color,[])
-        for f in [(0,2,1),(0,3,2),(4,5,6),(4,6,7),(0,1,5),(0,5,4),(1,2,6),(1,6,5),(2,3,7),(2,7,6),(3,0,4),(3,4,7)]:
-            tris.append([points[i] for i in f])
-    result=[]
-    batches=[(color,tris[a:a+16000]) for color,tris in groups.items() for a in range(0,len(tris),16000)]
-    for i,(color,tris) in enumerate(batches):
-        path=ROOT/'assets'/f'{name}_{i}.stl';path.parent.mkdir(exist_ok=True)
-        with path.open('wb') as f:
-            f.write(b'Warehouse structural members'.ljust(80,b'\0'));f.write(struct.pack('<I',len(tris)))
-            for a,b,c in tris:
-                u=[b[j]-a[j] for j in range(3)];v=[c[j]-a[j] for j in range(3)]
-                n=[u[1]*v[2]-u[2]*v[1],u[2]*v[0]-u[0]*v[2],u[0]*v[1]-u[1]*v[0]]
-                norm=math.sqrt(sum(x*x for x in n));n=[x/norm for x in n]
-                f.write(struct.pack('<12fH',*n,*a,*b,*c,0))
-        result.append(f'<visual name="{name}_{i}"><geometry><mesh><uri>{escape(str(path))}</uri></mesh></geometry><material><ambient>{color}</ambient><diffuse>{color}</diffuse><specular>.35 .35 .35 1</specular></material></visual>')
-    return result
+from sdf_parts import box, cylinder, strut, merge_boxes
 
 EQ.BATCH_BOXES=merge_boxes
 
@@ -99,7 +54,7 @@ def lift_cabin(axis='y'):
     return EQ.cabin(box,cylinder,lambda prefix: EQ.chain_conveyor(box,cylinder,1.8,1.6,axis,legs=False)+
         [box(f'{prefix}rail{dx}',dx,0,RAIL_TOP_OFFSET-RAIL_HEIGHT/2,.10,1.8,RAIL_HEIGHT,STEEL) for dx in [-.48,.48]])
 
-def pallet(name, xyz):
+def pallet_deck():
     v=[]
     # Moulded plastic lattice deck with fork pockets and nine support blocks.
     for a in range(9): v.append(box(f'deckrib{a}',0,(a-4)*.115,.13,1.2,.085,.04,BLUE))
@@ -108,6 +63,10 @@ def pallet(name, xyz):
     for a in [-.48,.48]: v.append(box(f'rimy{a}',0,a,.125,1.2,.04,.05,BLUE))
     for a in [-.51,0,.51]:
         for b in [-.4,0,.4]: v.append(box(f'foot{a}_{b}',a,b,.055,.16,.12,.11,BLUE))
+    return v
+
+def pallet(name, xyz):
+    v=pallet_deck()
     for a in range(3):
         for b in range(2):
             for c in range(3):
@@ -120,32 +79,45 @@ def pallet(name, xyz):
     for x in [-.33,.33]:
         v.append(box(f'wrapfront{x}',x,-.49,.925,.018,.005,1.55,'.92 .89 .74 1'))
         v.append(box(f'wraptop{x}',x,0,1.702,.018,.98,.004,'.92 .89 .74 1'))
-    model(name,xyz,v)
+    # All pallets are identical: batch the 134 boxes into one shared mesh per colour
+    # (a few draw calls per pallet instead of 134), generated once and reused.
+    global PALLET_MESH
+    if PALLET_MESH is None: PALLET_MESH=merge_boxes('pallet_mesh',v)
+    model(name,xyz,PALLET_MESH)
 
-v=[box('ground',7,15,-.12,100,82,.2,COLORS['floor'])]
-for x in range(-40,57,4): v.append(box(f'jointx{x}',x,15,-.015,.012,80,.004,'.38 .41 .42 1'))
-for y in range(-24,57,4): v.append(box(f'jointy{y}',7,y,-.015,98,.012,.004,'.38 .41 .42 1'))
-for y in [-12,-6.5]: v.append(box(f'aisle{y}',5,y,.002,88,.10,.008,'.86 .70 .19 1'))
-for j in range(C['jobs']):
-    x,y=pickup_position(j)[:2]
-    for dx in [-1.05,1.05]: v.append(box(f'bay{j}_{dx}',x+dx,y,.005,.06,2.2,.01,'.85 .86 .82 1'))
-    v.append(box(f'bayend{j}',x,y-1.1,.005,2.1,.06,.01,'.85 .86 .82 1'))
-for x in [-38,-33]:
-    for dx in [-1.2,1.2]: v.append(box(f'park{x}_{dx}',x+dx,-4.7,.005,.06,2.5,.01,'.16 .42 .35 1'))
+PALLET_MESH=None
+
+v=[box('ground',1,15,-.12,114,82,.2,COLORS['floor'])]   # covers the 4-floor building (x -51.9) and the 4-way store
+for x in range(-56,57,4): v.append(box(f'jointx{x}',x,15,-.015,.012,80,.004,'.38 .41 .42 1'))
+for y in range(-24,57,4): v.append(box(f'jointy{y}',1,y,-.015,112,.012,.004,'.38 .41 .42 1'))
+# Inbound AGV lanes on floor 1 (4-floor building) continuing into the 4-way store; pallet spots are drawn by the 4-floor scene.
+from agv_motion import LOAD_Y, RETURN_Y
+for y in (LOAD_Y, RETURN_Y): v.append(box(f'aisle{y}',3,y,.004,74,.10,.008,'.86 .70 .19 1'))
+for x,y,_,_ in PARKS:
+    for dx in [-.7,.7]: v.append(box(f'park{x}_{dx}',x+dx,y,.005,.06,1.9,.01,'.16 .42 .35 1'))
+    for dy in [-.95,.95]: v.append(box(f'parkend{x}_{dy}',x,y+dy,.005,1.46,.06,.01,'.16 .42 .35 1'))
 v.extend([box('back_wall',26,51,10,54,.18,20,'.64 .67 .69 1'),box('right_wall',53,25,10,.18,52,20,'.59 .63 .65 1')])
 for x in range(0,54,6): v.append(box(f'building_column{x}',x,50.8,10,.25,.3,20,'.35 .39 .42 1'))
 model('site',(0,0,0),v)
-v=[]
-for x in [-40,0]:
-    for y in [0,16,32,50]:
-        v.append(box(f'col{x}_{y}',x,y,10,.35,.35,20,COLORS['rack']))
-for k,z in enumerate(C['output_levels']):
-    for x in [-40,0]: v.append(box(f'edge{k}_{x}',x,25,z-.1,.22,50,.2,'.45 .55 .65 1'))
-    for y in [0,16,32,50]: v.append(box(f'cross{k}_{y}',-20,y,z-.1,40,.22,.2,'.45 .55 .65 1'))
-    # Open floor strips preserve a view into all four levels.
-    v.append(box(f'floor{k}',-3,25,z-.12,6,50,.15,'.3 .4 .5 1'))
-    v.append(box(f'outlanding{k}',-8.5,34,z-.12,17,18,.15,'.40 .44 .46 1'))
-model('four_floor_zone',(0,0,0),v)
+# 4-floor picking building west of the store (CAD, four_floor_scene.py); replaces the old placeholder zone.
+import four_floor_scene
+import loose_goods
+_spots=C.get('loose_pallet_spots',[])
+if _spots: four_floor_scene.ANIMATED_WORKER_AREAS={'carton_inbound'}
+parts.extend(four_floor_scene.models())
+# Floor-1 loose goods: one pallet deck per unpack spot, one model per carton of the demo (start hidden)
+# and the two unpacking operators as four animated parts each (torso+head, arms, left / right leg).
+if _spots:
+    _part_mesh={p:merge_boxes(f'op_{p}',[box(f'{p}{k}',*b) for k,b in enumerate(bs)]) for p,bs in loose_goods.WORKER_PARTS.items()}
+    for i,op in enumerate(loose_goods.OPERATORS):
+        for name,pose in loose_goods.operator_pose(i,*loose_goods.station(op)).items():
+            model(name,(pose[0],pose[1],pose[2],pose[5]),_part_mesh[name.split('_',1)[1]])
+    _deck=merge_boxes('loose_deck',pallet_deck())
+    for s,(x,y,yaw) in enumerate(_spots): model(f'loose_pallet_{s}',(x,y,-5,yaw),_deck)
+    cl,cw,ch=loose_goods.CARTON
+    _carton=merge_boxes('loose_carton',[box('c',0,0,0,cl,cw,ch-.004,CARTON),box('t',0,0,ch/2-.003,.06,cw+.002,.006,'.9 .8 .57 1')])
+    for i in range(int(C.get('loose_pallets',0))*int(C.get('loose_cartons_per_pallet',0))):
+        model(f'carton_{i}',(_spots[0][0],_spots[0][1],-5),_carton)
 from cad_scene import build_cad_scene
 stock_count=build_cad_scene(C,box,strut,merge_boxes,model)
 print(f'CAD slots per level: {len(LAYOUT.slots)}; illustrative stock: {stock_count}')
@@ -198,7 +170,7 @@ header='''<?xml version="1.0"?><sdf version="1.9"><world name="warehouse">
 <plugin filename="gz-sim-scene-broadcaster-system" name="gz::sim::systems::SceneBroadcaster"/>
 <scene><ambient>.5 .5 .5 1</ambient><background>.72 .76 .80 1</background><shadows>false</shadows></scene>
 <light name="sun" type="directional"><pose>0 0 30 0 0 0</pose><diffuse>.9 .9 .9 1</diffuse><direction>-.3 .2 -1</direction><cast_shadows>false</cast_shadows></light>
-<gui fullscreen="false"><plugin filename="MinimalScene" name="3D View"><gz-gui><title>Warehouse V1</title><property type="bool" key="showTitleBar">false</property><property type="string" key="state">docked</property></gz-gui><engine>ogre</engine><scene>scene</scene><ambient_light>.5 .5 .5</ambient_light><background_color>.72 .76 .80</background_color><camera_pose>40 -45 35 0 .52 2.1</camera_pose></plugin><plugin filename="GzSceneManager" name="Scene Manager"/><plugin filename="CameraTracking" name="Camera Tracking"/><plugin filename="InteractiveViewControl" name="View control"/><plugin filename="EntityContextMenuPlugin" name="Entity menu"/><plugin filename="WorldControl" name="World control"/><plugin filename="WorldStats" name="World stats"/><plugin filename="Screenshot" name="Screenshot"/><plugin filename="EntityTree" name="Entity tree"/></gui>
+<gui fullscreen="false"><plugin filename="MinimalScene" name="3D View"><gz-gui><title>Warehouse V1</title><property type="bool" key="showTitleBar">false</property><property type="string" key="state">docked</property></gz-gui><engine>ogre</engine><scene>scene</scene><ambient_light>.5 .5 .5</ambient_light><background_color>.72 .76 .80</background_color><camera_pose>8 -50 45 0 .53 1.76</camera_pose></plugin><plugin filename="GzSceneManager" name="Scene Manager"/><plugin filename="CameraTracking" name="Camera Tracking"/><plugin filename="InteractiveViewControl" name="View control"/><plugin filename="EntityContextMenuPlugin" name="Entity menu"/><plugin filename="WorldControl" name="World control"/><plugin filename="WorldStats" name="World stats"/><plugin filename="Screenshot" name="Screenshot"/><plugin filename="EntityTree" name="Entity tree"/></gui>
 '''
 (ROOT/'warehouse.sdf').write_text(header+''.join(parts)+'</world></sdf>')
 print(f'Generated warehouse.sdf: {len(parts)} models')

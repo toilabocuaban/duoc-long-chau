@@ -12,9 +12,9 @@
                        ],
     "output_levels":  [
                           0,
-                          5,
-                          10,
-                          15
+                          4.5,
+                          9,
+                          13.5
                       ],
     "warehouse_size":  [
                            52.6,
@@ -26,39 +26,39 @@
                         1.0,
                         1.7
                     ],
-    "speed_multiplier":  1,
-    "agv_speed":  2,
-    "lift_speed":  0.6,
-    "shuttle_speed":  1,
-    "jobs":  18,
+    "speed_multiplier":  10,
+    "agv_speed":  1.5,
+    "lift_speed":  1,
+    "shuttle_speed":  1.5,
+    "jobs":  100,
     "note":  "CAD constrained prototype. Slots, frames, shared grating, columns and port axes from DWG; process demo uses front-access slots. Not a throughput or contact-dynamics validation.",
     "layout_source":  "design_layout.json",
-    "inbound_interval_s":  100,
-    "outbound_interval_s":  100,
+    "inbound_interval_s":  180,
+    "outbound_interval_s":  180,
     "inbound_pickup_slots":  [
                                  [
-                                     -36,
-                                     -17,
+                                     -33.485,
+                                     -2.765,
                                      0,
-                                     -3.1415926535897931
+                                     1.5707963268
                                  ],
                                  [
-                                     -32,
-                                     -17,
+                                     -32.44,
+                                     -2.765,
                                      0,
-                                     -3.1415926535897931
+                                     1.5707963268
                                  ],
                                  [
-                                     -28,
-                                     -17,
+                                     -31.395,
+                                     -2.765,
                                      0,
-                                     -3.1415926535897931
+                                     1.5707963268
                                  ],
                                  [
-                                     -24,
-                                     -17,
+                                     -30.335,
+                                     -2.765,
                                      0,
-                                     -3.1415926535897931
+                                     1.5707963268
                                  ]
                              ],
     "initial_outbound_pallets":  4,
@@ -75,15 +75,29 @@
     "conveyor_acceleration":  0.25,
     "conveyor_jerk":  0.5,
     "lift_settle_s":  1,
-    "lift_position_tolerance_m":  0.002,
     "agv_following_gap_m":  1,
-    "shuttle_positioning_s":  5,
-    "shuttle_turn_s":  5,
+    "shuttle_positioning_s":  1,
+    "shuttle_turn_s":  1,
     "shuttle_lift_s":  2.5,
     "shuttle_availability":  0.7,
     "shuttle_utilization":  0.7,
-    "lift_positioning_s":  2,
-    "lift_transfer_s":  9.5,
     "lift_availability":  0.8,
-    "lift_utilization":  0.8
+    "lift_utilization":  0.8,
+    "loose_pallet_spots":  [
+                               [
+                                   -10.7,
+                                   -2.2,
+                                   0
+                               ],
+                               [
+                                   -4.7,
+                                   -2.2,
+                                   0
+                               ]
+                           ],
+    "loose_pallet_interval_s":  240,
+    "loose_pallets":  4,
+    "loose_cartons_per_pallet":  18,
+    "loose_unpack_s":  6,
+    "carton_conveyor_speed":  0.5
 }

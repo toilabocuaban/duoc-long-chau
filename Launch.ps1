@@ -1,5 +1,5 @@
 param(
-    [ValidateSet('Run','Inspect','View','Test')][string]$Mode='Run',
+    [ValidateSet('Run','Inspect','View','Test','FourFloor')][string]$Mode='Run',
     [string]$View='rack',
     [switch]$SoftwareRendering
 )
@@ -16,7 +16,7 @@ try {
     } elseif ($Mode -eq 'Test') {
         & wsl.exe -d $distro -u gazebo -- bash "$linuxRoot/test.sh"
     } else {
-        $script=if ($Mode -eq 'Inspect') {'inspect-equipment.sh'} else {'run.sh'}
+        $script=if ($Mode -eq 'Inspect') {'inspect-equipment.sh'} elseif ($Mode -eq 'FourFloor') {'four-floor.sh'} else {'run.sh'}
         $software=if ($SoftwareRendering) {'1'} else {'0'}
         & wsl.exe -d $distro -u gazebo -- env "WAREHOUSE_SOFTWARE_RENDERING=$software" bash "$linuxRoot/$script"
     }

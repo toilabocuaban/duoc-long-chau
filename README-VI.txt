@@ -102,22 +102,31 @@ DIEU PHOI DONG THOI (ban moi)
   Hoac sua inbound_interval_s / outbound_interval_s trong config.json.
 - Ban demo phat sinh 18 pallet nhap va 18 yeu cau xuat; co 9 pallet dong
   san trong kho de xuat ngay, sau do xuat cac pallet da nhap theo thu tu.
-  Sau demo con 9 pallet trong kho. Toc do chuyen dong van theo speed_multiplier.
+  Sau demo con 9 pallet trong kho.
 - Nhip yeu cau khong phai nang suat thuc te. Chong lan khong bo qua buffer
   mot pallet, thang chuyen nhap/xuat, khoang ho cang va khung rack/cot.
 
 CHUYEN DONG EM VA DIEU PHOI DUONG (ban hieu chinh)
 - Bo khoa toan tuyen AGV. Dat cho rieng tung doan theo vung quet ca than,
   cang va hang; tuyen lay hang y=-12, mang hang y=-9, ve bai y=-7.
-- Profile quintic tang toc/ham dung, van toc va gia toc ve 0 o hai dau.
-  Gioi han gia toc (m/s2): agv_acceleration=0.5; lift_acceleration=0.4;
+- Profile S-curve 7 doan (jerk+, gia toc deu, jerk-, chay deu, jerk-, giam toc
+  deu, jerk+). Quang duong dai chay deu dung toc do cau hinh (agv_speed,
+  lift_speed, shuttle_speed); quang ngan tu bo doan chay deu/gia toc deu de
+  khong vuot gioi han. Van toc va gia toc ve 0 o hai dau.
+- Shuttle: dung shuttle_positioning_s de dinh vi truoc moi lan nang/ha mam,
+  nang/ha mam trong shuttle_lift_s, doi bo banh X/Y tai moi lan doi huong
+  trong shuttle_turn_s.
+- *_availability / *_utilization la thong so nang suat, chua dung trong chuyen dong.
+  Gioi han gia toc (m/s2): agv_acceleration=0.5; lift_acceleration=0.3;
   shuttle_acceleration=0.6; conveyor_acceleration=0.25.
 - Gioi han jerk (m/s3): agv_jerk=1; lift_jerk=0.8; shuttle_jerk=1.2;
   conveyor_jerk=0.5. Quay AGV co gioi han toc do/gia toc/jerk rieng.
-- Bang tai conveyor_speed=0.3 m/s. He so speed_multiplier mac dinh 1.
-  Neu tang he so k: toc do hien thi nhan k, gia toc nhan k^2, jerk nhan k^3.
-- Thang den dung cao do, dung han va giu lift_settle_s=1 giay, kiem tra
-  sai so lift_position_tolerance_m=0.002m, sau do moi chuyen hang.
+- Bang tai conveyor_speed=0.3 m/s.
+- speed_multiplier = he so tua nhanh, AP DUNG CHO TAT CA: dong ho mo phong chay
+  nhanh k lan thoi gian thuc. Moi thong so giu gia tri that (toc do, gia toc,
+  jerk, thoi gian dung, tan suat hang vao / yeu cau xuat); k = 1 la thoi gian thuc.
+- Thang den dung cao do, dung han va giu lift_settle_s=1 giay, sau do moi
+  chuyen hang.
 - Mo 12-Configure-Flow.cmd de chinh tan suat va mot so thong so chuyen dong;
   cac gioi han khac nam trong config.json. Luu va khoi dong lai de ap dung.
 - Day la profile chuyen dong va interlock mo phong dong hoc; chua co dao

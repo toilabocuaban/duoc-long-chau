@@ -21,9 +21,13 @@ with (root/'test-server.log').open('w') as log:
         assert result_data.get('multiple_shuttle_motion_ticks',0)>0,result_data
         events=[json.loads(line) for line in (root/'events.jsonl').read_text().splitlines()]
         config=json.loads((root/'config.json').read_text())
-        def stamp(job,state):return next(e['demo_time_s'] for e in events if e['job']==job and e['state']==state)
-        assert stamp(1,'ALIGN_DEPARTURE')<stamp(0,'AGV_HANDOVER_CHAIN')
-        assert stamp(1,'AGV_CARRY_TO_INBOUND')<stamp(0,'AGV_RETURN_COMPLETE')
+        def stamp(job,*states):return next(e['demo_time_s'] for e in events if e['job']==job and e['state'] in states)
+        # An AGV either leaves its parking box or is redispatched on the return lane.
+        assert stamp(1,'ALIGN_DEPARTURE','TURN_TOWARDS_PICKUP')<stamp(0,'AGV_HANDOVER_CHAIN')
+        assert stamp(1,'AGV_CARRY_TO_INBOUND')<stamp(0,'AGV_RETURN_COMPLETE','AGV_REDISPATCH')
+        # Every inbound job must release its AGV one way or the other.
+        released=[e['job'] for e in events if e['state'] in ('AGV_RETURN_COMPLETE','AGV_REDISPATCH')]
+        assert sorted(released)==list(range(18)),released
         ready={}
         for e in events:
             if e['state']=='LIFT_READY':
@@ -40,6 +44,10 @@ with (root/'test-server.log').open('w') as log:
             assert len(stamps)==18,(state,stamps)
             assert all(abs((b-a)-config[key])<.04 for a,b in zip(stamps,stamps[1:])),(state,stamps)
         assert result_data.get('max_concurrent_motions',0)>=2,result_data
+        n_loose=config.get('loose_pallets',0)*config.get('loose_cartons_per_pallet',0) if config.get('loose_pallet_spots') else 0
+        assert result_data.get('loose_cartons_delivered',0)==n_loose,result_data
+        if n_loose>=len(config['output_levels']):   # cartons reach every floor of the 4-floor building
+            assert len(result_data['loose_cartons_per_floor'])==len(config['output_levels']),result_data
         assert result_data.get('inbound_outbound_overlap_ticks',0)>0,result_data
         (root/'verified-result.json').write_text(json.dumps(result_data,indent=2))
         print(json.dumps(result_data))

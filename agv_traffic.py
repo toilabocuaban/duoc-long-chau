@@ -11,8 +11,9 @@ class Plan:
     began:float
     duration:float
     loaded:bool=False
+    shape:object=None  # normalised motion law of the leg (S-curve from the controller)
     def at(self,time):
-        q=blend((time-self.began)/self.duration)
+        q=(self.shape or blend)((time-self.began)/self.duration)
         return tuple(a+(b-a)*q for a,b in zip(self.start,self.end))
 
 def compatible(candidate,peer,now,following_gap=1.0):

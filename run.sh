@@ -4,7 +4,7 @@ cd "$(dirname "$(readlink -f "$0")")"
 source ./graphics.sh
 export GZ_SIM_RESOURCE_PATH="$PWD:${GZ_SIM_RESOURCE_PATH:-}"
 export GZ_PARTITION=warehouse_v1
-if [[ ! -s warehouse.sdf || config.json -nt warehouse.sdf || build_world.py -nt warehouse.sdf || cad_scene.py -nt warehouse.sdf || equipment_visuals.py -nt warehouse.sdf ]]; then
+if [[ ! -s warehouse.sdf || config.json -nt warehouse.sdf || build_world.py -nt warehouse.sdf || cad_scene.py -nt warehouse.sdf || equipment_visuals.py -nt warehouse.sdf || four_floor_scene.py -nt warehouse.sdf || four_floor_layout.json -nt warehouse.sdf || sdf_parts.py -nt warehouse.sdf || loose_goods.py -nt warehouse.sdf ]]; then
     echo 'Building warehouse model...'
     python3 build_world.py
 else
@@ -12,7 +12,17 @@ else
 fi
 gz sim -r --render-engine ogre warehouse.sdf > gazebo.log 2>&1 &
 sim_pid=$!
-trap 'kill "$sim_pid" 2>/dev/null || true' EXIT
+ctl_pid=''
+trap 'kill "$sim_pid" ${ctl_pid:+"$ctl_pid"} 2>/dev/null || true' EXIT
 python3 wait_gui.py
-python3 controller.py | tee controller.log
-wait "$sim_pid"
+python3 controller.py > >(tee controller.log) 2>&1 &
+ctl_pid=$!
+# Closing the Gazebo window must also end this session's controller; otherwise it keeps running and
+# attaches to the next window opened on the same partition (two controllers driving one world).
+while kill -0 "$sim_pid" 2>/dev/null && kill -0 "$ctl_pid" 2>/dev/null; do sleep 1; done
+if ! kill -0 "$sim_pid" 2>/dev/null; then
+    kill "$ctl_pid" 2>/dev/null || true
+    echo 'Gazebo window closed: controller stopped.'
+fi
+wait "$ctl_pid" 2>/dev/null || true
+wait "$sim_pid" 2>/dev/null || true

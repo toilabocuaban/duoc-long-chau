@@ -1,0 +1,427 @@
+"""4-floor picking building (west of the 4-way store) built from four_floor_layout.json.
+
+Floors 2-4 repeat the floor-1 CAD plan, except items that exist on floor 1 only (agreed):
+the loose-goods area with the carton inbound gate (incline 'Bang tai tang 1', carton belt,
+weighing / barcode / profile check, 2 operators) and the full-case palletising area (4 pallet spots,
+1 operator). Floor elevations come from config.json output_levels (4.5 m: the spirals rise
+H=0.6 m -> 5.1 m, i.e. they arrive at belt height 0.6 m on the next floor).
+
+Spiral conveyors (CAD): In on the left tangent (x = centre - 1.3) fed through a 90-degree curve from
+the cross belt *U752 (y ~ 5.06); Out on the right tangent (x = centre + 1.3) into *U748 and the
+sorting belts. Spiral k->k+1 has its In on floor k and its Out on floor k+1, so each floor only gets
+the connections that really exist there. On floors 2-4 the cross belt *U752 takes part of the Out
+flow of the spiral arriving from below (roller transfer at the crossing) to the next spiral's In.
+
+Static content is batched into shared meshes. AGVs, carried racks and F4s are batched too for the
+layout review; build with --movable to make them individual models for the process step.
+
+Dimensions
+* Hikrobot Q3-600D latent AGV : 950 x 650 x 250 mm, lift platform 850 x 600 mm (datasheet).
+* Hikrobot F4-1000 forklift    : 1672 x 990 x 1915 mm, forks 1200 x 180 x 65 mm, outer width 680 mm.
+* Rack 1200 x 800 x 1700 mm, 4 shelves x 2 plastic trays 580 x 415 x 260 mm (8 trays / rack).
+Assumptions not drawn in the 2D CAD are marked "ASSUMPTION".
+"""
+import json
+import math
+import sys
+from pathlib import Path
+from sdf_parts import box, merge_boxes
+
+MOVABLE = '--movable' in sys.argv
+ROOT = Path(__file__).resolve().parent
+C = json.loads((ROOT / 'config.json').read_text())
+L = json.loads((ROOT / 'four_floor_layout.json').read_text(encoding='utf-8'))
+LEVELS = C['output_levels']                  # floor elevations (m)
+FLOOR_H = LEVELS[1] - LEVELS[0]
+BELT_Z = .6                                  # CAD: "Bang tai Belt H=0.6m"
+SPIRAL_TANGENT = 1.3                         # In/Out tangents at centre -/+ 1.3 m (CAD)
+CURVE_R = .96                                # 90-degree In curve, centreline radius (CAD)
+CURVE_W = .77
+FEEDER_Y = (4.5, 5.6)                        # *U752 cross-belt band (CAD y 4.674 .. 5.445)
+SPIRAL_TURNS = 4.5                           # ASSUMPTION: 1.0 m pitch over the 4.5 m rise
+
+CONCRETE = '.62 .63 .64 1'; WALL = '.20 .22 .26 1'; DOOR = '.25 .45 .75 1'; FIXTURE = '.52 .55 .58 1'
+ROUTE = '.98 .62 .05 1'; TAPE_Y = '.95 .80 .05 1'; TAPE_G = '.10 .70 .20 1'
+RACK_POST = '.28 .31 .35 1'; RACK_BEAM = '.93 .45 .10 1'; TRAY = '.05 .30 .78 1'; CARTON = '.82 .68 .44 1'
+AGV_BODY = '.95 .45 .08 1'; AGV_TOP = '.12 .13 .15 1'; AGV_PLATE = '.30 .32 .35 1'
+F4_BODY = '.66 .68 .70 1'; F4_DARK = '.14 .15 .17 1'; F4_FORK = '.36 .37 .40 1'
+SHIRT = '.10 .38 .72 1'; PANTS = '.15 .16 .20 1'; SKIN = '.86 .67 .52 1'; HAIR = '.10 .08 .07 1'
+DESK = '.20 .40 .75 1'; DESK_TOP = '.86 .88 .90 1'; BIN = '.10 .48 .88 1'; SCREEN = '.06 .07 .09 1'
+FRAME = '.55 .58 .61 1'; BELT = '.13 .13 .14 1'; ROLLER = '.78 .80 .82 1'; LEG = '.42 .45 .48 1'; RED = '.85 .12 .10 1'
+SLAB = '.80 .82 .84'
+
+_n = [0]
+def nm(p):
+    _n[0] += 1
+    return f'{p}{_n[0]}'
+
+def cx(r): return (r[0] + r[2]) / 2
+def cy(r): return (r[1] + r[3]) / 2
+
+def place(parts, x, y, yaw, z=0.):
+    c, s = math.cos(yaw), math.sin(yaw)
+    return [box(nm('p'), x + px * c - py * s, y + px * s + py * c, z + pz, sx, sy, sz, col, yaw + pyaw)
+            for px, py, pz, sx, sy, sz, col, pyaw in parts]
+
+def rect_box(r, z0, z1, col, inset=0.):
+    return box(nm('r'), cx(r), cy(r), (z0 + z1) / 2, max(.005, r[2] - r[0] - 2 * inset), max(.005, r[3] - r[1] - 2 * inset), z1 - z0, col)
+
+def line_box(s, w, h, col, z0=0.):
+    x0, y0, x1, y1 = s; ln = math.hypot(x1 - x0, y1 - y0)
+    return box(nm('l'), (x0 + x1) / 2, (y0 + y1) / 2, z0 + h / 2, ln + w, w, h, col, math.atan2(y1 - y0, x1 - x0))
+
+def tilted(x, y, z, sx, sy, sz, col, yaw, pitch):
+    return box(nm('t'), x, y, z, sx, sy, sz, col, yaw).replace(f'0 0 {yaw}</pose>', f'0 {pitch} {yaw}</pose>')
+
+# ---------------------------------------------------------------- part libraries (local frames)
+def rack_parts():
+    p = []
+    for sx in (-1, 1):
+        for sy in (-1, 1): p.append((sx * .58, sy * .38, .85, .04, .04, 1.7, RACK_POST, 0))
+    for z in (.40, .74, 1.08, 1.42):
+        for sy in (-1, 1): p.append((0, sy * .38, z - .025, 1.2, .04, .05, RACK_BEAM, 0))
+        p.append((0, 0, z - .0075, 1.16, .76, .015, RACK_POST, 0))
+        for tx in (-.295, .295):
+            p.append((tx, 0, z + .13, .58, .415, .26, TRAY, 0))
+            p.append((tx, 0, z + .264, .52, .36, .008, CARTON, 0))
+    for sy in (-1, 1): p.append((0, sy * .38, 1.675, 1.2, .04, .05, RACK_BEAM, 0))
+    return p
+
+def agv_parts():
+    return [(0, 0, .0975, .95, .65, .145, AGV_BODY, 0), (0, 0, .2075, .95, .65, .075, AGV_TOP, 0),
+            (0, 0, .25, .85, .60, .01, AGV_PLATE, 0), (.476, 0, .11, .01, .32, .04, AGV_TOP, 0),
+            (-.476, 0, .11, .01, .32, .04, AGV_TOP, 0)]
+
+def f4_parts():   # origin at the body/fork junction, forks along +x
+    return [(-.236, 0, .60, .472, .99, 1.20, F4_BODY, 0), (-.236, 0, 1.25, .40, .90, .10, F4_DARK, 0),
+            (-.236, 0, 1.0, .48, 1.0, .06, AGV_BODY, 0),
+            (.03, -.30, .9575, .08, .08, 1.915, F4_DARK, 0), (.03, .30, .9575, .08, .08, 1.915, F4_DARK, 0),
+            (.03, 0, 1.88, .08, .68, .07, F4_DARK, 0), (.06, 0, .40, .05, .68, .60, F4_DARK, 0),
+            (.66, -.25, .1135, 1.2, .18, .065, F4_FORK, 0), (.66, .25, .1135, 1.2, .18, .065, F4_FORK, 0),
+            (-.30, .42, 1.35, .05, .18, .14, SCREEN, 0)]
+
+def person_parts():  # ~1.68 m operator facing +x
+    return [(0, -.09, .43, .13, .14, .86, PANTS, 0), (0, .09, .43, .13, .14, .86, PANTS, 0),
+            (0, 0, 1.16, .24, .42, .62, SHIRT, 0), (.02, -.25, 1.15, .10, .09, .56, SHIRT, 0),
+            (.02, .25, 1.15, .10, .09, .56, SHIRT, 0), (.01, 0, 1.585, .20, .18, .22, SKIN, 0),
+            (-.02, 0, 1.70, .21, .19, .05, HAIR, 0)]
+
+# ---------------------------------------------------------------- conveyors (top of belt / rollers = 0.6 m)
+def belt(r, axis, z0=0., legs=True):
+    v = [rect_box(r, z0 + BELT_Z - .12, z0 + BELT_Z - .005, FRAME), rect_box(r, z0 + BELT_Z - .005, z0 + BELT_Z, BELT, .03)]
+    if legs:
+        ln = (r[2] - r[0]) if axis == 'x' else (r[3] - r[1]); n = max(2, math.ceil(ln / 2) + 1)
+        for k in range(n):
+            t = min(.1, ln / 4) + (ln - 2 * min(.1, ln / 4)) * k / (n - 1)
+            for side in (0, 1):
+                if axis == 'x': x, y = r[0] + t, (r[1] + .05 if side == 0 else r[3] - .05)
+                else: x, y = (r[0] + .05 if side == 0 else r[2] - .05), r[1] + t
+                v.append(box(nm('lg'), x, y, z0 + (BELT_Z - .12) / 2, .05, .05, BELT_Z - .12, LEG))
+    return v
+
+def roller_module(t, flow_axis, z0=0.):
+    """Right-angle roller transfer module, rollers flush with the belt top (0.6 m)."""
+    v = [rect_box(t, z0 + BELT_Z - .12, z0 + BELT_Z - .045, FRAME), box(nm('rl'), cx(t), cy(t), z0 + (BELT_Z - .12) / 2, .08, .08, BELT_Z - .12, LEG)]
+    ln = (t[2] - t[0]) if flow_axis == 'x' else (t[3] - t[1]); wd = (t[3] - t[1]) if flow_axis == 'x' else (t[2] - t[0])
+    n = max(3, int(ln / .075))
+    for k in range(n):
+        u = (k + .5) / n * ln
+        x, y = (t[0] + u, cy(t)) if flow_axis == 'x' else (cx(t), t[1] + u)
+        sx, sy = (.045, wd - .04) if flow_axis == 'x' else (wd - .04, .045)
+        v.append(box(nm('ro'), x, y, z0 + BELT_Z - .0225, sx, sy, .045, ROLLER))
+    return v
+
+def overlap(a, b):
+    return max(0., min(a[2], b[2]) - max(a[0], b[0])) * max(0., min(a[3], b[3]) - max(a[1], b[1]))
+
+def conveyor_set(belts, transfers, z0=0.):
+    """Belts are cut where a roller module sits so the two never overlap; modules take the belt's flow axis."""
+    v = []
+    for r, axis in belts:
+        lo, hi = (0, 2) if axis == 'x' else (1, 3)
+        cuts = sorted((t[lo], t[hi]) for t in transfers if overlap(r, t) > 1e-4)
+        start = r[lo]
+        for a, b in cuts + [(r[hi], r[hi])]:
+            if a - start > .05:
+                seg = list(r); seg[lo], seg[hi] = start, a
+                v += belt(seg, axis, z0)
+            start = max(start, b)
+    for t in transfers:
+        hosts = [(overlap(r, t), axis) for r, axis in belts if overlap(r, t) > 1e-4]
+        v += roller_module(t, max(hosts)[1] if hosts else 'x', z0)
+    return v
+
+INCLINE_TOP = 3.0   # CAD: 'Bang tai tang 1 H=0.6m -> 3m -> 0.6m'
+
+def incline_profile(r):
+    """(y, belt-top z) breakpoints of the floor-1 incline at x = centre of r.
+
+    It must be at 0.6 m on both roller modules on its line: the one taking cartons from the carton belt
+    (y ~ -0.75) and the one diverting to the spiral feeder (y ~ 5.06). ASSUMPTION: between them it
+    rises / runs level / falls in equal thirds (the CAD gives only the heights).
+    """
+    mods = sorted((t for t in L['transfers'] if abs(cx(t) - cx(r)) < .3), key=cy)
+    lo = mods[0][3] + .05 if mods and cy(mods[0]) < FEEDER_Y[0] else r[1]
+    hi = next((t[1] - .05 for t in mods if FEEDER_Y[0] < cy(t) < FEEDER_Y[1]), r[3])
+    third = (hi - lo) / 3
+    return [(r[1], BELT_Z), (lo, BELT_Z), (lo + third, INCLINE_TOP), (hi - third, INCLINE_TOP), (hi, BELT_Z), (r[3], BELT_Z)]
+
+def incline(r):
+    x = cx(r); w = r[2] - r[0]; prof = incline_profile(r)
+    v = []
+    for (ya, za), (yb, zb) in zip(prof, prof[1:]):
+        if yb - ya < .01: continue
+        seg = math.hypot(yb - ya, zb - za); pitch = -math.atan2(zb - za, yb - ya)
+        v.append(tilted(x, (ya + yb) / 2, (za + zb) / 2 - .06, seg, w, .12, FRAME, math.pi / 2, pitch))
+        v.append(tilted(x, (ya + yb) / 2, (za + zb) / 2 + .003, seg, w - .06, .006, BELT, math.pi / 2, pitch))
+        if za > BELT_Z + .01 and zb > BELT_Z + .01:   # supports under the raised level run
+            for yy in (ya, yb): v.append(box(nm('il'), x, yy, (za - .12) / 2, .08, .08, za - .12, LEG))
+    return v
+
+def spiral(sp):
+    """Absolute-frame spiral: In curve + In tangent on floor 'from', CCW helix, Out tangent on floor 'to'."""
+    v = []
+    ri, ro = sp['r_inner'], sp['r_outer']; rc = (ri + ro) / 2; w = ro - ri
+    zb, zt = LEVELS[sp['from_floor'] - 1], LEVELS[sp['to_floor'] - 1]
+    x_in, x_out = sp['x'] - SPIRAL_TANGENT, sp['x'] + SPIRAL_TANGENT
+    curve_c = (x_in + CURVE_R, cy(L['_feeder']) - CURVE_R)   # quarter turn from the tangent up to the *U752 axis
+    y_tan = curve_c[1]
+    # In: curve from the cross belt down into the left tangent, then the tangent to the ring (floor 'from').
+    n = 10
+    for k in range(n):
+        a0 = math.pi / 2 + (k / n) * math.pi / 2; a1 = math.pi / 2 + ((k + 1) / n) * math.pi / 2; am = (a0 + a1) / 2
+        ch = 2 * CURVE_R * math.sin((a1 - a0) / 2) * 1.04
+        px, py = curve_c[0] + CURVE_R * math.cos(am), curve_c[1] + CURVE_R * math.sin(am)
+        v.append(box(nm('cf'), px, py, zb + BELT_Z - .0625, ch, CURVE_W, .115, FRAME, am + math.pi / 2))
+        v.append(box(nm('cb'), px, py, zb + BELT_Z - .0025, ch, CURVE_W - .06, .005, BELT, am + math.pi / 2))
+    v += belt([x_in - w / 2, sp['y'], x_in + w / 2, y_tan], 'y', zb)
+    # Helix: starts at angle pi heading -y (CCW), ends at angle 0 heading +y.
+    total = SPIRAL_TURNS * 2 * math.pi; n = int(40 * SPIRAL_TURNS)
+    z0, z1 = zb + BELT_Z, zt + BELT_Z
+    arc = total * rc / n; pitch = -math.atan2((z1 - z0) / n, arc)
+    for k in range(n):
+        t = (k + .5) / n; ang = math.pi + total * t; z = z0 + (z1 - z0) * t
+        x, y = sp['x'] + rc * math.cos(ang), sp['y'] + rc * math.sin(ang); yaw = ang + math.pi / 2
+        v.append(tilted(x, y, z - .06, arc * 1.06, w, .10, FRAME, yaw, pitch))
+        v.append(tilted(x, y, z - .0025, arc * 1.06, w - .05, .005, BELT, yaw, pitch))
+        for rr in (ri, ro):
+            v.append(tilted(sp['x'] + rr * math.cos(ang), sp['y'] + rr * math.sin(ang), z + .05, arc * 1.06, .025, .08, TAPE_Y, yaw, pitch))
+    # Out: right tangent from the ring to *U748 (floor 'to').
+    out_end = min((c['rect'][1] for c in L['conveyors'] if c['block'] == '*U748' and abs(cx(c['rect']) - x_out) < .3), default=sp['y'] + 2.4)
+    v += belt([x_out - w / 2, sp['y'], x_out + w / 2, out_end], 'y', zt)
+    v.append(box(nm('sc'), sp['x'], sp['y'], (zb + z1 + .4) / 2, .3, .3, z1 + .4 - zb, LEG))
+    for k in range(4):
+        a = math.pi / 4 + k * math.pi / 2
+        v.append(box(nm('sp'), sp['x'] + (ro + .12) * math.cos(a), sp['y'] + (ro + .12) * math.sin(a), (zb + z1) / 2, .07, .07, z1 - zb, LEG))
+    return v
+
+# ---------------------------------------------------------------- floor content
+FLOOR1_ONLY_BLOCKS = {'*U753', '*U758', '*U757'}       # carton inbound line (floor 1)
+SPIRAL_ZONE_BLOCKS = {'*U752', '*U748'}               # rebuilt per floor from the spiral In/Out
+SORT_LOOP_BLOCKS = {'*U427', '*U429', '*U572'}        # two main sorting belts + cross pieces, rebuilt per floor
+SORT_BAND_Y = (6.3, 10.0)                              # roller modules sitting on the main sorting belts
+L['_feeder'] = next(c['rect'] for c in L['conveyors'] if c['block'] == '*U752')
+
+def on_feeder(t): return FEEDER_Y[0] < cy(t) < FEEDER_Y[1]
+def on_sort_loop(t): return SORT_BAND_Y[0] < cy(t) < SORT_BAND_Y[1]
+
+def loop_end_x(f):
+    """The CAD plan overlays every floor: the east end of the sorting loop is where that floor's goods enter it
+    (floor 1: the carton incline; floor k: the Out of spiral k-1 -> k)."""
+    if f == 1: return next(cx(c['rect']) for c in L['conveyors'] if c['block'] == '*U753')
+    return next(s['x'] + SPIRAL_TANGENT for s in L['spirals'] if s['to_floor'] == f)
+
+def sort_loop(f):
+    branch_x = [cx(c['rect']) for c in L['conveyors'] if c['block'] == '*U632']
+    ends = [loop_end_x(k) for k in range(1, len(LEVELS) + 1)]
+    end = loop_end_x(f)
+    def keep(x):   # a cross piece / module at another floor's loop end is a projection artefact
+        return any(abs(x - b) < .3 for b in branch_x) or abs(x - end) < .3 or not any(abs(x - e) < .3 for e in ends)
+    crosses = [c['rect'] for c in L['conveyors'] if c['block'] == '*U572' and keep(cx(c['rect'])) and cx(c['rect']) < end + .3]
+    east = max(r[2] for r in crosses if abs(cx(r) - end) < .3)
+    belts = [([c['rect'][0], c['rect'][1], min(c['rect'][2], east), c['rect'][3]], 'x') for c in L['conveyors'] if c['block'] in ('*U427', '*U429')]
+    belts += [(r, 'y') for r in crosses]
+    mods = [t for t in L['transfers'] if on_sort_loop(t) and keep(cx(t)) and cx(t) < east]
+    return belts, mods
+
+def carton_area(t): return cy(t) < FEEDER_Y[0] - .3   # roller modules on the floor-1 carton line
+
+def people():
+    agv_xy = [(a['x'], a['y']) for a in L['agvs']]
+    out = [dict(w) for w in L['workers']]
+    for z in L['unpack_zones']:
+        spots = [s for s in L['pallet_spots'] if z[0] <= cx(s) <= z[2] and z[1] <= cy(s) <= z[3]]
+        y = sum(cy(s) for s in spots) / len(spots) if spots else cy(z)
+        out.append({'x': min(s[0] for s in spots) - .8 if spots else z[0] + .6, 'y': y, 'area': 'unpack', 'yaw': 0.})
+    pick = [s for s in L['pallet_spots'] if cy(s) < 0]
+    if pick:
+        out.append({'x': sum(cx(s) for s in pick) / len(pick), 'y': max(s[3] for s in pick) + .9, 'area': 'pallet_pick', 'yaw': -math.pi / 2})
+    for w in out:
+        if 'yaw' not in w:
+            near = min(agv_xy, key=lambda a: math.dist(a, (w['x'], w['y'])))
+            w['yaw'] = math.atan2(near[1] - w['y'], near[0] - w['x']) if math.dist(near, (w['x'], w['y'])) < 2.5 else math.pi / 2
+    return out
+
+FLOOR1_AREAS = {'carton_inbound', 'pallet_pick'}
+ANIMATED_WORKER_AREAS = set()   # set by build_world: operators that become animated models
+
+def spot_marks(s):
+    x0, y0, x1, y1 = s
+    return [line_box(e, .05, .004, TAPE_G) for e in ((x0, y0, x1, y0), (x1, y0, x1, y1), (x1, y1, x0, y1), (x0, y1, x0, y0), (x0, y0, x1, y1), (x0, y1, x1, y0))]
+
+def east_interface(s):
+    """Wall / post on the east face towards the 4-way store, south part (y < 0): open on floor 1 (agreed)."""
+    return min(s[0], s[2]) > -1.3 and max(s[1], s[3]) < .3
+
+def floor_common():
+    v = []
+    for s in L['plan_lines'].get('wall', []):
+        if not east_interface(s): v.append(line_box(s, .06, .05, WALL))
+    for s in L['plan_lines'].get('door', []): v.append(line_box(s, .03, .02, DOOR))
+    for s in L['plan_lines'].get('fixture', []): v.append(line_box(s, .02, .015, FIXTURE))
+    for s in L['agv_paths']: v.append(line_box(s, .05, .004, ROUTE))
+    for c in L['columns']: v.append(rect_box(c, 0, FLOOR_H - .15, CONCRETE))         # structural, 8.3 m grid
+    for c in L.get('wall_posts', []):
+        if not east_interface(c): v.append(rect_box(c, 0, FLOOR_H - .15, CONCRETE))
+    for r in L['rack_cells']: v += place(rack_parts(), r['x'], r['y'], r['yaw'])
+    for st in L['stations']:
+        if st['desk']: v.append(rect_box(st['desk'], 0, .83, DESK)); v.append(rect_box(st['desk'], .83, .85, DESK_TOP))
+        for c in st['desk_cells']: v.append(rect_box(c, .85, 1.07, BIN, .015))   # ASSUMPTION: bins 220 mm on an 850 mm desk
+        if st.get('desk_ext'): v.append(rect_box(st['desk_ext'], 0, .85, DESK))
+        if st['monitor']:
+            m = st['monitor']
+            v.append(box(nm('mp'), cx(m), cy(m), .6, .04, .04, 1.2, LEG)); v.append(rect_box(m, 1.2, 1.55, SCREEN))
+        for q in st['posts']:
+            if max(q[2] - q[0], q[3] - q[1]) > .4: v.append(rect_box(q, .95, 1.0, TAPE_Y))
+            else: v.append(rect_box(q, 0, 1.1, TAPE_Y))
+        for q in st['mark']: v.append(rect_box(q, 0, .004, TAPE_Y))
+    for w in people():
+        if w['area'] not in FLOOR1_AREAS: v += place(person_parts(), w['x'], w['y'], w['yaw'])
+    for s in L['pallet_spots']:
+        if cy(s) >= 0: v += spot_marks(s)
+    for z in L['unpack_zones']:
+        x0, y0, x1, y1 = z
+        for e in ((x0, y0, x1, y0), (x1, y0, x1, y1), (x1, y1, x0, y1), (x0, y1, x0, y0)): v.append(line_box(e, .06, .004, TAPE_Y))
+    belts = [(c['rect'], c['axis']) for c in L['conveyors'] if c['block'] not in FLOOR1_ONLY_BLOCKS | SPIRAL_ZONE_BLOCKS | SORT_LOOP_BLOCKS]
+    v += conveyor_set(belts, [t for t in L['transfers'] if not on_feeder(t) and not carton_area(t) and not on_sort_loop(t)])
+    if not MOVABLE:
+        for a in L['agvs']:
+            v += place(agv_parts(), a['x'], a['y'], a['yaw'])
+            if a['rack']: v += place(rack_parts(), a['x'], a['y'], a['yaw'])
+        fl = L['forklift']; v += place(f4_parts(), fl['fork_tip_x'] - 1.2, fl['y'], fl['yaw'])
+    for d in L['devices']:
+        if d['kind'] == 'port_gate': v.append(rect_box(d['rect'], 0, 1.8, RED))
+    return v
+
+def floor_extra(f):
+    """Per-floor spiral connections; floor 1 also gets the carton inbound line and the palletising area."""
+    v = []
+    if f > 1:   # floors 2-4 keep the east wall that is open on floor 1
+        v += [line_box(s, .06, .05, WALL) for s in L['plan_lines'].get('wall', []) if east_interface(s)]
+        v += [rect_box(c, 0, FLOOR_H - .15, CONCRETE) for c in L.get('wall_posts', []) if east_interface(c)]
+    sp_out = next((s for s in L['spirals'] if s['to_floor'] == f), None)
+    sp_in = next((s for s in L['spirals'] if s['from_floor'] == f), None)
+    feeder = L['_feeder']; belts = []; trs = []
+    if sp_out:
+        x_out = sp_out['x'] + SPIRAL_TANGENT
+        belts += [(c['rect'], 'y') for c in L['conveyors'] if c['block'] == '*U748' and abs(cx(c['rect']) - x_out) < .3]
+        split = next((t for t in L['transfers'] if on_feeder(t) and abs(cx(t) - x_out) < .3), None)
+        if sp_in and split: trs.append(split)       # part of the arriving flow diverted to the next spiral
+    if sp_in:
+        left = sp_in['x'] - SPIRAL_TANGENT + CURVE_R
+        if sp_out and trs: right = trs[0][0]
+        else: right = min((c['rect'][0] for c in L['conveyors'] if c['block'] == '*U757'), default=feeder[2])
+        belts.append(([left, feeder[1], right, feeder[3]], 'x'))
+    if f == 1:
+        belts += [(c['rect'], 'x' if c['block'] != '*U753' else 'y') for c in L['conveyors'] if c['block'] in ('*U757', '*U758')]
+        trs += [t for t in L['transfers'] if carton_area(t) or (on_feeder(t) and not any(
+            abs(cx(t) - s['x'] - SPIRAL_TANGENT) < .3 for s in L['spirals']))]
+        for c in L['conveyors']:
+            if c['block'] == '*U753': v += incline(c['rect'])
+        for w in people():
+            if w['area'] in FLOOR1_AREAS and w['area'] not in ANIMATED_WORKER_AREAS: v += place(person_parts(), w['x'], w['y'], w['yaw'])
+        for s in L['pallet_spots']:
+            if cy(s) < 0: v += spot_marks(s)
+        for x, y, yaw in C.get('loose_pallet_spots', []):   # loose-goods unpack spots (agreed, floor 1)
+            hx, hy = (.6, .5) if abs(math.sin(yaw)) < .5 else (.5, .6)
+            v += spot_marks([x - hx, y - hy, x + hx, y + hy])
+        for d in L['devices']:
+            r = d['rect']
+            if d['kind'] == 'weighing': v.append(rect_box(r, BELT_Z - .15, BELT_Z + .02, '.25 .27 .30 1'))
+            elif d['kind'] == 'barcode_reader':
+                v.append(box(nm('bp'), cx(r), cy(r), .65, .05, .05, 1.3, LEG)); v.append(box(nm('bh'), cx(r), cy(r), 1.33, .12, .2, .1, SCREEN))
+            elif d['kind'] == 'profile_check':
+                lng = 'y' if r[3] - r[1] > r[2] - r[0] else 'x'
+                for k in (0, 1):
+                    px = cx(r) if lng == 'y' else (r[0] if k == 0 else r[2]); py = (r[1] if k == 0 else r[3]) if lng == 'y' else cy(r)
+                    v.append(box(nm('pc'), px, py, .7, .06, .06, 1.4, '.70 .70 .72 1'))
+                v.append(box(nm('pt'), cx(r), cy(r), 1.42, (r[2] - r[0]) if lng == 'x' else .08, (r[3] - r[1]) if lng == 'y' else .08, .06, '.70 .70 .72 1'))
+    loop_belts, loop_mods = sort_loop(f)
+    v += conveyor_set(belts + loop_belts, trs + loop_mods)
+    return v
+
+# ---------------------------------------------------------------- world assembly
+def model(name, pose, visuals, static=True):
+    x, y, z, yaw = pose
+    return (f'<model name="{name}"><static>{"true" if static else "false"}</static><pose>{x} {y} {z} 0 0 {yaw}</pose>'
+            f'<link name="body">{"".join(visuals)}</link></model>')
+
+def models():
+    out = []
+    common = merge_boxes('ff_floor', floor_common())
+    if MOVABLE:
+        agv_mesh = merge_boxes('ff_agv', place(agv_parts(), 0, 0, 0))
+        rack_mesh = merge_boxes('ff_rack', place(rack_parts(), 0, 0, 0))
+        f4_mesh = merge_boxes('ff_f4', place(f4_parts(), 0, 0, 0))
+    b = L['building']
+    for k, zf in enumerate(LEVELS):
+        f = k + 1
+        out.append(model(f'ff{f}_static', (0, 0, zf, 0), common))
+        extra = floor_extra(f)
+        if extra: out.append(model(f'ff{f}_extra', (0, 0, zf, 0), merge_boxes(f'ff_extra{f}', extra)))
+        if k == 0:
+            out.append(model('ff1_floor', (0, 0, 0, 0), [rect_box(b, -.012, -.002, '.83 .84 .85 1')]))
+        else:
+            out.append(model(f'ff{f}_slab', (0, 0, 0, 0), [rect_box(b, zf - .15, zf - .012, SLAB + ' 1').replace(
+                '</material>', '</material><transparency>0.7</transparency>')]))
+        if MOVABLE:
+            for i, a in enumerate(L['agvs']):
+                out.append(model(f'ff{f}_agv_{i}', (a['x'], a['y'], zf, a['yaw']), agv_mesh, static=False))
+                if a['rack']: out.append(model(f'ff{f}_agvrack_{i}', (a['x'], a['y'], zf, a['yaw']), rack_mesh, static=False))
+            fl = L['forklift']
+            out.append(model(f'ff{f}_f4', (fl['fork_tip_x'] - 1.2, fl['y'], zf, fl['yaw']), f4_mesh, static=False))
+    for j, sp in enumerate(L['spirals']):
+        out.append(model(f'ff_spiral_{sp["from_floor"]}_{sp["to_floor"]}', (0, 0, 0, 0), merge_boxes(f'ff_spiral{j}', spiral(sp))))
+    return out
+
+def context():
+    """Ground, 4-way store outline and its two output gates on every level (connection check)."""
+    v = [box('ground', -5, 15, -.12, 130, 100, .2, '.55 .58 .60 1')]
+    for s in ((0, 0, 52.6, 0), (52.6, 0, 52.6, 50), (52.6, 50, 0, 50), (0, 50, 0, 0)): v.append(line_box(s, .12, .01, '.20 .35 .60 1'))
+    try:
+        lay = json.loads((ROOT / 'design_layout.json').read_text(encoding='utf-8'))
+        for port in lay['ports']['out']:
+            gx, gy = port['gate']
+            for zf in LEVELS: v.append(box(nm('g'), gx, gy, zf + .3, port['gate_length'], 1.35, .1, '.10 .65 .30 1'))
+    except (OSError, KeyError):
+        pass
+    return model('ff_context', (0, 0, 0, 0), merge_boxes('ff_context', v))
+
+HEADER = '''<?xml version="1.0"?><sdf version="1.9"><world name="four_floor">
+<physics name="physics" type="ignored"><max_step_size>0.01</max_step_size><real_time_factor>1</real_time_factor></physics>
+<plugin filename="gz-sim-physics-system" name="gz::sim::systems::Physics"/>
+<plugin filename="gz-sim-user-commands-system" name="gz::sim::systems::UserCommands"/>
+<plugin filename="gz-sim-scene-broadcaster-system" name="gz::sim::systems::SceneBroadcaster"/>
+<scene><ambient>.55 .55 .55 1</ambient><background>.72 .76 .80 1</background><shadows>false</shadows></scene>
+<light name="sun" type="directional"><pose>0 0 40 0 0 0</pose><diffuse>.9 .9 .9 1</diffuse><direction>-.3 .2 -1</direction><cast_shadows>false</cast_shadows></light>
+<gui fullscreen="false"><plugin filename="MinimalScene" name="3D View"><gz-gui><title>Four Floor</title><property type="bool" key="showTitleBar">false</property><property type="string" key="state">docked</property></gz-gui><engine>ogre</engine><scene>scene</scene><ambient_light>.55 .55 .55</ambient_light><background_color>.72 .76 .80</background_color><camera_pose>-66 -30 30 0 .42 .70</camera_pose></plugin><plugin filename="GzSceneManager" name="Scene Manager"/><plugin filename="InteractiveViewControl" name="View control"/><plugin filename="CameraTracking" name="Camera Tracking"/><plugin filename="WorldControl" name="World control"/><plugin filename="WorldStats" name="World stats"/><plugin filename="Screenshot" name="Screenshot"/></gui>
+'''
+
+if __name__ == '__main__':
+    parts = models() + [context()]
+    for old in (ROOT / 'assets').glob('ff_*.stl'):   # drop stale batches from a previous build
+        if not any(old.name in p for p in parts): old.unlink()
+    (ROOT / 'four-floor.sdf').write_text(HEADER + ''.join(parts) + '</world></sdf>')
+    print(f'four-floor.sdf: {len(parts)} models | floors at {LEVELS} | per floor: {len(L["agvs"])} AGV+rack, '
+          f'{len(L["rack_cells"])} storage racks, {len(L["stations"])} stations, {len(L["columns"])} columns | '
+          f'spirals {[(s["from_floor"], s["to_floor"]) for s in L["spirals"]]}')

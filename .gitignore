@@ -10,3 +10,6 @@ cad-route-log.json
 warehouse.sdf
 equipment-detail.sdf
 assets/*.stl
+four-floor.sdf
+four-floor.log
+verified-result.json
