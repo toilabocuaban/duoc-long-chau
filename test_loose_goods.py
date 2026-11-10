@@ -54,5 +54,32 @@ class LooseGoodsChecks(unittest.TestCase):
             self.assertLess(math.dist(prev[:3], cur[:3]), total / 399 + 1e-6)
             prev = cur
 
+    def test_u1_station_and_agv_kho04_routes_clear_of_obstacles(self):
+        static_racks = [c for c in G.L['rack_cells'] if (round(c['x'], 3), round(c['y'], 3)) not in G.FF.U1_RESERVED_CELL_XY]
+        for f in G.floors():
+            z0 = G.LEVELS[f - 1]
+            for b in range(len(G.BRANCHES)):
+                wx, wy, wyaw, wz = G.u1_station(f, b)
+                rx, ry, rz, ryaw = G.u1_rack_pose(f, b)
+                self.assertAlmostEqual(wz, z0)
+                self.assertAlmostEqual(rz, z0)
+                self.assertAlmostEqual(wx, rx, places=2)
+                self.assertGreater(ry, wy)                     # U1 rack stands directly behind the sorting worker
+                c_pose = G.u1_carton_on_rack((rx, ry, rz, ryaw), 0)
+                self.assertAlmostEqual(c_pose[2], z0 + G.U1_RACK_CARTON_Z)
+                cells = G.U1_BRANCH_CELLS[b]
+                for k in range(len(cells) - 1):
+                    store = (cells[k]['x'], cells[k]['y'], z0)
+                    spare = (cells[k + 1]['x'], cells[k + 1]['y'], z0)
+                    u1 = (rx, ry, z0)
+                    for r in (G.u1_agv_route(u1, store, b), G.u1_agv_route(store, spare, b), G.u1_agv_route(spare, u1, b)):
+                        for p0, p1 in zip(r, r[1:]):
+                            xmin, xmax = min(p0[0], p1[0]), max(p0[0], p1[0])
+                            ymin, ymax = min(p0[1], p1[1]), max(p0[1], p1[1])
+                            for sr in static_racks:
+                                self.assertFalse((xmin - .8 <= sr['x'] <= xmax + .8) and (ymin - .6 <= sr['y'] <= ymax + .6))
+                            for col in G.L['columns']:
+                                self.assertTrue(xmax + .5 < col[0] or xmin - .5 > col[2] or ymax + .4 < col[1] or ymin - .4 > col[3])
+
 if __name__ == '__main__':
     unittest.main()

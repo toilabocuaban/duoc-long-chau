@@ -38,6 +38,25 @@ UNPACK_SPOTS=_unpack_spots();unpack_count={};unpack_occupant={}
 UNPACK_RACKS=[f'unpack_rack_{f}_{j}' for f in range(1,len(C['output_levels'])+1) for j in range(4)]
 RACK_LOCKS=[asyncio.Lock() for _ in UNPACK_RACKS]
 RACK_STORAGE=[(r['x'],r['y'],r['yaw']) for r in LG.L.get('rack_cells',[])[:len(UNPACK_RACKS)]]
+U1_PER_RACK=max(1,int(C.get('u1_cartons_per_rack',1)))
+U1_LOCKS={(f,b):asyncio.Lock() for f in LG.floors() for b in range(len(LG.BRANCHES))}
+
+def _init_u1_state():
+    state={}
+    for f in LG.floors():
+        for b in range(len(LG.BRANCHES)):
+            cells=[dict(c) for c in LG.U1_BRANCH_CELLS[b]]
+            state[(f,b)]={
+                'active_rack':f'u1_rack_{f}_{b}_0',
+                'empty_cell':cells[0],
+                'spares':[(f'u1_rack_{f}_{b}_{r}',cells[r],[] ) for r in range(1,LG.U1_RACKS_PER_BRANCH)],
+                'cartons':[],
+                'swaps':0,
+            }
+    return state
+
+U1_STATE=_init_u1_state()
+odd_pallet_seq=0
 
 def inbound_pickup_position(job):
     if not INBOUND_PICKUP_SLOTS:
@@ -253,9 +272,12 @@ async def arrivals(total):
         if pickup_bays:await pickup_bays[job%len(pickup_bays)].acquire()
         flow=inbound_classification(job)
         if flow=='odd' and LOOSE_SPOTS:
-            spot=LOOSE_SPOTS[job%len(LOOSE_SPOTS)]
-            spot_lock=ODD_SPOT_LOCKS[job%len(ODD_SPOT_LOCKS)]
-            names=[f'carton_{job*LOOSE_PER+j}' for j in range(LOOSE_PER)]
+            global odd_pallet_seq
+            odd_idx=odd_pallet_seq;odd_pallet_seq+=1
+            spot=LOOSE_SPOTS[odd_idx%len(LOOSE_SPOTS)]
+            spot_lock=ODD_SPOT_LOCKS[odd_idx%len(ODD_SPOT_LOCKS)]
+            base_idx=(odd_idx%max(1,LOOSE_PALLETS))*LOOSE_PER
+            names=[f'carton_{base_idx+j}' for j in range(LOOSE_PER)]
             stack=LG.stack_positions(spot,LOOSE_PER)
             async def receive_odd(dock_i,cartons):
                 send({n:poses[n][:2]+(-5,0) for n in cartons},transmit=not args.fast)
@@ -268,6 +290,8 @@ async def arrivals(total):
                     loose_stats['cartons_on_belt']+=1
                     loose_event('CARTON_ON_BELT',carton=n,pallet=job,floor=dest)
                     background_tasks.append(asyncio.create_task(carton_trip(n,dest,branch)))
+                loose_stats['pallets_unpacked']+=1
+                loose_event('LOOSE_PALLET_EMPTY',pallet=odd_idx,spot=odd_idx%len(LOOSE_SPOTS))
             async with spot_lock:
                 try:
                     await dock_flow.prepare('odd',job,spot,names,receive_odd)
@@ -390,20 +414,107 @@ async def follow_path(name,pts,speed):
     await engine.move({name:LG.along(pts,total)},speed,duration=max(.05,total/speed),kind='conveyor',
                       transform=lambda q:{name:LG.along(pts,q*total)},shape=lambda t:t)
 
+U1_PHASES=(.15,.10,.15,.20,.12,.10,.08,.10)
+
+async def u1_operator_cycle(floor,branch,carton,rack_pose,slot_idx=0):
+    """U1 sorting worker at the end of branch (*U632): picks carton from belt end, turns 180 deg, places on rack behind."""
+    wid=LG.u1_worker_id(floor,branch)
+    sx,sy,syaw,z0=LG.u1_station(floor,branch)
+    T=float(C.get('u1_place_s',2.5));d=[f*T for f in U1_PHASES]
+    pick_y=11.85;pick_bend,pick_arm=.38,.72
+    target_on_rack=LG.u1_carton_on_rack(rack_pose,slot_idx)
+    place_yaw=math.atan2(target_on_rack[1]-sy,target_on_rack[0]-sx)
+    place_y=12.04;place_bend,place_arm=.12,1.15
+    state={'x':sx,'y':sy,'yaw':syaw,'bend':0.,'arm':0.}
+    async def phase(dur,x=None,y=None,yaw=None,bend=None,arm=None,carry=False,carton_to=None,walk=False):
+        a=dict(state);b={'x':a['x'] if x is None else x,'y':a['y'] if y is None else y,
+             'yaw':a['yaw'] if yaw is None else a['yaw']+math.atan2(math.sin(yaw-a['yaw']),math.cos(yaw-a['yaw'])),
+             'bend':a['bend'] if bend is None else bend,'arm':a['arm'] if arm is None else arm}
+        steps=max(1,round(math.hypot(b['x']-a['x'],b['y']-a['y'])/STEP)) if walk else 0
+        c0=poses[carton]
+        def at(q):
+            k={key:a[key]+(b[key]-a[key])*q for key in a}
+            out=LG.operator_pose(wid,k['x'],k['y'],k['yaw'],k['bend'],k['arm'],.30*math.sin(math.pi*steps*q) if walk else 0.,z0=z0)
+            if carry: out[carton]=LG.held_carton(k['x'],k['y'],k['yaw'],k['bend'],k['arm'],z0=z0)
+            elif carton_to is not None: out[carton]=tuple(c0[j]+(carton_to[j]-c0[j])*q for j in range(4))
+            return out
+        end=at(1.)
+        await engine.move(end,duration=max(.04,dur),transform=at,shape=(lambda t:t) if walk else blend,exact=True)
+        state.update(b)
+    await phase(d[0],y=pick_y,bend=pick_bend,arm=pick_arm,walk=True)
+    grab=LG.held_carton(sx,pick_y,syaw,pick_bend,pick_arm,z0=z0)
+    await phase(d[1],carton_to=grab)
+    await phase(d[2],y=sy,bend=CARRY[0],arm=CARRY[1],carry=True,walk=True)
+    await phase(d[3],yaw=place_yaw,carry=True)
+    await phase(d[4],y=place_y,bend=place_bend,arm=place_arm,carry=True,walk=True)
+    await phase(d[5],carton_to=target_on_rack)
+    await phase(d[6],y=sy,bend=0.,arm=0.,walk=True)
+    await phase(d[7],yaw=syaw)
+
+async def u1_agv_swap_cycle(floor,branch,full_rack,cartons_on_rack,store_cell,next_rack,spare_cell,old_spare_cartons=()):
+    """AGV carries full_rack (+ cartons) along agv_paths to Kho 04, then brings next_rack from Kho 04 to U1."""
+    agv=f'u1_agv_{floor}_{branch}'
+    bx,u1_y,z0,_=LG.u1_rack_pose(floor,branch)
+    speed=float(C.get('agv_speed',1.5))
+    lift_z=.03
+    # 1. Carry loaded rack + its cartons from U1 station into Kho 04 empty cell
+    pts_store=LG.u1_agv_route((bx,u1_y,z0),(store_cell['x'],store_cell['y'],z0),branch)
+    len_store=LG.length(pts_store)
+    def at_store(q):
+        ax,ay,az,ayaw=LG.along(pts_store,q*len_store)
+        r_pose=(ax,ay,z0+lift_z,0.)
+        out={agv:(ax,ay,z0,ayaw),full_rack:r_pose}
+        for c_name,s_idx in cartons_on_rack:
+            out[c_name]=LG.u1_carton_on_rack(r_pose,s_idx)
+        return out
+    await engine.move(at_store(1.),speed=speed,duration=max(.1,len_store/speed),transform=at_store,shape=blend,exact=True)
+    settled=(store_cell['x'],store_cell['y'],z0,0.)
+    send({full_rack:settled,**{c_name:LG.u1_carton_on_rack(settled,s_idx) for c_name,s_idx in cartons_on_rack}},transmit=not args.fast)
+    loose_event('AGV_RACK_STORED',floor=floor,branch=branch,rack=full_rack,warehouse='04',cell=[round(store_cell['x'],3),round(store_cell['y'],3)])
+    # 2. Drive empty AGV to the replacement rack cell in Kho 04
+    pts_spare=LG.u1_agv_route((store_cell['x'],store_cell['y'],z0),(spare_cell['x'],spare_cell['y'],z0),branch)
+    len_spare=LG.length(pts_spare)
+    await engine.move({agv:LG.along(pts_spare,len_spare)},speed=speed,duration=max(.1,len_spare/speed),
+                      transform=lambda q:{agv:LG.along(pts_spare,q*len_spare)},shape=blend,exact=True)
+    if old_spare_cartons:
+        send({c_name:poses[c_name][:2]+(-5,0) for c_name,_ in old_spare_cartons},transmit=not args.fast)
+    # 3. Pick up replacement empty rack in Kho 04 and bring it out to U1 station behind the worker
+    loose_event('AGV_REPLACEMENT_RACK_PICKUP',floor=floor,branch=branch,rack=next_rack,from_cell=[round(spare_cell['x'],3),round(spare_cell['y'],3)])
+    pts_u1=LG.u1_agv_route((spare_cell['x'],spare_cell['y'],z0),(bx,u1_y,z0),branch)
+    len_u1=LG.length(pts_u1)
+    def at_u1(q):
+        ax,ay,az,ayaw=LG.along(pts_u1,q*len_u1)
+        return {agv:(ax,ay,z0,ayaw),next_rack:(ax,ay,z0+lift_z,0.)}
+    await engine.move(at_u1(1.),speed=speed,duration=max(.1,len_u1/speed),transform=at_u1,shape=blend,exact=True)
+    send({agv:(bx,u1_y,z0,math.pi/2),next_rack:(bx,u1_y,z0,0.)},transmit=not args.fast)
+    loose_event('AGV_REPLACEMENT_RACK_READY',floor=floor,branch=branch,rack=next_rack)
+
 async def carton_trip(name,dest,branch):
-    pts=LG.route(dest,poses[name][0],branch)
+    b=branch%len(LG.BRANCHES)
+    pts=LG.route(dest,poses[name][0],b)
     await follow_path(name,pts,C['carton_conveyor_speed'])
-    # Stop at the sorting-belt end, then process one carton on one preloaded rack.
-    loose_event('CARTON_WAITING_UNPACK',carton=name,floor=dest,branch=branch)
-    rack_index=(dest-1)*4+(branch%4);rack=UNPACK_RACKS[rack_index]
-    async with RACK_LOCKS[rack_index]:
-        loose_event('WORKER_OPEN_CARTON',carton=name,floor=dest,rack=rack)
-        await engine.until(scheduler.time+C.get('loose_unpack_s',6))
-        loose_event('CARTON_PLACED_ON_RACK',carton=name,floor=dest,rack=rack)
-        storage=RACK_STORAGE[rack_index]
-        loose_event('AGV_RACK_PICKUP',floor=dest,rack=rack)
-        await engine.move({rack:(storage[0],storage[1],LG.LEVELS[dest-1],storage[2])},speed=C.get('agv_speed',1.0),duration=4)
-        loose_event('AGV_RACK_STORED',floor=dest,rack=rack,warehouse='04')
+    # Stop at the sorting-belt end, then worker stacks carton onto U1 rack behind them.
+    loose_event('CARTON_WAITING_UNPACK',carton=name,floor=dest,branch=b)
+    async with U1_LOCKS[(dest,b)]:
+        st=U1_STATE[(dest,b)]
+        rack=st['active_rack']
+        slot_idx=len(st['cartons'])
+        rack_pose=LG.u1_rack_pose(dest,b)
+        loose_event('WORKER_OPEN_CARTON',carton=name,floor=dest,branch=b,rack=rack)
+        await u1_operator_cycle(dest,b,name,rack_pose,slot_idx)
+        st['cartons'].append((name,slot_idx))
+        loose_event('CARTON_PLACED_ON_RACK',carton=name,floor=dest,branch=b,rack=rack,slot=slot_idx)
+        if len(st['cartons'])>=U1_PER_RACK:
+            store_cell=st['empty_cell']
+            next_rack,spare_cell,old_cartons=st['spares'].pop(0)
+            carried=list(st['cartons'])
+            loose_event('AGV_RACK_PICKUP',floor=dest,branch=b,rack=rack,cartons=[c for c,_ in carried])
+            await u1_agv_swap_cycle(dest,b,rack,carried,store_cell,next_rack,spare_cell,old_cartons)
+            st['spares'].append((rack,store_cell,carried))
+            st['active_rack']=next_rack
+            st['empty_cell']=spare_cell
+            st['cartons']=[]
+            st['swaps']+=1
     loose_stats['cartons_delivered']+=1
     loose_stats['per_floor'][dest]=loose_stats['per_floor'].get(dest,0)+1
 
@@ -548,6 +659,13 @@ async def main():
     for f,zf in enumerate(LG.LEVELS,1):
         for j,s in enumerate(rack_spots):
             poses[f'unpack_rack_{f}_{j}']=((s[0]+s[2])/2,(s[1]+s[3])/2,zf,0)
+        for b in range(len(LG.BRANCHES)):
+            bx,u1_y,z0,_=LG.u1_rack_pose(f,b)
+            poses[f'u1_agv_{f}_{b}']=(bx,u1_y,z0,math.pi/2)
+            poses[f'u1_rack_{f}_{b}_0']=(bx,u1_y,z0,0.)
+            for r_idx in range(1,LG.U1_RACKS_PER_BRANCH):
+                cell=LG.U1_BRANCH_CELLS[b][r_idx]
+                poses[f'u1_rack_{f}_{b}_{r_idx}']=(cell['x'],cell['y'],z0,cell.get('yaw',0.))
     for i in range(2):
         for direction in ['in','out']:poses[f'{direction}_lift_{i}']=tuple(LAYOUT.data['ports'][direction][i]['lift'])+(.3,)
     for j in range(C['jobs']):poses[f'pallet_{j}']=inbound_pickup_position(j)
@@ -558,6 +676,12 @@ async def main():
         hidden.update({f'carton_{i}':(LOOSE_SPOTS[0][0],LOOSE_SPOTS[0][1],-5,0) for i in range(LOOSE_PALLETS*LOOSE_PER)})
         send(hidden)
         for i,op in enumerate(LG.OPERATORS):send(LG.operator_pose(i,*LG.station(op)))   # operators at the belt
+        u1_ops={}
+        for f in LG.floors():
+            for b in range(len(LG.BRANCHES)):
+                wx,wy,wyaw,wz=LG.u1_station(f,b)
+                u1_ops.update(LG.operator_pose(LG.u1_worker_id(f,b),wx,wy,wyaw,z0=wz))
+        send(u1_ops)
     for i in range(C.get('initial_outbound_pallets',0)):
         level=(i+4)%9;sid=LAYOUT.job_slots[i%len(LAYOUT.job_slots)];p=f'pallet_out_{i}'
         poses[p]=LAYOUT.slot_point(sid)+(C['storage_levels'][level],0)

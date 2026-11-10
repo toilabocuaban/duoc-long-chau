@@ -1,6 +1,8 @@
 #!/bin/bash
 set -euo pipefail
 cd "$(dirname "$(readlink -f "$0")")"
+pkill -9 -f "gz sim.*warehouse.sdf" 2>/dev/null || true
+pkill -9 -f "controller.py" 2>/dev/null || true
 source ./graphics.sh
 if [[ dock_flow.py -nt warehouse.sdf ]]; then python3 build_world.py; fi
 export GZ_SIM_RESOURCE_PATH="$PWD:${GZ_SIM_RESOURCE_PATH:-}"

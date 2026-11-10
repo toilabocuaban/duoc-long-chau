@@ -99,6 +99,8 @@
     "loose_pallets":  4,
     "loose_cartons_per_pallet":  18,
     "loose_unpack_s":  6,
+    "u1_cartons_per_rack": 1,
+    "u1_place_s": 2.5,
     "carton_conveyor_speed":  0.5,
     "dock_physical_count": 11,
     "dock_active_count": 4,

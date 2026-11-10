@@ -115,24 +115,24 @@ def _rot(yaw, v):
     c, s = math.cos(yaw), math.sin(yaw)
     return (v[0] * c - v[1] * s, v[0] * s + v[1] * c)
 
-def operator_pose(i, x, y, yaw, bend=0., arm=0., swing=0.):
+def operator_pose(i, x, y, yaw, bend=0., arm=0., swing=0., z0=0.):
     """Part poses (x, y, z, roll, pitch, yaw). bend: torso forward lean; arm: raise of the arms relative to
-    the torso (0 = hanging along it); swing: leg swing angle."""
+    the torso (0 = hanging along it); swing: leg swing angle; z0: floor base height."""
     n = part_names(i)
     sx = SHOULDER[0] * math.cos(bend) + SHOULDER[1] * math.sin(bend)
     sz = -SHOULDER[0] * math.sin(bend) + SHOULDER[1] * math.cos(bend)
     dx, dy = _rot(yaw, (sx, 0)); lx, ly = _rot(yaw, (0, LEG_Y))
-    return {n['torso']: (x, y, HIP, 0., bend, yaw),
-            n['arms']: (x + dx, y + dy, HIP + sz, 0., bend - arm, yaw),
-            n['legl']: (x + lx, y + ly, HIP, 0., swing, yaw),
-            n['legr']: (x - lx, y - ly, HIP, 0., -swing, yaw)}
+    return {n['torso']: (x, y, z0 + HIP, 0., bend, yaw),
+            n['arms']: (x + dx, y + dy, z0 + HIP + sz, 0., bend - arm, yaw),
+            n['legl']: (x + lx, y + ly, z0 + HIP, 0., swing, yaw),
+            n['legr']: (x - lx, y - ly, z0 + HIP, 0., -swing, yaw)}
 
-def held_carton(x, y, yaw, bend, arm):
+def held_carton(x, y, yaw, bend, arm, z0=0.):
     """Carton centre carried between the hands."""
     sx = SHOULDER[0] * math.cos(bend) + SHOULDER[1] * math.sin(bend)
     sz = -SHOULDER[0] * math.sin(bend) + SHOULDER[1] * math.cos(bend)
     th = bend - arm
-    hx, hz = sx - ARM * math.sin(th) + .08, HIP + sz - ARM * math.cos(th) + CARTON[2] / 2 - .04
+    hx, hz = sx - ARM * math.sin(th) + .08, z0 + HIP + sz - ARM * math.cos(th) + CARTON[2] / 2 - .04
     dx, dy = _rot(yaw, (hx, 0))
     return (x + dx, y + dy, hz, yaw)
 
@@ -140,6 +140,56 @@ def reach_for(z_carton):
     """Bend / arm raise to reach a carton whose centre is at height z (lower layers -> deeper bend)."""
     bend = min(1.1, max(.3, 1.4 - 1.2 * z_carton))
     return bend, bend * .55
+
+# ---------------------------------------------------------------- U1 sorting-branch stations -> Kho 04
+U1_WORKER_Y = 11.981
+U1_RACK_Y = FF.U1_RACK_Y
+U1_RACKS_PER_BRANCH = FF.U1_RACKS_PER_BRANCH
+U1_BRANCH_CELLS = FF.U1_BRANCH_CELLS
+U1_RACK_CARTON_Z = 1.25
+
+def u1_worker_id(floor, branch):
+    """Unique integer ID for animated U1 sorting worker on (floor 1..4, branch 0..5)."""
+    return 100 + floor * 10 + (branch % len(BRANCHES))
+
+def u1_station(floor, branch):
+    """(x, y, yaw, z0) of the U1 sorting worker at the north end of branch (*U632), facing south."""
+    bx = FF.cx(BRANCHES[branch % len(BRANCHES)])
+    return (bx, U1_WORKER_Y, -math.pi / 2, LEVELS[floor - 1])
+
+def u1_rack_pose(floor, branch):
+    """Initial pose (x, y, z, yaw) of the U1 rack directly behind the U1 sorting worker."""
+    bx = FF.cx(BRANCHES[branch % len(BRANCHES)])
+    return (bx, U1_RACK_Y, LEVELS[floor - 1], 0.)
+
+def u1_carton_on_rack(rack_pose, slot=0):
+    """World pose (x, y, z, yaw) of a carton placed into a tray on a U1 rack at rack_pose=(rx, ry, rz, ryaw)."""
+    rx, ry, rz = rack_pose[:3]
+    ryaw = rack_pose[3] if len(rack_pose) > 3 else 0.
+    dx_local = -.295 if slot % 2 == 0 else .295
+    dx, dy = _rot(ryaw, (dx_local, 0.))
+    return (rx + dx, ry + dy, rz + U1_RACK_CARTON_Z, ryaw)
+
+def _u1_corridor_y(y):
+    return 13.795 if y < 16.5 else 17.959
+
+def u1_agv_route(start_xyz, end_xyz, branch):
+    """3D polyline along CAD agv_paths connecting U1 station and Kho 04 rack_cells on the same floor."""
+    x1, y1, z = start_xyz[:3]
+    x2, y2 = end_xyz[:2]
+    b = branch % len(BRANCHES)
+    c1, c2 = _u1_corridor_y(y1), _u1_corridor_y(y2)
+    aisle_x = -26.627 if b < 3 else -11.585
+    raw = [(x1, y1, z), (x1, c1, z)]
+    if abs(c1 - c2) < 1e-3:
+        raw += [(x2, c2, z), (x2, y2, z)]
+    else:
+        raw += [(aisle_x, c1, z), (aisle_x, c2, z), (x2, c2, z), (x2, y2, z)]
+    pts = [raw[0]]
+    for p in raw[1:]:
+        if math.hypot(p[0] - pts[-1][0], p[1] - pts[-1][1]) > 1e-4:
+            pts.append(p)
+    return pts
 
 def length(pts):
     return sum(math.dist(a, b) for a, b in zip(pts, pts[1:]))

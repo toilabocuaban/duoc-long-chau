@@ -74,18 +74,24 @@ def tilted(x, y, z, sx, sy, sz, col, yaw, pitch):
     return box(nm('t'), x, y, z, sx, sy, sz, col, yaw).replace(f'0 0 {yaw}</pose>', f'0 {pitch} {yaw}</pose>')
 
 # ---------------------------------------------------------------- part libraries (local frames)
-def rack_parts():
+def rack_parts(open_shelf_z=None):
     p = []
     for sx in (-1, 1):
         for sy in (-1, 1): p.append((sx * .58, sy * .38, .85, .04, .04, 1.7, RACK_POST, 0))
     for z in (.40, .74, 1.08, 1.42):
         for sy in (-1, 1): p.append((0, sy * .38, z - .025, 1.2, .04, .05, RACK_BEAM, 0))
         p.append((0, 0, z - .0075, 1.16, .76, .015, RACK_POST, 0))
+        if open_shelf_z is not None and abs(z - open_shelf_z) < 1e-3:
+            continue
         for tx in (-.295, .295):
             p.append((tx, 0, z + .13, .58, .415, .26, TRAY, 0))
             p.append((tx, 0, z + .264, .52, .36, .008, CARTON, 0))
     for sy in (-1, 1): p.append((0, sy * .38, 1.675, 1.2, .04, .05, RACK_BEAM, 0))
     return p
+
+def u1_rack_parts():
+    """U1 inbound rack: identical 4-shelf blue-tray rack as Khu 04."""
+    return rack_parts()
 
 def agv_parts():
     return [(0, 0, .0975, .95, .65, .145, AGV_BODY, 0), (0, 0, .2075, .95, .65, .075, AGV_TOP, 0),
@@ -263,7 +269,22 @@ def people():
     return out
 
 FLOOR1_AREAS = {'carton_inbound', 'pallet_pick'}
-ANIMATED_WORKER_AREAS = set()   # set by build_world: operators that become animated models
+ANIMATED_WORKER_AREAS = {'carton_inbound', 'sorting'} if C.get('loose_pallet_spots') else set()
+U1_RACK_Y = 12.691              # CAD x1 rack station directly behind each sorting worker (y=11.981)
+U1_BRANCHES = sorted((c['rect'] for c in L['conveyors'] if c['block'] == '*U632'), key=cx)
+U1_RACKS_PER_BRANCH = 4         # 1 rack at U1 station + 3 replacement racks in Kho 04
+
+def _u1_kho04_pool():
+    c160 = sorted((c for c in L['rack_cells'] if round(c['y'], 3) == 16.056), key=lambda c: c['x'])
+    c169 = sorted((c for c in L['rack_cells'] if round(c['y'], 3) == 16.951), key=lambda c: c['x'])
+    c205 = sorted((c for c in L['rack_cells'] if round(c['y'], 3) == 20.561
+                   and round(c['x'], 3) in (-32.269, -30.968, -29.667, -24.813)), key=lambda c: c['x'])
+    return c160 + c169 + c205
+
+_U1_POOL = _u1_kho04_pool()
+U1_BRANCH_CELLS = {b: [_U1_POOL[b], _U1_POOL[6 + b], _U1_POOL[12 + b], _U1_POOL[18 + b]]
+                   for b in range(len(U1_BRANCHES))}
+U1_RESERVED_CELL_XY = {(round(c['x'], 3), round(c['y'], 3)) for c in _U1_POOL}
 
 def spot_marks(s):
     x0, y0, x1, y1 = s
@@ -283,7 +304,9 @@ def floor_common():
     for c in L['columns']: v.append(rect_box(c, 0, FLOOR_H - .15, CONCRETE))         # structural, 8.3 m grid
     for c in L.get('wall_posts', []):
         if not east_interface(c): v.append(rect_box(c, 0, FLOOR_H - .15, CONCRETE))
-    for r in L['rack_cells']: v += place(rack_parts(), r['x'], r['y'], r['yaw'])
+    for r in L['rack_cells']:
+        if (round(r['x'], 3), round(r['y'], 3)) not in U1_RESERVED_CELL_XY:
+            v += place(rack_parts(), r['x'], r['y'], r['yaw'])
     for st in L['stations']:
         if st['desk']: v.append(rect_box(st['desk'], 0, .83, DESK)); v.append(rect_box(st['desk'], .83, .85, DESK_TOP))
         for c in st['desk_cells']: v.append(rect_box(c, .85, 1.07, BIN, .015))   # ASSUMPTION: bins 220 mm on an 850 mm desk
@@ -296,7 +319,8 @@ def floor_common():
             else: v.append(rect_box(q, 0, 1.1, TAPE_Y))
         for q in st['mark']: v.append(rect_box(q, 0, .004, TAPE_Y))
     for w in people():
-        if w['area'] not in FLOOR1_AREAS: v += place(person_parts(), w['x'], w['y'], w['yaw'])
+        if w['area'] not in FLOOR1_AREAS and w['area'] not in ANIMATED_WORKER_AREAS:
+            v += place(person_parts(), w['x'], w['y'], w['yaw'])
     for s in L['pallet_spots']:
         if cy(s) >= 0: v += spot_marks(s)
     for z in L['unpack_zones']:
@@ -306,6 +330,8 @@ def floor_common():
     v += conveyor_set(belts, [t for t in L['transfers'] if not on_feeder(t) and not carton_area(t) and not on_sort_loop(t)])
     if not MOVABLE:
         for a in L['agvs']:
+            if a.get('source') == 'x1':
+                continue
             v += place(agv_parts(), a['x'], a['y'], a['yaw'])
             if a['rack']: v += place(rack_parts(), a['x'], a['y'], a['yaw'])
         fl = L['forklift']; v += place(f4_parts(), fl['fork_tip_x'] - 1.2, fl['y'], fl['yaw'])
@@ -369,9 +395,12 @@ def model(name, pose, visuals, static=True):
 def models():
     out = []
     common = merge_boxes('ff_floor', floor_common())
+    u1_agv_mesh = merge_boxes('ff_u1_agv', place(agv_parts(), 0, 0, 0))
+    u1_rack_mesh = merge_boxes('ff_u1_rack', place(u1_rack_parts(), 0, 0, 0))
+    unpack_rack_mesh = merge_boxes('ff_unpack_rack', place(rack_parts(), 0, 0, 0))
     if MOVABLE:
         agv_mesh = merge_boxes('ff_agv', place(agv_parts(), 0, 0, 0))
-        rack_mesh = merge_boxes('ff_rack', place(rack_parts(), 0, 0, 0))
+        rack_mesh = unpack_rack_mesh
         f4_mesh = merge_boxes('ff_f4', place(f4_parts(), 0, 0, 0))
     b = L['building']
     for k, zf in enumerate(LEVELS):
@@ -390,13 +419,20 @@ def models():
                 if a['rack']: out.append(model(f'ff{f}_agvrack_{i}', (a['x'], a['y'], zf, a['yaw']), rack_mesh, static=False))
             fl = L['forklift']
             out.append(model(f'ff{f}_f4', (fl['fork_tip_x'] - 1.2, fl['y'], zf, fl['yaw']), f4_mesh, static=False))
+        # U1 sorting-branch stations: 1 AGV + 1 active rack behind each U1 worker, plus 3 spare racks in Kho 04.
+        for br_idx, br_rect in enumerate(U1_BRANCHES):
+            bx = cx(br_rect)
+            out.append(model(f'u1_agv_{f}_{br_idx}', (bx, U1_RACK_Y, zf, math.pi / 2), u1_agv_mesh, static=True))
+            out.append(model(f'u1_rack_{f}_{br_idx}_0', (bx, U1_RACK_Y, zf, 0.), u1_rack_mesh, static=True))
+            for r_idx in range(1, U1_RACKS_PER_BRANCH):
+                cell = U1_BRANCH_CELLS[br_idx][r_idx]
+                out.append(model(f'u1_rack_{f}_{br_idx}_{r_idx}', (cell['x'], cell['y'], zf, cell.get('yaw', 0.)), u1_rack_mesh, static=True))
         # Dynamic unpack racks: reuse the same rack/tray mesh used by the CAD AGVs.
         # One rack is positioned behind each unpack operator on every floor.
         unpack_spots = [s for z in L['unpack_zones'] for s in L['pallet_spots']
                         if z[0] <= cx(s) <= z[2] and z[1] <= cy(s) <= z[3]]
         for j, s in enumerate(unpack_spots):
-            rack_visual = rack_mesh if MOVABLE else merge_boxes(f'unpack_rack_{f}_{j}', place(rack_parts(), 0, 0, 0))
-            out.append(model(f'unpack_rack_{f}_{j}', (cx(s), cy(s), zf, 0), rack_visual, static=False))
+            out.append(model(f'unpack_rack_{f}_{j}', (cx(s), cy(s), zf, 0), unpack_rack_mesh, static=True))
     for j, sp in enumerate(L['spirals']):
         out.append(model(f'ff_spiral_{sp["from_floor"]}_{sp["to_floor"]}', (0, 0, 0, 0), merge_boxes(f'ff_spiral{j}', spiral(sp))))
     return out

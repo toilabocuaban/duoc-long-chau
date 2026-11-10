@@ -109,7 +109,7 @@ truck_scene.add_scene(C,model)
 import four_floor_scene
 import loose_goods
 _spots=C.get('loose_pallet_spots',[])
-if _spots: four_floor_scene.ANIMATED_WORKER_AREAS={'carton_inbound'}
+if _spots: four_floor_scene.ANIMATED_WORKER_AREAS={'carton_inbound','sorting'}
 parts.extend(four_floor_scene.models())
 import dock_flow
 dock_flow.scene(C,model,pallet_deck)
@@ -120,6 +120,11 @@ if _spots:
     for i,op in enumerate(loose_goods.OPERATORS):
         for name,pose in loose_goods.operator_pose(i,*loose_goods.station(op)).items():
             model(name,(pose[0],pose[1],pose[2],pose[5]),_part_mesh[name.split('_',1)[1]])
+    for f in loose_goods.floors():
+        for b in range(len(loose_goods.BRANCHES)):
+            wx,wy,wyaw,wz=loose_goods.u1_station(f,b)
+            for name,pose in loose_goods.operator_pose(loose_goods.u1_worker_id(f,b),wx,wy,wyaw,z0=wz).items():
+                model(name,(pose[0],pose[1],pose[2],pose[5]),_part_mesh[name.split('_',1)[1]])
     _deck=merge_boxes('loose_deck',pallet_deck())
     for s,(x,y,yaw) in enumerate(_spots): model(f'loose_pallet_{s}',(x,y,-5,yaw),_deck)
     cl,cw,ch=loose_goods.CARTON
