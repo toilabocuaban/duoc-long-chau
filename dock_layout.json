@@ -1,0 +1,19 @@
+{
+  "source": "Layout DCL-ETEK-4-Ways version 4.dwg; AutoCAD COM read-only extraction of asnsalda, 2026-11-10",
+  "origin_mm": [351421.53136008, 239481.1168709311],
+  "architecture_translation_mm": [-3132644.4148792047, 1044861.829340219],
+  "notes": "Truck block centres matched to cc door blocks. Stair bay at x=-44.534684 is excluded. IDs increase west to east. Rear datum uses north edge of CAD truck block; truck length remains configurable (CAD symbol is 6.20 m).",
+  "doors": [
+    {"id":1,"x":-48.634684,"door_y":-9.953311,"rear_y":-10.200009,"truck_handle":"E9858","door_handle":"E9856"},
+    {"id":2,"x":-40.234684,"door_y":-9.953311,"rear_y":-10.220000,"truck_handle":"E9859","door_handle":"E984F"},
+    {"id":3,"x":-36.134684,"door_y":-9.933312,"rear_y":-10.220000,"truck_handle":"E9851","door_handle":"E984D"},
+    {"id":4,"x":-31.884684,"door_y":-9.953311,"rear_y":-10.220000,"truck_handle":"E9842","door_handle":"E9840"},
+    {"id":5,"x":-27.784684,"door_y":-9.953311,"rear_y":-10.220000,"truck_handle":"E9843","door_handle":"E983E"},
+    {"id":6,"x":-23.584684,"door_y":-9.953311,"rear_y":-10.220000,"truck_handle":"E9833","door_handle":"E9831"},
+    {"id":7,"x":-19.484684,"door_y":-9.953311,"rear_y":-10.220000,"truck_handle":"E9834","door_handle":"E982F"},
+    {"id":8,"x":-15.284684,"door_y":-9.953311,"rear_y":-10.220000,"truck_handle":"E982B","door_handle":"E9829"},
+    {"id":9,"x":-11.184684,"door_y":-9.953311,"rear_y":-10.220000,"truck_handle":"E982C","door_handle":"E9827"},
+    {"id":10,"x":-6.984684,"door_y":-9.953311,"rear_y":-10.200002,"truck_handle":"E981B","door_handle":"E9819"},
+    {"id":11,"x":-2.884684,"door_y":-9.953311,"rear_y":-10.220000,"truck_handle":"E981C","door_handle":"E9817"}
+  ]
+}

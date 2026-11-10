@@ -1,0 +1,80 @@
+CẬP NHẬT XE TẢI / DOCK - 10/11/2026
+
+Nguồn vị trí: đọc trực tiếp block asnsalda của Layout DCL-ETEK-4-Ways version 4.dwg
+bằng AutoCAD COM, chỉ đọc. dock_layout.json lưu handle của từng truck/cửa, gốc
+tọa độ CAD và phép dịch của block kiến trúc để kiểm tra lại được.
+
+11 ô có truck phía trước khu nhà 4 tầng. Ô x=-44.534684 là cầu thang, không đặt xe.
+Chọn 4 cửa (đánh số từ trái sang phải, bỏ cầu thang):
+  Cửa 4: X=-31.884684, đuôi Y=-10.220000 (W1)
+  Cửa 5: X=-27.784684, đuôi Y=-10.220000 (W1)
+  Cửa 9: X=-11.184684, đuôi Y=-10.220000 (W2)
+  Cửa 10: X=-6.984684, đuôi Y=-10.200002 (W2)
+Đầu xe hướng ra sân theo -Y. Không lấy vị trí xe từ 4 ô pallet inbound.
+
+Mô hình xe tham khảo ảnh người dùng: cabin đỏ vát góc, kính trước/kính cửa,
+gạt mưa, gương, tay nắm, bậc lên xuống, lưới tản nhiệt, cản, đèn pha/xi nhan,
+khung gầm, bình nhiên liệu, bánh/lốp/mâm/bu lông, chắn bùn, 3 trục rơ-moóc.
+Vách và nóc thùng là các tấm mỏng trong suốt, cửa sau mở, có pallet và các
+thùng carton có nhãn/băng dính bên trong. Các chi tiết hộp được gộp thành mesh
+chung để giảm số lệnh vẽ.
+
+Trong suốt: đặt <transparency> trực tiếp trong <visual> theo SDF, không nằm
+trong <material>. Mặc định 0.85. Sàn thùng cao 1.15 m so với sân xe (giả định
+minh họa); hạ mặt sân để sàn thùng ngang sàn kho Z=0, có tấm nối dock.
+
+Kích thước xe vẫn là thông số minh họa, không phải thông số xe thực tế đã đo:
+dài tổng thể 12 m, rộng 2.5 m, chiều cao thùng 2.85 m từ sàn xe (đã đổi từ
+giá trị cũ 3.8 m để cân đối với cabin theo ảnh). Ký hiệu xe trong CAD dài khoảng 6.20 m, rộng
+2.24 m; ảnh tham khảo là dạng đầu kéo/rơ-moóc dài hơn. Dùng đúng tâm cửa và
+điểm đuôi từ CAD, giữ chiều dài cấu hình để mô phỏng kiểu xe ảnh tham khảo.
+
+Cấu hình: tab Dock & xe tải trong 12-Configure-Flow.cmd.
+Chọn thứ tự cửa bằng dock_active_ids trong config.json; các cửa bổ sung được
+lấy theo thứ tự CAD khi tăng số dock/xe. dock_positions và dock_spacing_m
+ước lượng cũ đã được bỏ để tránh đặt sai layout.
+
+Mở mô phỏng: 02-Start-Warehouse.cmd. Chuyển camera tới dãy xe: 15-View-Trucks.cmd.
+review_trucks.py chụp ảnh bằng camera Gazebo trong phiên riêng, ẩn tầng 2-4
+chỉ trong ảnh kiểm tra để thấy rõ dock tầng 1, không thay đổi warehouse.sdf.
+
+Phạm vi: xe vẫn đỗ tĩnh và chưa mô phỏng động lực học đầu kéo. Hoạt cảnh dỡ
+hàng, quét mã, kéo pallet tới W1/W2 và hoàn trả pallet rỗng đã được nối vào
+controller; máy quét và manifest hiện là dữ liệu giả lập.
+
+CẬP NHẬT LUỒNG CÔNG NHÂN VÀ PHÂN LOẠI
+
+- Mỗi dock hoạt động có một công nhân dạng 4 bộ phận chuyển động, pallet rỗng,
+  xe kéo pallet và máy quét mã.
+- Một lô được hiện ở cuối thùng xe; công nhân đi vào thùng, lấy từng carton,
+  mang qua máy quét rồi đặt lên pallet ngoài cửa dock.
+- Mã được mô phỏng theo manifest: EVEN-... là hàng chẵn; ODD-... là hàng lẻ.
+  Đây là dữ liệu mô phỏng, chưa kết nối máy quét/WMS thật.
+- Hàng chẵn: 18 carton tạo thành một pallet, công nhân kéo đến một trong 4 ô W1;
+  pallet mô phỏng chính xuất hiện ở cùng vị trí và AGV đưa vào kho 4-way.
+- Hàng lẻ: số carton/pallet theo loose_cartons_per_pallet, kéo đến một trong hai
+  vị trí W2; công nhân W2 lấy từng carton lên băng tải, đi qua thang xoắn và đầu
+  sorting. Pallet rỗng được kéo về đúng dock để tái sử dụng.
+- Xe kéo pallet và AGV dùng khóa liên động. Khi pallet thủ công cần cắt vùng
+  inbound, hệ thống chờ AGV về vị trí an toàn. Chỉ một AGV vào vùng bốn ô lấy
+  pallet trong một lượt để tránh hai bộ càng chờ vòng ở các ô kề nhau.
+
+Các thông số mới trong giao diện Cấu hình / Công nhân dock: tốc độ đi bộ,
+tốc độ kéo pallet, thời gian nhấc thùng và thời gian đặt thùng. Thời gian quét
+mã vẫn ở tab Dock & xe tải.
+
+CẬP NHẬT TRANG TRÍ VÀ TUYẾN XE KÉO
+
+- Mỗi thùng xe có mặc định 2 hàng pallet carton trang trí nằm sâu phía đầu
+  thùng. Chúng chỉ để hiển thị, không bị công nhân lấy và không tham gia thống kê.
+  Số hàng chỉnh bằng truck_decorative_pallet_rows (0..3) trong tab Dock & xe tải.
+- Carton nguồn nằm bên trong thùng xe, ngay sau cửa sau. Công nhân đứng ở phía
+  trong nhà máy tại mép cửa, cúi và đưa tay vào thùng để lấy carton; thân người
+  không đi ra sân và không đi xuyên qua mô hình xe. Hàng trang trí nằm sâu hơn
+  trong thùng không tham gia luồng dỡ hàng.
+- Xe kéo không đi ra sân. Nó đi thẳng từ dock về phía bắc, cắt hai làn AGV dưới
+  khóa liên động, chạy theo hành lang nội bộ Y=-5.35 m rồi rẽ tới W1/W2. Khi
+  quay về, xe đi ngược đúng tuyến và toàn bộ điểm đều nằm phía trong nhà máy.
+- Khi chờ AGV nhường đường hoặc chờ máy quét, công nhân có chuyển động nhẹ ở
+  thân, chân và tay; nếu đang cầm thùng thì thùng đi theo tay. Trạng thái chờ
+  vẫn giữ nguyên liên động an toàn.

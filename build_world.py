@@ -87,9 +87,14 @@ def pallet(name, xyz):
 
 PALLET_MESH=None
 
-v=[box('ground',1,15,-.12,114,82,.2,COLORS['floor'])]   # covers the 4-floor building (x -51.9) and the 4-way store
-for x in range(-56,57,4): v.append(box(f'jointx{x}',x,15,-.015,.012,80,.004,'.38 .41 .42 1'))
-for y in range(-24,57,4): v.append(box(f'jointy{y}',1,y,-.015,112,.012,.004,'.38 .41 .42 1'))
+import truck_scene
+# Warehouse slab ends at CAD south facade. Recessed truck yard aligns trailer
+# deck with warehouse floor; no truck intersects the AGV lanes at y=-8.4/-6.4.
+v=[box('ground',1,22.89,-.12,114,66.22,.2,COLORS['floor']),
+   box('truck_yard',1,-22.11,-truck_scene.DECK-.10,114,23.78,.20,'.28 .30 .32 1'),
+   box('dock_retaining_face',-26,-10.20,-.6,52,.08,1.10,'.52 .54 .56 1')]
+for x in range(-56,57,4): v.append(box(f'jointx{x}',x,22.89,-.015,.012,66.22,.004,'.38 .41 .42 1'))
+for y in range(-8,57,4): v.append(box(f'jointy{y}',1,y,-.015,112,.012,.004,'.38 .41 .42 1'))
 # Inbound AGV lanes on floor 1 (4-floor building) continuing into the 4-way store; pallet spots are drawn by the 4-floor scene.
 from agv_motion import LOAD_Y, RETURN_Y
 for y in (LOAD_Y, RETURN_Y): v.append(box(f'aisle{y}',3,y,.004,74,.10,.008,'.86 .70 .19 1'))
@@ -99,12 +104,15 @@ for x,y,_,_ in PARKS:
 v.extend([box('back_wall',26,51,10,54,.18,20,'.64 .67 .69 1'),box('right_wall',53,25,10,.18,52,20,'.59 .63 .65 1')])
 for x in range(0,54,6): v.append(box(f'building_column{x}',x,50.8,10,.25,.3,20,'.35 .39 .42 1'))
 model('site',(0,0,0),v)
+truck_scene.add_scene(C,model)
 # 4-floor picking building west of the store (CAD, four_floor_scene.py); replaces the old placeholder zone.
 import four_floor_scene
 import loose_goods
 _spots=C.get('loose_pallet_spots',[])
 if _spots: four_floor_scene.ANIMATED_WORKER_AREAS={'carton_inbound'}
 parts.extend(four_floor_scene.models())
+import dock_flow
+dock_flow.scene(C,model,pallet_deck)
 # Floor-1 loose goods: one pallet deck per unpack spot, one model per carton of the demo (start hidden)
 # and the two unpacking operators as four animated parts each (torso+head, arms, left / right leg).
 if _spots:

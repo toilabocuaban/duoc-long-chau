@@ -2,9 +2,10 @@
 set -euo pipefail
 cd "$(dirname "$(readlink -f "$0")")"
 source ./graphics.sh
+if [[ dock_flow.py -nt warehouse.sdf ]]; then python3 build_world.py; fi
 export GZ_SIM_RESOURCE_PATH="$PWD:${GZ_SIM_RESOURCE_PATH:-}"
 export GZ_PARTITION=warehouse_v1
-if [[ ! -s warehouse.sdf || config.json -nt warehouse.sdf || build_world.py -nt warehouse.sdf || cad_scene.py -nt warehouse.sdf || equipment_visuals.py -nt warehouse.sdf || four_floor_scene.py -nt warehouse.sdf || four_floor_layout.json -nt warehouse.sdf || sdf_parts.py -nt warehouse.sdf || loose_goods.py -nt warehouse.sdf ]]; then
+if [[ ! -s warehouse.sdf || config.json -nt warehouse.sdf || build_world.py -nt warehouse.sdf || cad_scene.py -nt warehouse.sdf || equipment_visuals.py -nt warehouse.sdf || four_floor_scene.py -nt warehouse.sdf || four_floor_layout.json -nt warehouse.sdf || sdf_parts.py -nt warehouse.sdf || loose_goods.py -nt warehouse.sdf || truck_scene.py -nt warehouse.sdf || dock_layout.json -nt warehouse.sdf ]] || grep -qE '<uri>[A-Za-z]:[\\/]' warehouse.sdf; then
     echo 'Building warehouse model...'
     python3 build_world.py
 else

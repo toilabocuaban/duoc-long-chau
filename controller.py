@@ -1,5 +1,6 @@
 """Deterministic kinematic process demonstrator. No collision/dynamics claims."""
 import argparse
+import asyncio
 import json
 import math
 import time
@@ -15,6 +16,8 @@ from motion_profile import SCurve, bounds, intersects, blend
 from agv_motion import wrap
 from agv_traffic import Plan,compatible
 import loose_goods as LG
+import truck_scene
+from dock_flow import DockFlow
 
 ROOT=Path(__file__).resolve().parent
 C=json.loads((ROOT/'config.json').read_text())
@@ -32,11 +35,19 @@ def _unpack_spots():
     if not all(groups):raise ValueError(f'Each output port needs an unpack zone with pallet spots: {groups}')
     return [sorted(g,key=lambda sp:-sp[1]) for g in groups]
 UNPACK_SPOTS=_unpack_spots();unpack_count={};unpack_occupant={}
+UNPACK_RACKS=[f'unpack_rack_{f}_{j}' for f in range(1,len(C['output_levels'])+1) for j in range(4)]
+RACK_LOCKS=[asyncio.Lock() for _ in UNPACK_RACKS]
+RACK_STORAGE=[(r['x'],r['y'],r['yaw']) for r in LG.L.get('rack_cells',[])[:len(UNPACK_RACKS)]]
 
 def inbound_pickup_position(job):
     if not INBOUND_PICKUP_SLOTS:
         return pickup_position(job)
     return INBOUND_PICKUP_SLOTS[job % len(INBOUND_PICKUP_SLOTS)]
+
+def inbound_classification(job):
+    """Return the simulated barcode result for an inbound load."""
+    seq=C.get('inbound_type_sequence',['even','odd']) or ['even']
+    return str(seq[job % len(seq)]).lower()
 node=Node()
 poses={}
 deck_offsets={f'shuttle_{i}':-.06 for i in range(10)}
@@ -162,6 +173,8 @@ class Engine:
 
 background_tasks=[]
 engine=Engine();agv_load=[None,None];pickups=[None,None]
+dock_flow=DockFlow(C,engine,send,poses,args.fast,lambda state,**kw:loose_event(state,**kw))
+dock_flow.clock=lambda:scheduler.time
 reservations={}
 # One pallet per inbound pickup bay: an arrival waits until the AGV has carried the previous load away.
 pickup_bays=[asyncio.Semaphore(1) for _ in INBOUND_PICKUP_SLOTS]
@@ -238,13 +251,41 @@ async def arrivals(total):
     async def place(job):
         global max_pending
         if pickup_bays:await pickup_bays[job%len(pickup_bays)].acquire()
-        p=f'pallet_{job}';send({p:inbound_pickup_position(job)},transmit=not args.fast)
+        flow=inbound_classification(job)
+        if flow=='odd' and LOOSE_SPOTS:
+            spot=LOOSE_SPOTS[job%len(LOOSE_SPOTS)]
+            spot_lock=ODD_SPOT_LOCKS[job%len(ODD_SPOT_LOCKS)]
+            names=[f'carton_{job*LOOSE_PER+j}' for j in range(LOOSE_PER)]
+            stack=LG.stack_positions(spot,LOOSE_PER)
+            async def receive_odd(dock_i,cartons):
+                send({n:poses[n][:2]+(-5,0) for n in cartons},transmit=not args.fast)
+                send({n:p+(spot[2],) for n,p in zip(names,stack)},transmit=not args.fast)
+                for n,p in zip(names,stack):
+                    op=op_of_spot=min((w for w in LG.L['workers'] if w['area']=='carton_inbound'),key=lambda w:abs(w['x']-spot[0]))
+                    await operator_cycle(LG.OPERATORS.index(op),op,spot,n,p)
+                    dest=LG.floors()[loose_stats['cartons_on_belt']%len(LG.floors())]
+                    branch=loose_stats['cartons_on_belt']//len(LG.floors())
+                    loose_stats['cartons_on_belt']+=1
+                    loose_event('CARTON_ON_BELT',carton=n,pallet=job,floor=dest)
+                    background_tasks.append(asyncio.create_task(carton_trip(n,dest,branch)))
+            async with spot_lock:
+                try:
+                    await dock_flow.prepare('odd',job,spot,names,receive_odd)
+                finally:
+                    if pickup_bays:pickup_bays[job%len(pickup_bays)].release()
+            return
+        async def receive(i,cartons):
+            send({n:poses[n][:2]+(-5,0) for n in cartons},transmit=not args.fast)
+            p=f'pallet_{job}';send({p:inbound_pickup_position(job)},transmit=not args.fast)
+        await dock_flow.prepare('even',job,inbound_pickup_position(job),list(range(18)),receive)
         event(job,'PICKUP_BAY_LOADED');await in_queue.put(job)
         max_pending=max(max_pending,in_queue.qsize())
     placements=[]
     for job in range(total):
         await engine.until(job*C['inbound_interval_s'])
-        event(job,'INBOUND_ARRIVAL')
+        flow='even'
+        docks=truck_scene.selected_docks({**C,'truck_count_visible':C.get('dock_active_count',4)})
+        event(job,'INBOUND_ARRIVAL',dock=docks[job%len(docks)]['id'] if docks else None)
         placements.append(asyncio.create_task(place(job)))
     await asyncio.gather(*placements)
     for _ in range(2):await in_queue.put(None)
@@ -262,6 +303,7 @@ async def agv_worker(lane):
     global stored_count
     job=await in_queue.get();parked=True
     while job is not None:
+        traffic=dock_flow.gate.agv();await traffic.__aenter__()
         p=f'pallet_{job}';level=job%9;z=C['storage_levels'][level];s=f'shuttle_{level}'
         inp=LAYOUT.data['ports']['in'][lane];ix,iy=inp['lift'];bx,by=inp['buffer'];il=f'in_lift_{lane}'
         route=route_to_pickup(lane,job,inbound_pickup_position(job))
@@ -293,16 +335,9 @@ async def agv_worker(lane):
             legs=route_home(lane,ix)
             await follow_async(job,lane,legs[:3],pickup=p)  # reverse, turn, run back along y=-7
             pickups[lane]=None
-            if not in_queue.empty():
-                nxt=in_queue.get_nowait()
-                if nxt is not None:
-                    event(job,'AGV_REDISPATCH',agv=lane+1,next_job=nxt)
-                    return nxt,False
-                await follow_async(job,lane,legs[3:])
-                event(job,'AGV_RETURN_COMPLETE');return None,True
             await follow_async(job,lane,legs[3:])
             event(job,'AGV_RETURN_COMPLETE')
-            return await in_queue.get(),True
+            return 'wait',True
         home=asyncio.create_task(return_trip())
         async def downstream(job=job,p=p,level=level,z=z,s=s,inp=inp,ix=ix,iy=iy,bx=bx,by=by,il=il,ready=ready):
             global stored_count,inbound_active
@@ -333,9 +368,12 @@ async def agv_worker(lane):
                 stored_count+=1;inbound_active-=1;await stored.put((job,level,sid,lane,p))
         background_tasks.append(asyncio.create_task(downstream()))
         job,parked=await home
+        await traffic.__aexit__(None,None,None)
+        if job=='wait':job=await in_queue.get()
 
 # ---------------------------------------------------------------- floor-1 loose goods (agreed process)
 LOOSE_SPOTS=[tuple(s) for s in C.get('loose_pallet_spots',[])]
+ODD_SPOT_LOCKS=[asyncio.Lock() for _ in LOOSE_SPOTS] or [asyncio.Lock()]
 LOOSE_PALLETS=int(C.get('loose_pallets',0)) if LOOSE_SPOTS else 0
 LOOSE_PER=int(C.get('loose_cartons_per_pallet',0))
 loose_stats={'pallets_unpacked':0,'cartons_on_belt':0,'cartons_delivered':0,'per_floor':{}}
@@ -355,9 +393,19 @@ async def follow_path(name,pts,speed):
 async def carton_trip(name,dest,branch):
     pts=LG.route(dest,poses[name][0],branch)
     await follow_path(name,pts,C['carton_conveyor_speed'])
-    loose_stats['cartons_delivered']+=1;loose_stats['per_floor'][dest]=loose_stats['per_floor'].get(dest,0)+1
-    loose_event('CARTON_AT_SORTING_HEAD',carton=name,floor=dest,branch=branch)
-    send({name:poses[name][:2]+(-5,0)},transmit=not args.fast)   # put into a tray at the sorting head
+    # Stop at the sorting-belt end, then process one carton on one preloaded rack.
+    loose_event('CARTON_WAITING_UNPACK',carton=name,floor=dest,branch=branch)
+    rack_index=(dest-1)*4+(branch%4);rack=UNPACK_RACKS[rack_index]
+    async with RACK_LOCKS[rack_index]:
+        loose_event('WORKER_OPEN_CARTON',carton=name,floor=dest,rack=rack)
+        await engine.until(scheduler.time+C.get('loose_unpack_s',6))
+        loose_event('CARTON_PLACED_ON_RACK',carton=name,floor=dest,rack=rack)
+        storage=RACK_STORAGE[rack_index]
+        loose_event('AGV_RACK_PICKUP',floor=dest,rack=rack)
+        await engine.move({rack:(storage[0],storage[1],LG.LEVELS[dest-1],storage[2])},speed=C.get('agv_speed',1.0),duration=4)
+        loose_event('AGV_RACK_STORED',floor=dest,rack=rack,warehouse='04')
+    loose_stats['cartons_delivered']+=1
+    loose_stats['per_floor'][dest]=loose_stats['per_floor'].get(dest,0)+1
 
 # Unpack cycle phases (fraction of loose_unpack_s): turn, walk, face pallet, bend+reach, grab, rise, turn,
 # walk back carrying, face belt, reach over the belt, release onto the belt, straighten.
@@ -404,24 +452,30 @@ async def operator_cycle(i,op,spot,carton,stack_pos):
 async def loose_goods():
     """Loose pallets arrive at the floor-1 spots; the operator next to each spot unpacks it carton by
     carton onto the carton belt; cartons go up to floors 1-4 in turn and to the sorting branches in turn."""
-    if not LOOSE_PALLETS:return
+    # When barcode classification is integrated into arrivals(), the legacy
+    # independent loose-pallet generator must stay off to avoid duplicate odd loads.
+    if not LOOSE_PALLETS or C.get('inbound_classification')=='barcode':return
     ops=sorted((w for w in LG.L['workers'] if w['area']=='carton_inbound'),key=lambda w:w['x'])
     op_of=[min(ops,key=lambda w:abs(w['x']-s[0])) for s in LOOSE_SPOTS]
     free=[asyncio.Semaphore(1) for _ in LOOSE_SPOTS];counter={'carton':0,'branch':{}}
     async def unpack(k):
         s=k%len(LOOSE_SPOTS);await free[s].acquire();spot=LOOSE_SPOTS[s];deck=f'loose_pallet_{s}'
         stack=LG.stack_positions(spot,LOOSE_PER);names=[f'carton_{k*LOOSE_PER+j}' for j in range(LOOSE_PER)]
-        send({deck:spot[:2]+(0,spot[2]),**{n:p+(spot[2],) for n,p in zip(names,stack)}},transmit=not args.fast)
-        loose_event('LOOSE_PALLET_ON_SPOT',pallet=k,spot=s)
-        op=op_of[s]
-        for n,p in zip(names,stack):
-            await operator_cycle(LG.OPERATORS.index(op),op,spot,n,p)
-            i=counter['carton'];counter['carton']+=1;dest=LG.floors()[i%len(LG.floors())]
-            br=counter['branch'].get(dest,0);counter['branch'][dest]=br+1;loose_stats['cartons_on_belt']+=1
-            loose_event('CARTON_ON_BELT',carton=n,pallet=k,floor=dest)
-            background_tasks.append(asyncio.create_task(carton_trip(n,dest,br)))
-        send({deck:spot[:2]+(-5,spot[2])},transmit=not args.fast);loose_stats['pallets_unpacked']+=1
-        loose_event('LOOSE_PALLET_EMPTY',pallet=k,spot=s);free[s].release()
+        async def receive(dock_i,cartons):
+            send({n:poses[n][:2]+(-5,0) for n in cartons},transmit=not args.fast)
+            send({n:p+(spot[2],) for n,p in zip(names,stack)},transmit=not args.fast)
+            loose_event('LOOSE_PALLET_ON_SPOT',pallet=k,spot=s)
+            op=op_of[s]
+            for n,p in zip(names,stack):
+                await operator_cycle(LG.OPERATORS.index(op),op,spot,n,p)
+                i=counter['carton'];counter['carton']+=1;dest=LG.floors()[i%len(LG.floors())]
+                br=counter['branch'].get(dest,0);counter['branch'][dest]=br+1;loose_stats['cartons_on_belt']+=1
+                loose_event('CARTON_ON_BELT',carton=n,pallet=k,floor=dest)
+                background_tasks.append(asyncio.create_task(carton_trip(n,dest,br)))
+            loose_stats['pallets_unpacked']+=1
+            loose_event('LOOSE_PALLET_EMPTY',pallet=k,spot=s)
+        await dock_flow.prepare('odd',k,spot,names,receive)
+        free[s].release()
     jobs=[]
     for k in range(LOOSE_PALLETS):
         await engine.until(k*C['loose_pallet_interval_s'])
@@ -489,6 +543,11 @@ async def main():
             if attempt==59:raise
             await asyncio.sleep(1)
     for i in range(10):poses[f'shuttle_{i}']=LAYOUT.slot_point(LAYOUT.parking[i//9])+(C['storage_levels'][i%9],)
+    rack_spots=[s for z in LG.L['unpack_zones'] for s in LG.L['pallet_spots']
+                if z[0] <= (s[0]+s[2])/2 <= z[2] and z[1] <= (s[1]+s[3])/2 <= z[3]]
+    for f,zf in enumerate(LG.LEVELS,1):
+        for j,s in enumerate(rack_spots):
+            poses[f'unpack_rack_{f}_{j}']=((s[0]+s[2])/2,(s[1]+s[3])/2,zf,0)
     for i in range(2):
         for direction in ['in','out']:poses[f'{direction}_lift_{i}']=tuple(LAYOUT.data['ports'][direction][i]['lift'])+(.3,)
     for j in range(C['jobs']):poses[f'pallet_{j}']=inbound_pickup_position(j)
@@ -503,8 +562,10 @@ async def main():
         level=(i+4)%9;sid=LAYOUT.job_slots[i%len(LAYOUT.job_slots)];p=f'pallet_out_{i}'
         poses[p]=LAYOUT.slot_point(sid)+(C['storage_levels'][level],0)
         await stored.put((C['jobs']+i,level,sid,i%2,p))
+    dock_flow.initialize()
     total=min(args.jobs,C['jobs']);ticker=asyncio.create_task(engine.run())
-    workers=asyncio.gather(arrivals(total),requests(total),agv_worker(0),agv_worker(1),outbound_worker(0),outbound_worker(1),loose_goods())
+    even_total=sum(1 for job in range(total) if inbound_classification(job)=='even')
+    workers=asyncio.gather(arrivals(total),requests(even_total),agv_worker(0),agv_worker(1),outbound_worker(0),outbound_worker(1),loose_goods())
     done,_=await asyncio.wait([ticker,workers],return_when=asyncio.FIRST_COMPLETED)
     if ticker in done:await ticker
     await workers
@@ -516,6 +577,7 @@ async def main():
             'inbound_interval_s':C['inbound_interval_s'],'outbound_interval_s':C['outbound_interval_s'],'max_pending_inbound':max_pending,
             'loose_pallets_unpacked':loose_stats['pallets_unpacked'],'loose_cartons_delivered':loose_stats['cartons_delivered'],
             'loose_cartons_per_floor':{str(k):v for k,v in sorted(loose_stats['per_floor'].items())},
+            'dock_flow':dock_flow.stats,
             'mode':'Concurrent CAD constrained kinematic','demo_duration_s':scheduler.time}
     (ROOT/'validation.json').write_text(json.dumps(report,indent=2))
     (ROOT/'cad-route-log.json').write_text(json.dumps(shuttle_route_log))

@@ -390,6 +390,13 @@ def models():
                 if a['rack']: out.append(model(f'ff{f}_agvrack_{i}', (a['x'], a['y'], zf, a['yaw']), rack_mesh, static=False))
             fl = L['forklift']
             out.append(model(f'ff{f}_f4', (fl['fork_tip_x'] - 1.2, fl['y'], zf, fl['yaw']), f4_mesh, static=False))
+        # Dynamic unpack racks: reuse the same rack/tray mesh used by the CAD AGVs.
+        # One rack is positioned behind each unpack operator on every floor.
+        unpack_spots = [s for z in L['unpack_zones'] for s in L['pallet_spots']
+                        if z[0] <= cx(s) <= z[2] and z[1] <= cy(s) <= z[3]]
+        for j, s in enumerate(unpack_spots):
+            rack_visual = rack_mesh if MOVABLE else merge_boxes(f'unpack_rack_{f}_{j}', place(rack_parts(), 0, 0, 0))
+            out.append(model(f'unpack_rack_{f}_{j}', (cx(s), cy(s), zf, 0), rack_visual, static=False))
     for j, sp in enumerate(L['spirals']):
         out.append(model(f'ff_spiral_{sp["from_floor"]}_{sp["to_floor"]}', (0, 0, 0, 0), merge_boxes(f'ff_spiral{j}', spiral(sp))))
     return out
