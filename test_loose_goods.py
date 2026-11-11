@@ -67,12 +67,59 @@ class LooseGoodsChecks(unittest.TestCase):
                 self.assertGreater(ry, wy)                     # U1 rack stands directly behind the sorting worker
                 c_pose = G.u1_carton_on_rack((rx, ry, rz, ryaw), 0)
                 self.assertAlmostEqual(c_pose[2], z0 + G.U1_RACK_CARTON_Z)
+                meds_in = [G.u1_med_in_carton((wx, 11.229, G.zc(f), math.pi / 2), m) for m in range(G.U1_MED_PER_CARTON)]
+                meds_rack = [G.u1_med_on_rack((rx, ry, rz, ryaw), m, 0) for m in range(G.U1_MED_PER_CARTON)]
+                self.assertEqual(len({round(m[0], 3) for m in meds_in}), G.U1_MED_PER_CARTON)
+                self.assertEqual(len({round(m[0], 3) for m in meds_rack}), G.U1_MED_PER_CARTON)
+                self.assertTrue(all(abs(m[0] - (rx - .295)) < .20 for m in meds_rack))   # inside the 580mm hollow blue tray
                 cells = G.U1_BRANCH_CELLS[b]
                 for k in range(len(cells) - 1):
                     store = (cells[k]['x'], cells[k]['y'], z0)
                     spare = (cells[k + 1]['x'], cells[k + 1]['y'], z0)
                     u1 = (rx, ry, z0)
                     for r in (G.u1_agv_route(u1, store, b), G.u1_agv_route(store, spare, b), G.u1_agv_route(spare, u1, b)):
+                        for p0, p1 in zip(r, r[1:]):
+                            xmin, xmax = min(p0[0], p1[0]), max(p0[0], p1[0])
+                            ymin, ymax = min(p0[1], p1[1]), max(p0[1], p1[1])
+                            for sr in static_racks:
+                                self.assertFalse((xmin - .8 <= sr['x'] <= xmax + .8) and (ymin - .6 <= sr['y'] <= ymax + .6))
+                            for col in G.L['columns']:
+                                self.assertTrue(xmax + .5 < col[0] or xmin - .5 > col[2] or ymax + .4 < col[1] or ymin - .4 > col[3])
+
+    def test_z05_unpack_and_u2_stations_to_kho04(self):
+        reserved = G.FF.U1_RESERVED_CELL_XY | G.FF.U2_RESERVED_CELL_XY
+        static_racks = [c for c in G.L['rack_cells'] if (round(c['x'], 3), round(c['y'], 3)) not in reserved]
+        self.assertEqual(len(G.Z05_WORKERS), 2)
+        self.assertEqual(len(G.U2_WORKERS), 6)
+        for f in G.floors():
+            z0 = G.LEVELS[f - 1]
+            for z_idx in range(len(G.Z05_WORKERS)):
+                spot_xy = (-1.705, 37.19 if z_idx == 0 else 30.27)
+                stack = G.z05_stack_positions(spot_xy, f, 18)
+                self.assertEqual(len(stack), 18)
+                self.assertGreater(stack[0][2], stack[-1][2])
+                p0 = G.z05_pallet_side(spot_xy, 0)
+                p1 = G.z05_pallet_side(spot_xy, 1)
+                self.assertGreater(math.hypot(p0[0] - p1[0], p0[1] - p1[1]), .4)   # two workers at same pallet do not overlap
+            for u2_idx in range(len(G.U2_WORKERS)):
+                wx, wy, wyaw, wz = G.u2_station(f, u2_idx)
+                rx, ry, rz, ryaw = G.u2_rack_pose(f, u2_idx)
+                drop = G.u2_carton_drop_pose(f, u2_idx)
+                self.assertAlmostEqual(wz, z0)
+                self.assertAlmostEqual(rz, z0)
+                self.assertGreater(drop[0], wx)                # carton sits on the floor in front of the U2 worker (east)
+                self.assertLess(rx, wx)                        # U2 rack sits directly behind the U2 worker (west)
+                meds_in = [G.u2_med_in_carton(drop, m) for m in range(G.U1_MED_PER_CARTON)]
+                meds_rack = [G.u1_med_on_rack((rx, ry, rz, ryaw), m, 0) for m in range(G.U1_MED_PER_CARTON)]
+                self.assertEqual(len({round(m[1], 3) for m in meds_in}), G.U1_MED_PER_CARTON)
+                self.assertEqual(len({round(m[1], 3) for m in meds_rack}), G.U1_MED_PER_CARTON)
+                self.assertTrue(all(abs(m[1] - (ry - .295)) < .20 for m in meds_rack))
+                cells = G.U2_STATION_CELLS[u2_idx]
+                for k in range(len(cells) - 1):
+                    store = (cells[k]['x'], cells[k]['y'], z0)
+                    spare = (cells[k + 1]['x'], cells[k + 1]['y'], z0)
+                    u2 = (rx, ry, z0)
+                    for r in (G.u2_agv_route(u2, store, u2_idx), G.u2_agv_route(store, spare, u2_idx), G.u2_agv_route(spare, u2, u2_idx)):
                         for p0, p1 in zip(r, r[1:]):
                             xmin, xmax = min(p0[0], p1[0]), max(p0[0], p1[0])
                             ymin, ymax = min(p0[1], p1[1]), max(p0[1], p1[1])

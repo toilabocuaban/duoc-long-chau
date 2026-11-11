@@ -74,24 +74,36 @@ def tilted(x, y, z, sx, sy, sz, col, yaw, pitch):
     return box(nm('t'), x, y, z, sx, sy, sz, col, yaw).replace(f'0 0 {yaw}</pose>', f'0 {pitch} {yaw}</pose>')
 
 # ---------------------------------------------------------------- part libraries (local frames)
-def rack_parts(open_shelf_z=None):
+def hollow_tray_parts(tx, z, col=TRAY):
+    """5-sided open-top hollow blue plastic tote (580 x 415 x 260 mm) at (tx, 0) on shelf height z."""
+    wx, wy, h, tw, tb = .58, .415, .26, .022, .020
+    return [
+        (tx, 0., z + tb / 2, wx, wy, tb, col, 0),
+        (tx, -(wy - tw) / 2, z + h / 2, wx, tw, h, col, 0),
+        (tx, +(wy - tw) / 2, z + h / 2, wx, tw, h, col, 0),
+        (tx - (wx - tw) / 2, 0., z + h / 2, tw, wy - 2 * tw, h, col, 0),
+        (tx + (wx - tw) / 2, 0., z + h / 2, tw, wy - 2 * tw, h, col, 0),
+    ]
+
+def rack_parts(hollow_trays=False):
     p = []
     for sx in (-1, 1):
         for sy in (-1, 1): p.append((sx * .58, sy * .38, .85, .04, .04, 1.7, RACK_POST, 0))
     for z in (.40, .74, 1.08, 1.42):
         for sy in (-1, 1): p.append((0, sy * .38, z - .025, 1.2, .04, .05, RACK_BEAM, 0))
         p.append((0, 0, z - .0075, 1.16, .76, .015, RACK_POST, 0))
-        if open_shelf_z is not None and abs(z - open_shelf_z) < 1e-3:
-            continue
         for tx in (-.295, .295):
-            p.append((tx, 0, z + .13, .58, .415, .26, TRAY, 0))
-            p.append((tx, 0, z + .264, .52, .36, .008, CARTON, 0))
+            if hollow_trays:
+                p.extend(hollow_tray_parts(tx, z))
+            else:
+                p.append((tx, 0, z + .13, .58, .415, .26, TRAY, 0))
+                p.append((tx, 0, z + .264, .52, .36, .008, CARTON, 0))
     for sy in (-1, 1): p.append((0, sy * .38, 1.675, 1.2, .04, .05, RACK_BEAM, 0))
     return p
 
 def u1_rack_parts():
-    """U1 inbound rack: identical 4-shelf blue-tray rack as Khu 04."""
-    return rack_parts()
+    """U1 inbound rack: 4-shelf rack with hollow open-top blue plastic trays (580x415x260 mm)."""
+    return rack_parts(hollow_trays=True)
 
 def agv_parts():
     return [(0, 0, .0975, .95, .65, .145, AGV_BODY, 0), (0, 0, .2075, .95, .65, .075, AGV_TOP, 0),
@@ -269,10 +281,10 @@ def people():
     return out
 
 FLOOR1_AREAS = {'carton_inbound', 'pallet_pick'}
-ANIMATED_WORKER_AREAS = {'carton_inbound', 'sorting'} if C.get('loose_pallet_spots') else set()
+ANIMATED_WORKER_AREAS = {'carton_inbound', 'sorting', 'unpack', 'put_away'} if C.get('loose_pallet_spots') else set()
 U1_RACK_Y = 12.691              # CAD x1 rack station directly behind each sorting worker (y=11.981)
 U1_BRANCHES = sorted((c['rect'] for c in L['conveyors'] if c['block'] == '*U632'), key=cx)
-U1_RACKS_PER_BRANCH = 4         # 1 rack at U1 station + 3 replacement racks in Kho 04
+U1_RACKS_PER_BRANCH = 2         # 1 rack at U1 station + 1 replacement rack in Kho 04
 
 def _u1_kho04_pool():
     c160 = sorted((c for c in L['rack_cells'] if round(c['y'], 3) == 16.056), key=lambda c: c['x'])
@@ -282,9 +294,23 @@ def _u1_kho04_pool():
     return c160 + c169 + c205
 
 _U1_POOL = _u1_kho04_pool()
-U1_BRANCH_CELLS = {b: [_U1_POOL[b], _U1_POOL[6 + b], _U1_POOL[12 + b], _U1_POOL[18 + b]]
+U1_BRANCH_CELLS = {b: [_U1_POOL[b], _U1_POOL[6 + b]]
                    for b in range(len(U1_BRANCHES))}
-U1_RESERVED_CELL_XY = {(round(c['x'], 3), round(c['y'], 3)) for c in _U1_POOL}
+U1_RESERVED_CELL_XY = {(round(c['x'], 3), round(c['y'], 3)) for cells in U1_BRANCH_CELLS.values() for c in cells}
+
+# U2 put-away stations (6 stations per floor opposite Zone 05 unpack zones) -> Kho 04
+U2_WORKERS = sorted((w for w in L['workers'] if w['area'] == 'put_away'), key=lambda w: -w['y'])
+U2_RACK_X = -8.773
+U2_RACKS_Y = [40.881, 36.121, 32.121, 28.121, 24.121, 17.959]
+U2_CORRIDORS_Y = [40.881, 36.121, 32.121, 28.121, 24.121, 19.059]
+U2_CELL_ROWS_Y = [41.879, 37.115, 33.123, 29.122, 25.122, 20.561]
+U2_CELL_XS = (-13.105, -14.406)
+U2_RACKS_PER_STATION = 2
+U2_STATION_CELLS = {u2_idx: [next(c for c in L['rack_cells']
+                                  if round(c['x'], 3) == rx and round(c['y'], 3) == U2_CELL_ROWS_Y[u2_idx])
+                             for rx in U2_CELL_XS]
+                    for u2_idx in range(len(U2_WORKERS))}
+U2_RESERVED_CELL_XY = {(round(c['x'], 3), round(c['y'], 3)) for cells in U2_STATION_CELLS.values() for c in cells}
 
 def spot_marks(s):
     x0, y0, x1, y1 = s
@@ -305,7 +331,7 @@ def floor_common():
     for c in L.get('wall_posts', []):
         if not east_interface(c): v.append(rect_box(c, 0, FLOOR_H - .15, CONCRETE))
     for r in L['rack_cells']:
-        if (round(r['x'], 3), round(r['y'], 3)) not in U1_RESERVED_CELL_XY:
+        if (round(r['x'], 3), round(r['y'], 3)) not in (U1_RESERVED_CELL_XY | U2_RESERVED_CELL_XY):
             v += place(rack_parts(), r['x'], r['y'], r['yaw'])
     for st in L['stations']:
         if st['desk']: v.append(rect_box(st['desk'], 0, .83, DESK)); v.append(rect_box(st['desk'], .83, .85, DESK_TOP))
@@ -427,12 +453,13 @@ def models():
             for r_idx in range(1, U1_RACKS_PER_BRANCH):
                 cell = U1_BRANCH_CELLS[br_idx][r_idx]
                 out.append(model(f'u1_rack_{f}_{br_idx}_{r_idx}', (cell['x'], cell['y'], zf, cell.get('yaw', 0.)), u1_rack_mesh, static=True))
-        # Dynamic unpack racks: reuse the same rack/tray mesh used by the CAD AGVs.
-        # One rack is positioned behind each unpack operator on every floor.
-        unpack_spots = [s for z in L['unpack_zones'] for s in L['pallet_spots']
-                        if z[0] <= cx(s) <= z[2] and z[1] <= cy(s) <= z[3]]
-        for j, s in enumerate(unpack_spots):
-            out.append(model(f'unpack_rack_{f}_{j}', (cx(s), cy(s), zf, 0), unpack_rack_mesh, static=True))
+        # U2 put-away stations opposite Zone 05: 1 AGV + 1 active rack behind each U2 worker, plus 3 spare racks in Kho 04.
+        for u2_idx, ry in enumerate(U2_RACKS_Y):
+            out.append(model(f'u2_agv_{f}_{u2_idx}', (U2_RACK_X, ry, zf, 0.), u1_agv_mesh, static=True))
+            out.append(model(f'u2_rack_{f}_{u2_idx}_0', (U2_RACK_X, ry, zf, math.pi / 2), u1_rack_mesh, static=True))
+            for r_idx in range(1, U2_RACKS_PER_STATION):
+                cell = U2_STATION_CELLS[u2_idx][r_idx]
+                out.append(model(f'u2_rack_{f}_{u2_idx}_{r_idx}', (cell['x'], cell['y'], zf, cell.get('yaw', 0.)), u1_rack_mesh, static=True))
     for j, sp in enumerate(L['spirals']):
         out.append(model(f'ff_spiral_{sp["from_floor"]}_{sp["to_floor"]}', (0, 0, 0, 0), merge_boxes(f'ff_spiral{j}', spiral(sp))))
     return out

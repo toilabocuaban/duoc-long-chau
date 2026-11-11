@@ -146,7 +146,21 @@ U1_WORKER_Y = 11.981
 U1_RACK_Y = FF.U1_RACK_Y
 U1_RACKS_PER_BRANCH = FF.U1_RACKS_PER_BRANCH
 U1_BRANCH_CELLS = FF.U1_BRANCH_CELLS
-U1_RACK_CARTON_Z = 1.25
+U1_RACK_CARTON_Z = 1.24
+U1_MED_PER_CARTON = 3
+MED_YELLOW = '.98 .78 .10 1'
+MED_WHITE = '.96 .96 .94 1'
+MED_ORANGE = '.95 .42 .08 1'
+
+def med_box_parts():
+    """2x2 pack of small yellow medicine boxes (fits 3 packs per 580x415x260 mm hollow blue tray)."""
+    out = []
+    for sx in (-.038, .038):
+        for sy in (-.078, .078):
+            out.append((sx, sy, .035, .068, .145, .15, MED_YELLOW))
+            out.append((sx, sy, -.065, .068, .145, .05, MED_WHITE))
+            out.append((sx, sy, -.030, .070, .147, .02, MED_ORANGE))
+    return out
 
 def u1_worker_id(floor, branch):
     """Unique integer ID for animated U1 sorting worker on (floor 1..4, branch 0..5)."""
@@ -162,13 +176,24 @@ def u1_rack_pose(floor, branch):
     bx = FF.cx(BRANCHES[branch % len(BRANCHES)])
     return (bx, U1_RACK_Y, LEVELS[floor - 1], 0.)
 
-def u1_carton_on_rack(rack_pose, slot=0):
-    """World pose (x, y, z, yaw) of a carton placed into a tray on a U1 rack at rack_pose=(rx, ry, rz, ryaw)."""
+def u1_med_in_carton(carton_pose, m):
+    """World pose (x, y, z, yaw) of yellow medicine box m (0..2) inside an opened carton at belt end."""
+    cx, cy, cz = carton_pose[:3]
+    dx = (m - (U1_MED_PER_CARTON - 1) / 2) * .10
+    return (cx + dx, cy, cz + .05, 0.)
+
+def u1_med_on_rack(rack_pose, m, tray_slot=0):
+    """World pose (x, y, z, yaw) of yellow medicine box m (0..2) inside a hollow blue tray on a U1 rack."""
     rx, ry, rz = rack_pose[:3]
     ryaw = rack_pose[3] if len(rack_pose) > 3 else 0.
-    dx_local = -.295 if slot % 2 == 0 else .295
+    tx = -.295 if tray_slot % 2 == 0 else .295
+    dx_local = tx + (m - (U1_MED_PER_CARTON - 1) / 2) * .165
     dx, dy = _rot(ryaw, (dx_local, 0.))
     return (rx + dx, ry + dy, rz + U1_RACK_CARTON_Z, ryaw)
+
+def u1_carton_on_rack(rack_pose, slot=0):
+    """World pose (x, y, z, yaw) of the first medicine box / slot in a hollow blue tray on a U1 rack."""
+    return u1_med_on_rack(rack_pose, slot % U1_MED_PER_CARTON, slot // U1_MED_PER_CARTON)
 
 def _u1_corridor_y(y):
     return 13.795 if y < 16.5 else 17.959
@@ -185,6 +210,83 @@ def u1_agv_route(start_xyz, end_xyz, branch):
         raw += [(x2, c2, z), (x2, y2, z)]
     else:
         raw += [(aisle_x, c1, z), (aisle_x, c2, z), (x2, c2, z), (x2, y2, z)]
+    pts = [raw[0]]
+    for p in raw[1:]:
+        if math.hypot(p[0] - pts[-1][0], p[1] - pts[-1][1]) > 1e-4:
+            pts.append(p)
+    return pts
+
+# ---------------------------------------------------------------- Zone 05 (Unpack Pallet) -> U2 -> Kho 04
+Z05_WORKERS = sorted((w for w in FF.people() if w['area'] == 'unpack'), key=lambda w: -w['y'])
+Z05_CARTONS_PER_PALLET = 18
+U2_WORKERS = FF.U2_WORKERS
+U2_RACK_X = FF.U2_RACK_X
+U2_RACKS_Y = FF.U2_RACKS_Y
+U2_CORRIDORS_Y = FF.U2_CORRIDORS_Y
+U2_RACKS_PER_STATION = FF.U2_RACKS_PER_STATION
+U2_STATION_CELLS = FF.U2_STATION_CELLS
+U2_DROP_X = -7.42
+
+def z05_worker_id(floor, zone):
+    """Unique integer ID for animated Zone 05 unpack worker on (floor 1..4, zone 0..1)."""
+    return 200 + floor * 10 + (zone % len(Z05_WORKERS))
+
+def z05_station(floor, zone):
+    """(x, y, yaw, z0) of the Zone 05 unpack worker on (floor 1..4, zone 0..1), facing east."""
+    w = Z05_WORKERS[zone % len(Z05_WORKERS)]
+    return (w['x'], w['y'], 0., LEVELS[floor - 1])
+
+def z05_pallet_side(spot_xy, worker_idx=0):
+    """Standing position (x, y, yaw) on the west side of a Zone 05 pallet spot, facing east.
+    Two workers sharing the same pallet stand slightly offset along y (+/-0.28 m) so they never overlap."""
+    dy = .28 if (worker_idx % 2) == 0 else -.28
+    return (spot_xy[0] - .6 - .42, spot_xy[1] + dy, 0.)
+
+def z05_stack_positions(spot_xy, floor, n=Z05_CARTONS_PER_PALLET):
+    """World poses (x, y, z, yaw) of the n=18 cartons stacked 3x3x2 on a Zone 05 pallet deck on floor."""
+    z0 = LEVELS[floor - 1]
+    return [(px, py, z0 + pz, 0.) for px, py, pz in stack_positions((spot_xy[0], spot_xy[1], 0.), n)]
+
+def u2_worker_id(floor, u2_idx):
+    """Unique integer ID for animated U2 put-away worker on (floor 1..4, u2_idx 0..5)."""
+    return 300 + floor * 10 + (u2_idx % len(U2_WORKERS))
+
+def u2_station(floor, u2_idx):
+    """(x, y, yaw, z0) of the U2 worker on (floor 1..4, u2_idx 0..5), facing east towards Zone 05."""
+    w = U2_WORKERS[u2_idx % len(U2_WORKERS)]
+    return (w['x'], w['y'], 0., LEVELS[floor - 1])
+
+def u2_carton_drop_pose(floor, u2_idx):
+    """World pose (x, y, z, yaw) of a carton placed on the floor directly in front of U2 worker u2_idx."""
+    w = U2_WORKERS[u2_idx % len(U2_WORKERS)]
+    return (U2_DROP_X, w['y'], LEVELS[floor - 1] + CARTON[2] / 2, math.pi / 2)
+
+def u2_rack_pose(floor, u2_idx):
+    """Initial pose (x, y, z, yaw) of the U2 rack directly behind U2 worker u2_idx."""
+    idx = u2_idx % len(U2_RACKS_Y)
+    return (U2_RACK_X, U2_RACKS_Y[idx], LEVELS[floor - 1], math.pi / 2)
+
+def u2_med_in_carton(carton_pose, m):
+    """World pose (x, y, z, yaw) of yellow medicine box m (0..2) inside an opened carton on the U2 floor."""
+    cx, cy, cz = carton_pose[:3]
+    dy = (m - (U1_MED_PER_CARTON - 1) / 2) * .10
+    return (cx, cy + dy, cz + .05, math.pi / 2)
+
+def u2_agv_route(start_xyz, end_xyz, u2_idx):
+    """3D polyline along CAD agv_paths connecting U2 station and Kho 04 rack_cells on the same floor."""
+    x1, y1, z = start_xyz[:3]
+    x2, y2 = end_xyz[:2]
+    idx = u2_idx % len(U2_RACKS_Y)
+    sy, cy = U2_RACKS_Y[idx], U2_CORRIDORS_Y[idx]
+    raw = [(x1, y1, z)]
+    if abs(y1 - sy) < 1e-3 and abs(sy - cy) > 1e-3:
+        raw += [(-10.067, sy, z), (-10.067, cy, z)]
+    elif abs(y1 - cy) > 1e-3:
+        raw.append((x1, cy, z))
+    if abs(y2 - sy) < 1e-3 and abs(sy - cy) > 1e-3:
+        raw += [(-10.067, cy, z), (-10.067, sy, z), (x2, y2, z)]
+    else:
+        raw += [(x2, cy, z), (x2, y2, z)]
     pts = [raw[0]]
     for p in raw[1:]:
         if math.hypot(p[0] - pts[-1][0], p[1] - pts[-1][1]) > 1e-4:

@@ -109,7 +109,7 @@ truck_scene.add_scene(C,model)
 import four_floor_scene
 import loose_goods
 _spots=C.get('loose_pallet_spots',[])
-if _spots: four_floor_scene.ANIMATED_WORKER_AREAS={'carton_inbound','sorting'}
+if _spots: four_floor_scene.ANIMATED_WORKER_AREAS={'carton_inbound','sorting','unpack','put_away'}
 parts.extend(four_floor_scene.models())
 import dock_flow
 dock_flow.scene(C,model,pallet_deck)
@@ -125,12 +125,35 @@ if _spots:
             wx,wy,wyaw,wz=loose_goods.u1_station(f,b)
             for name,pose in loose_goods.operator_pose(loose_goods.u1_worker_id(f,b),wx,wy,wyaw,z0=wz).items():
                 model(name,(pose[0],pose[1],pose[2],pose[5]),_part_mesh[name.split('_',1)[1]])
+        for z_idx in range(len(loose_goods.Z05_WORKERS)):
+            wx,wy,wyaw,wz=loose_goods.z05_station(f,z_idx)
+            for name,pose in loose_goods.operator_pose(loose_goods.z05_worker_id(f,z_idx),wx,wy,wyaw,z0=wz).items():
+                model(name,(pose[0],pose[1],pose[2],pose[5]),_part_mesh[name.split('_',1)[1]])
+        for u2_idx in range(len(loose_goods.U2_WORKERS)):
+            wx,wy,wyaw,wz=loose_goods.u2_station(f,u2_idx)
+            for name,pose in loose_goods.operator_pose(loose_goods.u2_worker_id(f,u2_idx),wx,wy,wyaw,z0=wz).items():
+                model(name,(pose[0],pose[1],pose[2],pose[5]),_part_mesh[name.split('_',1)[1]])
     _deck=merge_boxes('loose_deck',pallet_deck())
     for s,(x,y,yaw) in enumerate(_spots): model(f'loose_pallet_{s}',(x,y,-5,yaw),_deck)
     cl,cw,ch=loose_goods.CARTON
     _carton=merge_boxes('loose_carton',[box('c',0,0,0,cl,cw,ch-.004,CARTON),box('t',0,0,ch/2-.003,.06,cw+.002,.006,'.9 .8 .57 1')])
+    _med_box=merge_boxes('med_box',[box(f'mb{k}',*b) for k,b in enumerate(loose_goods.med_box_parts())])
     for i in range(int(C.get('loose_pallets',0))*int(C.get('loose_cartons_per_pallet',0))):
         model(f'carton_{i}',(_spots[0][0],_spots[0][1],-5),_carton)
+        for m in range(loose_goods.U1_MED_PER_CARTON):
+            model(f'med_{i}_{m}',(_spots[0][0],_spots[0][1],-5),_med_box)
+    _z05_per=int(C.get('z05_cartons_per_pallet',loose_goods.Z05_CARTONS_PER_PALLET))
+    for f in loose_goods.floors():
+        for z_idx in range(len(loose_goods.Z05_WORKERS)):
+            wx,wy,_,_=loose_goods.z05_station(f,z_idx)
+            model(f'z05_deck_{f}_{z_idx}',(wx,wy,-5,0),_deck)
+            for c_idx in range(_z05_per):
+                model(f'z05_carton_{f}_{z_idx}_{c_idx}',(wx,wy,-5,0),_carton)
+        for u2_idx in range(len(loose_goods.U2_WORKERS)):
+            rx,ry,_,_=loose_goods.u2_rack_pose(f,u2_idx)
+            for r_idx in range(loose_goods.U2_RACKS_PER_STATION):
+                for m in range(loose_goods.U1_MED_PER_CARTON):
+                    model(f'u2_med_{f}_{u2_idx}_{r_idx}_{m}',(rx,ry,-5,0),_med_box)
 from cad_scene import build_cad_scene
 stock_count=build_cad_scene(C,box,strut,merge_boxes,model)
 print(f'CAD slots per level: {len(LAYOUT.slots)}; illustrative stock: {stock_count}')

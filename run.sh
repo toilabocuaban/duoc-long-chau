@@ -1,7 +1,7 @@
 #!/bin/bash
 set -euo pipefail
 cd "$(dirname "$(readlink -f "$0")")"
-pkill -9 -f "gz sim.*warehouse.sdf" 2>/dev/null || true
+pkill -9 -f "gz sim" 2>/dev/null || true
 pkill -9 -f "controller.py" 2>/dev/null || true
 source ./graphics.sh
 if [[ dock_flow.py -nt warehouse.sdf ]]; then python3 build_world.py; fi
@@ -16,7 +16,7 @@ fi
 gz sim -r --render-engine ogre warehouse.sdf > gazebo.log 2>&1 &
 sim_pid=$!
 ctl_pid=''
-trap 'kill "$sim_pid" ${ctl_pid:+"$ctl_pid"} 2>/dev/null || true' EXIT
+trap 'kill "$sim_pid" ${ctl_pid:+"$ctl_pid"} 2>/dev/null || true; pkill -9 -f "gz sim" 2>/dev/null || true' EXIT
 python3 wait_gui.py
 python3 controller.py > >(tee controller.log) 2>&1 &
 ctl_pid=$!
