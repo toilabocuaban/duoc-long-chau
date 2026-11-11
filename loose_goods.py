@@ -115,17 +115,20 @@ def _rot(yaw, v):
     c, s = math.cos(yaw), math.sin(yaw)
     return (v[0] * c - v[1] * s, v[0] * s + v[1] * c)
 
-def operator_pose(i, x, y, yaw, bend=0., arm=0., swing=0., z0=0.):
+def operator_pose(i, x, y, yaw, bend=0., arm=0., swing=0., z0=0., upper_only=False):
     """Part poses (x, y, z, roll, pitch, yaw). bend: torso forward lean; arm: raise of the arms relative to
     the torso (0 = hanging along it); swing: leg swing angle; z0: floor base height."""
     n = part_names(i)
     sx = SHOULDER[0] * math.cos(bend) + SHOULDER[1] * math.sin(bend)
     sz = -SHOULDER[0] * math.sin(bend) + SHOULDER[1] * math.cos(bend)
-    dx, dy = _rot(yaw, (sx, 0)); lx, ly = _rot(yaw, (0, LEG_Y))
-    return {n['torso']: (x, y, z0 + HIP, 0., bend, yaw),
-            n['arms']: (x + dx, y + dy, z0 + HIP + sz, 0., bend - arm, yaw),
-            n['legl']: (x + lx, y + ly, z0 + HIP, 0., swing, yaw),
-            n['legr']: (x - lx, y - ly, z0 + HIP, 0., -swing, yaw)}
+    dx, dy = _rot(yaw, (sx, 0))
+    out = {n['torso']: (x, y, z0 + HIP, 0., bend, yaw),
+           n['arms']: (x + dx, y + dy, z0 + HIP + sz, 0., bend - arm, yaw)}
+    if not upper_only:
+        lx, ly = _rot(yaw, (0, LEG_Y))
+        out[n['legl']] = (x + lx, y + ly, z0 + HIP, 0., swing, yaw)
+        out[n['legr']] = (x - lx, y - ly, z0 + HIP, 0., -swing, yaw)
+    return out
 
 def held_carton(x, y, yaw, bend, arm, z0=0.):
     """Carton centre carried between the hands."""
@@ -287,6 +290,173 @@ def u2_agv_route(start_xyz, end_xyz, u2_idx):
         raw += [(-10.067, cy, z), (-10.067, sy, z), (x2, y2, z)]
     else:
         raw += [(x2, cy, z), (x2, y2, z)]
+    pts = [raw[0]]
+    for p in raw[1:]:
+        if math.hypot(p[0] - pts[-1][0], p[1] - pts[-1][1]) > 1e-4:
+            pts.append(p)
+    return pts
+
+# ---------------------------------------------------------------- Empty Carton Trolleys <-> Khu 06 & Khu P1 (14 Stations)
+TROLLEY_CAPACITY = FF.TROLLEY_CAPACITY
+K06_SLOTS_XY = FF.K06_SLOTS_XY
+P1_STATIONS = FF.P1_STATIONS
+P1_RACKS_PER_STATION = FF.P1_RACKS_PER_STATION
+P1_CELL_MAP = FF.P1_CELL_MAP
+P1_STATION_CELLS = FF.P1_STATION_CELLS
+
+_TROLLEY_SLOTS_LOCAL = (
+    (-.24, 0., .30 + CARTON[2] * .5),
+    (+.24, 0., .30 + CARTON[2] * .5),
+    (-.24, 0., .30 + CARTON[2] * 1.5),
+    (+.24, 0., .30 + CARTON[2] * 1.5),
+    (0.,   0., .30 + CARTON[2] * 2.5),
+)
+
+def trolley_carton_pose(trolley_pose, slot=0):
+    """World pose (x, y, z, yaw) of empty carton slot (0..4) stacked inside a wire-mesh trolley."""
+    tx, ty, tz = trolley_pose[:3]
+    tyaw = trolley_pose[3] if len(trolley_pose) > 3 else 0.
+    lx, ly, lz = _TROLLEY_SLOTS_LOCAL[slot % len(_TROLLEY_SLOTS_LOCAL)]
+    dx, dy = _rot(tyaw, (lx, ly))
+    return (tx + dx, ty + dy, tz + lz, tyaw)
+
+def k06_slot_pose(floor, slot_idx=0):
+    """World pose (x, y, z, yaw) of a trolley staging slot in Khu 06 ([-4.31, 13.6])."""
+    kx, ky = K06_SLOTS_XY[slot_idx % len(K06_SLOTS_XY)]
+    return (kx, ky, LEVELS[floor - 1], 0.)
+
+def u1_trolley_pose(floor, branch):
+    """Initial pose (x, y, z, yaw) of the empty-carton trolley beside U1 sorting worker."""
+    bx = FF.cx(BRANCHES[branch % len(BRANCHES)])
+    return (bx + .95, 12.05, LEVELS[floor - 1], 0.)
+
+def u1_k06_route(start_xyz, end_xyz):
+    """3D polyline along CAD agv_paths connecting a U1 trolley position and Khu 06."""
+    x1, y1, z = start_xyz[:3]
+    x2, y2 = end_xyz[:2]
+    raw = [(x1, y1, z), (x1, 13.795, z), (x2, 13.795, z), (x2, y2, z)]
+    pts = [raw[0]]
+    for p in raw[1:]:
+        if math.hypot(p[0] - pts[-1][0], p[1] - pts[-1][1]) > 1e-4:
+            pts.append(p)
+    return pts
+
+def u2_trolley_pose(floor, u2_idx):
+    """Initial pose (x, y, z, yaw) of the empty-carton trolley beside U2 put-away worker."""
+    idx = u2_idx % len(U2_WORKERS)
+    wy = U2_WORKERS[idx]['y']
+    ty = wy + .95 if idx == 0 else wy - .95
+    return (-7.95, ty, LEVELS[floor - 1], math.pi / 2)
+
+def u2_k06_route(start_xyz, end_xyz, u2_idx=0):
+    """3D polyline along CAD agv_paths connecting a U2 trolley position and Khu 06."""
+    x1, y1, z = start_xyz[:3]
+    x2, y2 = end_xyz[:2]
+    if abs(x1 - (-7.95)) < .5:
+        raw = [(x1, y1, z), (-10.067, y1, z), (-10.067, 13.795, z), (x2, 13.795, z), (x2, y2, z)]
+    else:
+        raw = [(x1, y1, z), (x1, 13.795, z), (-10.067, 13.795, z), (-10.067, y2, z), (x2, y2, z)]
+    pts = [raw[0]]
+    for p in raw[1:]:
+        if math.hypot(p[0] - pts[-1][0], p[1] - pts[-1][1]) > 1e-4:
+            pts.append(p)
+    return pts
+
+def p1_worker_id(floor, st_idx):
+    """Unique integer ID for animated P1 picking worker on (floor 1..4, st_idx 0..13)."""
+    return 400 + floor * 20 + (st_idx % len(P1_STATIONS))
+
+def p1_station(floor, st_idx):
+    """(x, y, yaw, z0) of P1 picking worker on (floor 1..4, st_idx 0..13), standing between desk and trolley."""
+    idx = st_idx % len(P1_STATIONS)
+    st = P1_STATIONS[idx]
+    dx, dy = FF.cx(st['desk']), FF.cy(st['desk'])
+    z0 = LEVELS[floor - 1]
+    if idx < 7:
+        return (dx + .98, dy, -math.pi / 2, z0)
+    return (dx, dy - .98, 0., z0)
+
+def p1_rack_pose(floor, st_idx):
+    """Initial pose (x, y, z, yaw) of the P1 rack at st['rack'] on (floor 1..4, st_idx 0..13)."""
+    idx = st_idx % len(P1_STATIONS)
+    st = P1_STATIONS[idx]
+    return (FF.cx(st['rack']), FF.cy(st['rack']), LEVELS[floor - 1], 0. if idx < 7 else math.pi / 2)
+
+def p1_trolley_pose(floor, st_idx):
+    """Initial pose (x, y, z, yaw) of the P1 trolley at st['mark'] on (floor 1..4, st_idx 0..13)."""
+    idx = st_idx % len(P1_STATIONS)
+    tx, ty, tyaw = FF.p1_trolley_xy_yaw(idx)
+    return (tx, ty, LEVELS[floor - 1], tyaw)
+
+def p1_active_carton_pose(floor, st_idx):
+    """World pose (x, y, z, yaw) on the working edge of the P1 desk where the worker packs 3 medicine boxes."""
+    idx = st_idx % len(P1_STATIONS)
+    st = P1_STATIONS[idx]
+    dx, dy = FF.cx(st['desk']), FF.cy(st['desk'])
+    z = LEVELS[floor - 1] + .85 + CARTON[2] / 2
+    if idx < 7:
+        return (dx + .45, dy - .18, z, 0.)
+    return (dx + .18, dy - .45, z, math.pi / 2)
+
+def p1_aside_carton_pose(floor, st_idx):
+    """World pose (x, y, z, yaw) further onto the P1 desk where the packed carton is set aside before disappearing."""
+    idx = st_idx % len(P1_STATIONS)
+    st = P1_STATIONS[idx]
+    dx, dy = FF.cx(st['desk']), FF.cy(st['desk'])
+    z = LEVELS[floor - 1] + .85 + CARTON[2] / 2
+    if idx < 7:
+        return (dx - .15, dy + .10, z, 0.)
+    return (dx - .10, dy + .15, z, math.pi / 2)
+
+def p1_med_in_carton(carton_pose, m):
+    """World pose (x, y, z, yaw) of yellow medicine box m (0..2) packed inside a carton on the P1 desk."""
+    cx, cy, cz = carton_pose[:3]
+    cyaw = carton_pose[3] if len(carton_pose) > 3 else 0.
+    offset = (m - (U1_MED_PER_CARTON - 1) / 2) * .10
+    dx, dy = _rot(cyaw, (offset, 0.))
+    return (cx + dx, cy + dy, cz + .05, cyaw)
+
+def p1_agv_route(start_xyz, end_xyz, st_idx):
+    """3D polyline along CAD agv_paths connecting P1 station rack spot and Kho 04 rack_cells on the same floor."""
+    idx = st_idx % len(P1_STATIONS)
+    x1, y1, z = start_xyz[:3]
+    x2, y2 = end_xyz[:2]
+    _, _, corr_y = P1_CELL_MAP[idx]
+    st = P1_STATIONS[idx]
+    rx, ry = FF.cx(st['rack']), FF.cy(st['rack'])
+    raw = [(x1, y1, z)]
+    if idx >= 7:
+        if abs(x1 - rx) < 1e-2 and abs(y1 - corr_y) > 1e-2:
+            raw += [(-45.706, y1, z), (-45.706, corr_y, z)]
+        elif abs(y1 - corr_y) > 1e-2:
+            raw.append((x1, corr_y, z))
+        if abs(x2 - rx) < 1e-2 and abs(y2 - corr_y) > 1e-2:
+            raw += [(-45.706, corr_y, z), (-45.706, y2, z), (x2, y2, z)]
+        else:
+            raw += [(x2, corr_y, z), (x2, y2, z)]
+    else:
+        raw += [(x1, corr_y, z), (x2, corr_y, z), (x2, y2, z)]
+    pts = [raw[0]]
+    for p in raw[1:]:
+        if math.hypot(p[0] - pts[-1][0], p[1] - pts[-1][1]) > 1e-4:
+            pts.append(p)
+    return pts
+
+def p1_k06_route(start_xyz, end_xyz, st_idx):
+    """3D polyline along CAD perimeter agv_paths connecting P1 trolley mark and Khu 06."""
+    idx = st_idx % len(P1_STATIONS)
+    x1, y1, z = start_xyz[:3]
+    x2, y2 = end_xyz[:2]
+    if idx < 7:
+        if y1 > 40.:
+            raw = [(x1, y1, z), (x1, 45.291, z), (-10.067, 45.291, z), (-10.067, 13.795, z), (x2, 13.795, z), (x2, y2, z)]
+        else:
+            raw = [(x1, y1, z), (x1, 13.795, z), (-10.067, 13.795, z), (-10.067, 45.291, z), (x2, 45.291, z), (x2, y2, z)]
+    else:
+        if x1 < -40.:
+            raw = [(x1, y1, z), (-45.706, y1, z), (-45.706, 45.291, z), (-10.067, 45.291, z), (-10.067, 13.795, z), (x2, 13.795, z), (x2, y2, z)]
+        else:
+            raw = [(x1, y1, z), (x1, 13.795, z), (-10.067, 13.795, z), (-10.067, 45.291, z), (-45.706, 45.291, z), (-45.706, y2, z), (x2, y2, z)]
     pts = [raw[0]]
     for p in raw[1:]:
         if math.hypot(p[0] - pts[-1][0], p[1] - pts[-1][1]) > 1e-4:

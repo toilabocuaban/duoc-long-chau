@@ -103,13 +103,13 @@ for x,y,_,_ in PARKS:
     for dy in [-.95,.95]: v.append(box(f'parkend{x}_{dy}',x,y+dy,.005,1.46,.06,.01,'.16 .42 .35 1'))
 v.extend([box('back_wall',26,51,10,54,.18,20,'.64 .67 .69 1'),box('right_wall',53,25,10,.18,52,20,'.59 .63 .65 1')])
 for x in range(0,54,6): v.append(box(f'building_column{x}',x,50.8,10,.25,.3,20,'.35 .39 .42 1'))
-model('site',(0,0,0),v)
+model('site',(0,0,0),merge_boxes('site_mesh',v))
 truck_scene.add_scene(C,model)
 # 4-floor picking building west of the store (CAD, four_floor_scene.py); replaces the old placeholder zone.
 import four_floor_scene
 import loose_goods
 _spots=C.get('loose_pallet_spots',[])
-if _spots: four_floor_scene.ANIMATED_WORKER_AREAS={'carton_inbound','sorting','unpack','put_away'}
+if _spots: four_floor_scene.ANIMATED_WORKER_AREAS={'carton_inbound','sorting','unpack','put_away','picking_station'}
 parts.extend(four_floor_scene.models())
 import dock_flow
 dock_flow.scene(C,model,pallet_deck)
@@ -133,27 +133,42 @@ if _spots:
             wx,wy,wyaw,wz=loose_goods.u2_station(f,u2_idx)
             for name,pose in loose_goods.operator_pose(loose_goods.u2_worker_id(f,u2_idx),wx,wy,wyaw,z0=wz).items():
                 model(name,(pose[0],pose[1],pose[2],pose[5]),_part_mesh[name.split('_',1)[1]])
+        for st_idx in range(len(loose_goods.P1_STATIONS)):
+            wx,wy,wyaw,wz=loose_goods.p1_station(f,st_idx)
+            for name,pose in loose_goods.operator_pose(loose_goods.p1_worker_id(f,st_idx),wx,wy,wyaw,z0=wz).items():
+                model(name,(pose[0],pose[1],pose[2],pose[5]),_part_mesh[name.split('_',1)[1]])
     _deck=merge_boxes('loose_deck',pallet_deck())
     for s,(x,y,yaw) in enumerate(_spots): model(f'loose_pallet_{s}',(x,y,-5,yaw),_deck)
     cl,cw,ch=loose_goods.CARTON
     _carton=merge_boxes('loose_carton',[box('c',0,0,0,cl,cw,ch-.004,CARTON),box('t',0,0,ch/2-.003,.06,cw+.002,.006,'.9 .8 .57 1')])
     _med_box=merge_boxes('med_box',[box(f'mb{k}',*b) for k,b in enumerate(loose_goods.med_box_parts())])
-    for i in range(int(C.get('loose_pallets',0))*int(C.get('loose_cartons_per_pallet',0))):
+    _loose_pool=max(180,int(C.get('loose_pallets',0))*int(C.get('loose_cartons_per_pallet',0)))
+    for i in range(_loose_pool):
         model(f'carton_{i}',(_spots[0][0],_spots[0][1],-5),_carton)
-        for m in range(loose_goods.U1_MED_PER_CARTON):
-            model(f'med_{i}_{m}',(_spots[0][0],_spots[0][1],-5),_med_box)
-    _z05_per=int(C.get('z05_cartons_per_pallet',loose_goods.Z05_CARTONS_PER_PALLET))
+    _z05_pool=max(80,len(loose_goods.Z05_WORKERS)*int(C.get('z05_cartons_per_pallet',loose_goods.Z05_CARTONS_PER_PALLET))*2)
     for f in loose_goods.floors():
+        z0=loose_goods.LEVELS[f-1]
+        for b in range(len(loose_goods.BRANCHES)):
+            rx,ry,_,_=loose_goods.u1_rack_pose(f,b)
+            for m in range(loose_goods.U1_MED_PER_CARTON):
+                model(f'u1_med_{f}_{b}_{m}',(rx,ry,-5,0),_med_box)
         for z_idx in range(len(loose_goods.Z05_WORKERS)):
             wx,wy,_,_=loose_goods.z05_station(f,z_idx)
             model(f'z05_deck_{f}_{z_idx}',(wx,wy,-5,0),_deck)
-            for c_idx in range(_z05_per):
-                model(f'z05_carton_{f}_{z_idx}_{c_idx}',(wx,wy,-5,0),_carton)
+        w0x,w0y,_,_=loose_goods.z05_station(f,0)
+        for c_idx in range(_z05_pool):
+            model(f'z05_carton_{f}_{c_idx}',(w0x,w0y,-5,0),_carton)
         for u2_idx in range(len(loose_goods.U2_WORKERS)):
             rx,ry,_,_=loose_goods.u2_rack_pose(f,u2_idx)
-            for r_idx in range(loose_goods.U2_RACKS_PER_STATION):
-                for m in range(loose_goods.U1_MED_PER_CARTON):
-                    model(f'u2_med_{f}_{u2_idx}_{r_idx}_{m}',(rx,ry,-5,0),_med_box)
+            for m in range(loose_goods.U1_MED_PER_CARTON):
+                model(f'u2_med_{f}_{u2_idx}_{m}',(rx,ry,-5,0),_med_box)
+        for st_idx in range(len(loose_goods.P1_STATIONS)):
+            r0_pose=loose_goods.p1_rack_pose(f,st_idx)
+            for m in range(loose_goods.U1_MED_PER_CARTON):
+                model(f'p1_med_{f}_{st_idx}_{m}',loose_goods.u1_med_on_rack(r0_pose,m,0),_med_box)
+            t_pose=loose_goods.p1_trolley_pose(f,st_idx)
+            for c_slot in range(loose_goods.TROLLEY_CAPACITY):
+                model(f'p1_carton_{f}_{st_idx}_{c_slot}',loose_goods.trolley_carton_pose(t_pose,c_slot),_carton)
 from cad_scene import build_cad_scene
 stock_count=build_cad_scene(C,box,strut,merge_boxes,model)
 print(f'CAD slots per level: {len(LAYOUT.slots)}; illustrative stock: {stock_count}')
@@ -176,6 +191,7 @@ for i,port in enumerate(LAYOUT.data['ports']['out']):
         model(f'out_gate_{i}_{k}',(gx,gy,z),EQ.chain_conveyor(box,cylinder,port['gate_length'],1.35,'x'))
     for k,z in enumerate(C['storage_levels']):model(f'out_buffer_{i}_{k}',(bx,by,z),EQ.chain_conveyor(box,cylinder,1.6,1.35,'y',legs=False))
 
+_fork_mesh=merge_boxes('agv_fork',[box('carriage',0,0,.25,.1,.98,.5,DARK),box('forkL',.8,-.23,.04,1.6,.12,.08,STEEL),box('forkR',.8,.23,.04,1.6,.12,.08,STEEL)])
 for i in range(2):
     v=[chamfer(f'chassis{i}',-.08,0,.48,1.5,1.12,.56,WHITE),chamfer(f'counterweight{i}',-.46,0,.82,.65,1.08,.3,TEAL),box('bumper',-.82,0,.29,.1,1.05,.18,DARK),box('battery',-.1,0,.83,.5,.75,.18,DARK)]
     for a in [-.48,.48]:
@@ -186,27 +202,32 @@ for i in range(2):
     for h in [.2,1.3,2.5]: v.append(box(f'mastcross{h}',.68,0,h,.13,1,.08,DARK))
     v.extend([box('scanner',-.25,0,1.0,.24,.35,.16,DARK),box('scanwindow',-.25,-.18,1,.2,.015,.06,'.2 .45 .6 1'),cylinder('beacon',-.5,0,1.12,.06,.10,'.95 .48 .03 1')])
     for b in [-.48,.48]: v.append(box(f'status{b}',-.25,b,.67,.45,.025,.035,'.12 .8 .55 1'))
-    model(f'agv_{i}',PARKS[i],v)
-    model(f'fork_{i}',assembly(i,PARKS[i],.02)[f'fork_{i}'],[box('carriage',0,0,.25,.1,.98,.5,DARK),box('forkL',.8,-.23,.04,1.6,.12,.08,STEEL),box('forkR',.8,.23,.04,1.6,.12,.08,STEEL)])
+    model(f'agv_{i}',PARKS[i],merge_boxes(f'agv_body_{i}',v))
+    model(f'fork_{i}',assembly(i,PARKS[i],.02)[f'fork_{i}'],_fork_mesh)
 for i in range(10):
     z=C['storage_levels'][i%9];px,py=LAYOUT.slot_point(LAYOUT.parking[i//9])
     model(f'shuttle_{i}',(px,py,z),EQ.shuttle_body(i,box,cylinder,chamfer))
     model(f'shuttle_deck_{i}',(px,py,z-.06),EQ.shuttle_deck(box,cylinder))
     for axis in ['x','y']:
         model(f'shuttle_wheels_{axis}_{i}',(px,py,z+(0 if axis=='y' else .04)),EQ.shuttle_wheels(axis,box,cylinder))
-for i in range(C['jobs']): pallet(f'pallet_{i}',pickup_position(i))
+_seq=C.get('inbound_type_sequence',['even','odd']) or ['even']
+_use_barcode=C.get('inbound_classification')=='barcode' and bool(_spots)
+for i in range(C['jobs']):
+    if _use_barcode and str(_seq[i%len(_seq)]).lower()!='even':
+        continue
+    pallet(f'pallet_{i}',pickup_position(i))
 for i in range(C.get('initial_outbound_pallets',0)):
     xy=LAYOUT.slot_point(LAYOUT.job_slots[i%len(LAYOUT.job_slots)])
     pallet(f'pallet_out_{i}',xy+(C['storage_levels'][(i+4)%9],0))
 
 header='''<?xml version="1.0"?><sdf version="1.9"><world name="warehouse">
-<physics name="physics" type="ignored"><max_step_size>0.01</max_step_size><real_time_factor>1</real_time_factor></physics>
+<physics name="physics" type="ignored"><max_step_size>0.05</max_step_size><real_time_factor>1</real_time_factor></physics>
 <plugin filename="gz-sim-physics-system" name="gz::sim::systems::Physics"/>
 <plugin filename="gz-sim-user-commands-system" name="gz::sim::systems::UserCommands"/>
 <plugin filename="gz-sim-scene-broadcaster-system" name="gz::sim::systems::SceneBroadcaster"/>
 <scene><ambient>.5 .5 .5 1</ambient><background>.72 .76 .80 1</background><shadows>false</shadows></scene>
 <light name="sun" type="directional"><pose>0 0 30 0 0 0</pose><diffuse>.9 .9 .9 1</diffuse><direction>-.3 .2 -1</direction><cast_shadows>false</cast_shadows></light>
-<gui fullscreen="false"><plugin filename="MinimalScene" name="3D View"><gz-gui><title>Warehouse V1</title><property type="bool" key="showTitleBar">false</property><property type="string" key="state">docked</property></gz-gui><engine>ogre</engine><scene>scene</scene><ambient_light>.5 .5 .5</ambient_light><background_color>.72 .76 .80</background_color><camera_pose>8 -50 45 0 .53 1.76</camera_pose></plugin><plugin filename="GzSceneManager" name="Scene Manager"/><plugin filename="CameraTracking" name="Camera Tracking"/><plugin filename="InteractiveViewControl" name="View control"/><plugin filename="EntityContextMenuPlugin" name="Entity menu"/><plugin filename="WorldControl" name="World control"/><plugin filename="WorldStats" name="World stats"/><plugin filename="Screenshot" name="Screenshot"/><plugin filename="EntityTree" name="Entity tree"/></gui>
+<gui fullscreen="false"><plugin filename="MinimalScene" name="3D View"><gz-gui><title>Warehouse V1</title><property type="bool" key="showTitleBar">false</property><property type="string" key="state">docked</property></gz-gui><engine>ogre</engine><scene>scene</scene><ambient_light>.5 .5 .5</ambient_light><background_color>.72 .76 .80</background_color><camera_pose>8 -50 45 0 .53 1.76</camera_pose></plugin><plugin filename="GzSceneManager" name="Scene Manager"/><plugin filename="CameraTracking" name="Camera Tracking"/><plugin filename="InteractiveViewControl" name="View control"/><plugin filename="EntityContextMenuPlugin" name="Entity menu"/><plugin filename="WorldControl" name="World control"/><plugin filename="WorldStats" name="World stats"/><plugin filename="Screenshot" name="Screenshot"/></gui>
 '''
 (ROOT/'warehouse.sdf').write_text(header+''.join(parts)+'</world></sdf>')
 print(f'Generated warehouse.sdf: {len(parts)} models')

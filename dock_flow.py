@@ -45,6 +45,7 @@ def scene(c,model,pallet_deck):
     deck=merge_boxes('dock_empty_pallet',pallet_deck())
     carton=merge_boxes('dock_carton',[box('box',0,0,0,*LG.CARTON,'.76 .57 .33 1'),box('tape',0,0,.127,.05,.3,.004,'.92 .8 .57 1')])
     jack=merge_boxes('dock_jack',[box('body',-.55,0,.12,.35,.55,.18,'.9 .55 .02 1'),box('forkl',.1,-.25,.055,1.2,.12,.08,'.9 .55 .02 1'),box('forkr',.1,.25,.055,1.2,.12,.08,'.9 .55 .02 1'),box('handle',-.78,0,.65,.06,.06,1.1,'.1 .1 .1 1'),box('grip',-.78,0,1.20,.06,.5,.06,'.1 .1 .1 1')])
+    scanner=merge_boxes('dock_scanner',[box('stand',0,0,.5,.06,.06,1,'.3 .3 .3 1'),box('reader',0,0,1.02,.22,.16,.12,'.05 .12 .12 1'),box('light',0,-.085,1.03,.14,.01,.04,'.1 1 .2 1')])
     n=max(18,int(c.get('loose_cartons_per_pallet',18)))
     for i,d in enumerate(dock_list(c)):
         for name,pose in LG.operator_pose(worker_id(i),d['x']+.85,d['rear_y']+.75,math.pi).items():
@@ -52,7 +53,7 @@ def scene(c,model,pallet_deck):
         model(f'dock_deck_{i}',stage(d)[:2]+(0,0),deck)
         model(f'dock_jack_{i}',stage(d)[:2]+(0,0),jack)
         for j in range(n):model(f'dock_carton_{i}_{j}',(d['x'],d['rear_y']-1,-5),carton)
-        model(f'dock_scanner_{i}',(d['x']+.75,d['rear_y']+.45,0),[box('stand',0,0,.5,.06,.06,1,'.3 .3 .3 1'),box('reader',0,0,1.02,.22,.16,.12,'.05 .12 .12 1'),box('light',0,-.085,1.03,.14,.01,.04,'.1 1 .2 1')])
+        model(f'dock_scanner_{i}',(d['x']+.75,d['rear_y']+.45,0),scanner)
 
 class DockFlow:
     def __init__(self,c,engine,send,poses,fast,emit):

@@ -36,10 +36,21 @@ def _unpack_spots():
     return [sorted(g,key=lambda sp:-sp[1]) for g in groups]
 UNPACK_SPOTS=_unpack_spots();unpack_count={};unpack_occupant={}
 U1_PER_RACK=max(1,int(C.get('u1_cartons_per_rack',1)))
+TROLLEY_CAP=max(1,int(C.get('trolley_capacity',LG.TROLLEY_CAPACITY)))
 U1_LOCKS={(f,b):asyncio.Lock() for f in LG.floors() for b in range(len(LG.BRANCHES))}
 Z05_LOCKS={(f,z_idx):asyncio.Lock() for f in LG.floors() for z_idx in range(len(LG.Z05_WORKERS))}
+Z05_WORKER_LOCKS={(f,w_idx):asyncio.Lock() for f in LG.floors() for w_idx in range(len(LG.Z05_WORKERS))}
 U2_PER_RACK=max(1,int(C.get('u2_cartons_per_rack',1)))
 U2_LOCKS={(f,u2_idx):asyncio.Lock() for f in LG.floors() for u2_idx in range(len(LG.U2_WORKERS))}
+U2_DELIVERY_LOCKS={(f,u2_idx):asyncio.Lock() for f in LG.floors() for u2_idx in range(len(LG.U2_WORKERS))}
+P1_LOCKS={(f,st_idx):asyncio.Lock() for f in LG.floors() for st_idx in range(len(LG.P1_STATIONS))}
+P1_ROW_SEMAPHORES={(f,row):asyncio.Semaphore(2 if f==1 else 1) for f in LG.floors() for row in (0,1)}
+LOOSE_CARTON_POOL=max(180,int(C.get('loose_pallets',0))*int(C.get('loose_cartons_per_pallet',0)))
+Z05_CARTON_POOL=max(80,len(LG.Z05_WORKERS)*int(C.get('z05_cartons_per_pallet',LG.Z05_CARTONS_PER_PALLET))*2)
+FREE_CARTONS=asyncio.Queue()
+FREE_Z05_CARTONS={f:asyncio.Queue() for f in LG.floors()}
+p1_running=False
+_EVENTS_FP=None
 
 def _init_u1_state():
     state={}
@@ -48,10 +59,16 @@ def _init_u1_state():
             cells=[dict(c) for c in LG.U1_BRANCH_CELLS[b]]
             state[(f,b)]={
                 'active_rack':f'u1_rack_{f}_{b}_0',
+                'active_rack_idx':0,
                 'empty_cell':cells[0],
-                'spares':[(f'u1_rack_{f}_{b}_{r}',cells[r],[] ) for r in range(1,LG.U1_RACKS_PER_BRANCH)],
+                'spares':[(f'u1_rack_{f}_{b}_{r}',r,cells[r],[]) for r in range(1,LG.U1_RACKS_PER_BRANCH)],
                 'cartons':[],
                 'swaps':0,
+                'active_trolley':f'u1_trolley_{f}_{b}',
+                'spare_trolley':f'k06_trolley_{f}_{b%4}',
+                'k06_slot':b%4,
+                'trolley_cartons':[],
+                'trolley_swaps':0,
             }
     return state
 
@@ -67,6 +84,31 @@ def _init_u2_state():
                 'spares':[(f'u2_rack_{f}_{u2_idx}_{r}',r,cells[r],[]) for r in range(1,LG.U2_RACKS_PER_STATION)],
                 'cartons':[],
                 'swaps':0,
+                'active_trolley':f'u2_trolley_{f}_{u2_idx}',
+                'spare_trolley':f'k06_trolley_{f}_{u2_idx%4}',
+                'k06_slot':u2_idx%4,
+                'trolley_cartons':[],
+                'trolley_swaps':0,
+            }
+    return state
+
+def _init_p1_state():
+    state={}
+    for f in LG.floors():
+        for st_idx in range(len(LG.P1_STATIONS)):
+            cells=[dict(c) for c in LG.P1_STATION_CELLS[st_idx]]
+            state[(f,st_idx)]={
+                'active_rack':f'p1_rack_{f}_{st_idx}_0',
+                'active_rack_idx':0,
+                'empty_cell':cells[0],
+                'spares':[(f'p1_rack_{f}_{st_idx}_1',1,cells[1])],
+                'active_trolley':f'p1_trolley_{f}_{st_idx}',
+                'spare_trolley':f'k06_trolley_{f}_{4+(st_idx%4)}',
+                'k06_slot':4+(st_idx%4),
+                'trolley_remaining':[f'p1_carton_{f}_{st_idx}_{c}' for c in range(TROLLEY_CAP-1,-1,-1)],
+                'cartons_packed':0,
+                'rack_swaps':0,
+                'trolley_swaps':0,
             }
     return state
 
@@ -88,6 +130,7 @@ def _init_z05_floor_state():
 
 U1_STATE=_init_u1_state()
 U2_STATE=_init_u2_state()
+P1_STATE=_init_p1_state()
 Z05_FLOOR_STATE=_init_z05_floor_state()
 odd_pallet_seq=0
 
@@ -173,11 +216,17 @@ def send(changes,transmit=True,immediate=False):
     else:
         last_tx_poses.update({n:tuple(v) for n,v in changes.items()})
 
+def _write_event(record):
+    global _EVENTS_FP
+    if _EVENTS_FP is None or _EVENTS_FP.closed:
+        _EVENTS_FP=(ROOT/'events.jsonl').open('a',buffering=1)
+    _EVENTS_FP.write(json.dumps(record)+'\n')
+
 def event(job,state,**extra):
     record={'job':job,'state':state,'demo_time_s':round(scheduler.time,5),**extra}
     events.append(record)
     (ROOT/'status.json').write_text(json.dumps(record,indent=2))
-    with (ROOT/'events.jsonl').open('a') as f: f.write(json.dumps(record)+'\n')
+    _write_event(record)
     print(f'Pallet {job+1:02d}: {state}',flush=True)
 
 route_checks=0
@@ -334,10 +383,9 @@ async def arrivals(total):
             odd_idx=odd_pallet_seq;odd_pallet_seq+=1
             spot=LOOSE_SPOTS[odd_idx%len(LOOSE_SPOTS)]
             spot_lock=ODD_SPOT_LOCKS[odd_idx%len(ODD_SPOT_LOCKS)]
-            base_idx=(odd_idx%max(1,LOOSE_PALLETS))*LOOSE_PER
-            names=[f'carton_{base_idx+j}' for j in range(LOOSE_PER)]
             stack=LG.stack_positions(spot,LOOSE_PER)
             async def receive_odd(dock_i,cartons):
+                names=[await FREE_CARTONS.get() for _ in range(LOOSE_PER)]
                 send({n:poses[n][:2]+(-5,0) for n in cartons},transmit=not args.fast)
                 send({n:p+(spot[2],) for n,p in zip(names,stack)},transmit=not args.fast)
                 for n,p in zip(names,stack):
@@ -352,7 +400,7 @@ async def arrivals(total):
                 loose_event('LOOSE_PALLET_EMPTY',pallet=odd_idx,spot=odd_idx%len(LOOSE_SPOTS))
             async with spot_lock:
                 try:
-                    await dock_flow.prepare('odd',job,spot,names,receive_odd)
+                    await dock_flow.prepare('odd',job,spot,list(range(LOOSE_PER)),receive_odd)
                 finally:
                     if pickup_bays:pickup_bays[job%len(pickup_bays)].release()
             return
@@ -463,7 +511,7 @@ loose_stats={'pallets_unpacked':0,'cartons_on_belt':0,'cartons_delivered':0,'per
 def loose_event(state,**extra):
     record={'job':None,'loose':True,'state':state,'demo_time_s':round(scheduler.time,5),**extra}
     events.append(record)
-    with (ROOT/'events.jsonl').open('a') as f: f.write(json.dumps(record)+'\n')
+    _write_event(record)
     if 'pallet' in extra and state.startswith('LOOSE_PALLET'): print(f"Loose pallet {extra['pallet']+1:02d}: {state}",flush=True)
 
 async def follow_path(name,pts,speed):
@@ -474,11 +522,11 @@ async def follow_path(name,pts,speed):
 
 U1_PHASES=(.15,.10,.15,.20,.12,.10,.08,.10)
 
-async def u1_operator_cycle(floor,branch,carton,rack_pose,tray_slot=0):
+async def u1_operator_cycle(floor,branch,carton,rack_pose,rack_idx,trolley_slot,tray_slot=0):
     """U1 sorting worker at the end of branch (*U632):
     1. Opens carton on the belt end, revealing 3 yellow medicine boxes inside.
     2. Picks each yellow medicine box (3 turns), turns 180 deg, and places it into the hollow blue tray on the U1 rack.
-    3. Clears the empty carton shell from the belt end."""
+    3. Picks up the empty carton shell and places it into the empty Trolley standing next to the worker."""
     wid=LG.u1_worker_id(floor,branch)
     sx,sy,syaw,z0=LG.u1_station(floor,branch)
     open_s=float(C.get('u1_open_carton_s',4.0))
@@ -486,9 +534,8 @@ async def u1_operator_cycle(floor,branch,carton,rack_pose,tray_slot=0):
     d=[f*pick_s for f in U1_PHASES]
     pick_y=11.85;pick_bend,pick_arm=.38,.72
     place_y=12.06;place_bend,place_arm=.14,1.14
-    c_idx=int(carton.split('_')[1])
     med_count=int(C.get('u1_med_boxes_per_carton',LG.U1_MED_PER_CARTON))
-    med_names=[f'med_{c_idx}_{m}' for m in range(med_count)]
+    med_names=[f'u1_med_{floor}_{branch}_{m}' for m in range(med_count)]
     c_pose=poses[carton]
     state={'x':sx,'y':sy,'yaw':syaw,'bend':0.,'arm':0.}
     async def phase(dur,x=None,y=None,yaw=None,bend=None,arm=None,carry_item=None,item_to=None,walk=False):
@@ -496,11 +543,12 @@ async def u1_operator_cycle(floor,branch,carton,rack_pose,tray_slot=0):
              'yaw':a['yaw'] if yaw is None else a['yaw']+math.atan2(math.sin(yaw-a['yaw']),math.cos(yaw-a['yaw'])),
              'bend':a['bend'] if bend is None else bend,'arm':a['arm'] if arm is None else arm}
         steps=max(1,round(math.hypot(b['x']-a['x'],b['y']-a['y'])/STEP)) if walk else 0
+        upper_only=(not walk and abs(b['yaw']-a['yaw'])<1e-6 and abs(b['x']-a['x'])<1e-6 and abs(b['y']-a['y'])<1e-6)
         item_name=carry_item or (item_to[0] if item_to else None)
         i0=poses[item_name] if item_name else None
         def at(q):
             k={key:a[key]+(b[key]-a[key])*q for key in a}
-            out=LG.operator_pose(wid,k['x'],k['y'],k['yaw'],k['bend'],k['arm'],.30*math.sin(math.pi*steps*q) if walk else 0.,z0=z0)
+            out=LG.operator_pose(wid,k['x'],k['y'],k['yaw'],k['bend'],k['arm'],.30*math.sin(math.pi*steps*q) if walk else 0.,z0=z0,upper_only=upper_only)
             if carry_item:
                 out[carry_item]=LG.held_carton(k['x'],k['y'],k['yaw'],k['bend'],k['arm'],z0=z0)
             elif item_to is not None:
@@ -530,10 +578,69 @@ async def u1_operator_cycle(floor,branch,carton,rack_pose,tray_slot=0):
         loose_event('MED_BOX_PLACED_IN_TRAY',carton=carton,med_box=m_name,box_index=m,floor=floor,branch=branch)
         await phase(d[6],y=sy,bend=0.,arm=0.,walk=True)
         await phase(d[7],yaw=syaw)
-    # 3. Automatically clear the empty carton shell from the belt end
-    send({carton:(c_pose[0],c_pose[1],-5,0)},transmit=not args.fast)
-    loose_event('EMPTY_CARTON_CLEARED',carton=carton,floor=floor,branch=branch)
+    # 3. Pick up the empty carton shell and place it into the adjacent U1 Trolley
+    t_pose=LG.u1_trolley_pose(floor,branch)
+    target_in_trolley=LG.trolley_carton_pose(t_pose,trolley_slot)
+    t_yaw=math.atan2(target_in_trolley[1]-sy,target_in_trolley[0]-sx)
+    await phase(d[0],y=pick_y,yaw=syaw,bend=pick_bend,arm=pick_arm,walk=True)
+    grab_c=LG.held_carton(sx,pick_y,syaw,pick_bend,pick_arm,z0=z0)
+    await phase(d[1],item_to=(carton,grab_c))
+    await phase(d[2],y=sy,bend=CARRY[0],arm=CARRY[1],carry_item=carton,walk=True)
+    await phase(d[3],yaw=t_yaw,carry_item=carton)
+    await phase(d[4],bend=.22,arm=.95,carry_item=carton)
+    await phase(d[5],item_to=(carton,target_in_trolley))
+    await phase(d[6],x=sx,y=sy,yaw=syaw,bend=0.,arm=0.)
+    loose_event('EMPTY_CARTON_IN_TROLLEY',carton=carton,floor=floor,branch=branch,slot=trolley_slot)
     return placed
+
+async def u1_trolley_swap_cycle(floor,branch,cartons_in_trolley):
+    """When U1 trolley reaches 5 empty cartons, U1 AGV transports the full trolley to Khu 06 and brings an empty trolley back."""
+    agv=f'u1_agv_{floor}_{branch}'
+    bx,u1_y,z0,_=LG.u1_rack_pose(floor,branch)
+    tx,ty,_,tyaw=LG.u1_trolley_pose(floor,branch)
+    st=U1_STATE[(floor,branch)]
+    trolley=st['active_trolley']
+    k06_slot=st['k06_slot']
+    kx,ky,_,kyaw=LG.k06_slot_pose(floor,k06_slot)
+    speed=float(C.get('u1_agv_speed',0.45))
+    lift_z=.03
+    # 1. Move AGV from U1 rack to U1 trolley
+    pts_to_t=LG.u1_k06_route((bx,u1_y,z0),(tx,ty,z0))
+    len_to_t=LG.length(pts_to_t)
+    await engine.move({agv:LG.along(pts_to_t,len_to_t)},speed=speed,duration=max(.1,len_to_t/speed),
+                      transform=lambda q:{agv:LG.along(pts_to_t,q*len_to_t)},shape=blend,exact=True)
+    # 2. Carry full trolley (+ 5 empty cartons) to Khu 06
+    pts_k06=LG.u1_k06_route((tx,ty,z0),(kx,ky,z0))
+    len_k06=LG.length(pts_k06)
+    def at_k06(q):
+        ax,ay,az,ayaw=LG.along(pts_k06,q*len_k06)
+        tp=(ax,ay,z0+lift_z,tyaw)
+        out={agv:(ax,ay,z0,ayaw),trolley:tp}
+        for idx,c_name in enumerate(cartons_in_trolley):
+            out[c_name]=LG.trolley_carton_pose(tp,idx)
+        return out
+    await engine.move(at_k06(1.),speed=speed,duration=max(.1,len_k06/speed),transform=at_k06,shape=blend,exact=True)
+    send({trolley:(kx,ky,z0,kyaw),**{c_name:(kx,ky,-5,0) for c_name in cartons_in_trolley}},transmit=not args.fast)
+    for c_name in cartons_in_trolley:
+        FREE_CARTONS.put_nowait(c_name)
+    loose_event('U1_TROLLEY_DELIVERED_TO_K06',floor=floor,branch=branch,trolley=trolley,k06_slot=k06_slot)
+    # 3. Bring empty replacement trolley from Khu 06 back to U1 station
+    pts_back=LG.u1_k06_route((kx,ky,z0),(tx,ty,z0))
+    len_back=LG.length(pts_back)
+    def at_back(q):
+        ax,ay,az,ayaw=LG.along(pts_back,q*len_back)
+        return {agv:(ax,ay,z0,ayaw),trolley:(ax,ay,z0+lift_z,tyaw)}
+    await engine.move(at_back(1.),speed=speed,duration=max(.1,len_back/speed),transform=at_back,shape=blend,exact=True)
+    send({trolley:(tx,ty,z0,tyaw)},transmit=not args.fast)
+    # 4. Return AGV to U1 rack position
+    pts_home=LG.u1_k06_route((tx,ty,z0),(bx,u1_y,z0))
+    len_home=LG.length(pts_home)
+    await engine.move({agv:LG.along(pts_home,len_home)},speed=speed,duration=max(.1,len_home/speed),
+                      transform=lambda q:{agv:LG.along(pts_home,q*len_home)},shape=blend,exact=True)
+    send({agv:(bx,u1_y,z0,math.pi/2)},transmit=not args.fast)
+    st['trolley_cartons']=[]
+    st['trolley_swaps']+=1
+    loose_event('U1_REPLACEMENT_TROLLEY_READY',floor=floor,branch=branch,trolley=trolley)
 
 async def u1_agv_swap_cycle(floor,branch,full_rack,meds_on_rack,store_cell,next_rack,spare_cell,old_spare_meds=()):
     """AGV slowly carries full_rack (+ yellow medicine boxes in blue tray) along agv_paths to Kho 04, then brings next_rack to U1."""
@@ -553,15 +660,13 @@ async def u1_agv_swap_cycle(floor,branch,full_rack,meds_on_rack,store_cell,next_
         return out
     await engine.move(at_store(1.),speed=speed,duration=max(.1,len_store/speed),transform=at_store,shape=blend,exact=True)
     settled=(store_cell['x'],store_cell['y'],z0,0.)
-    send({full_rack:settled,**{m_name:LG.u1_med_on_rack(settled,m_idx,t_slot) for m_name,m_idx,t_slot in meds_on_rack}},transmit=not args.fast)
+    send({full_rack:settled,**{m_name:(settled[0],settled[1],-5,0) for m_name,_,_ in meds_on_rack}},transmit=not args.fast)
     loose_event('AGV_RACK_STORED',floor=floor,branch=branch,rack=full_rack,warehouse='04',cell=[round(store_cell['x'],3),round(store_cell['y'],3)])
     # 2. Drive empty AGV to the replacement rack cell in Kho 04
     pts_spare=LG.u1_agv_route((store_cell['x'],store_cell['y'],z0),(spare_cell['x'],spare_cell['y'],z0),branch)
     len_spare=LG.length(pts_spare)
     await engine.move({agv:LG.along(pts_spare,len_spare)},speed=speed,duration=max(.1,len_spare/speed),
                       transform=lambda q:{agv:LG.along(pts_spare,q*len_spare)},shape=blend,exact=True)
-    if old_spare_meds:
-        send({m_name:poses[m_name][:2]+(-5,0) for m_name,_,_ in old_spare_meds},transmit=not args.fast)
     # 3. Pick up replacement empty rack in Kho 04 and bring it out to U1 station behind the worker
     loose_event('AGV_REPLACEMENT_RACK_PICKUP',floor=floor,branch=branch,rack=next_rack,from_cell=[round(spare_cell['x'],3),round(spare_cell['y'],3)])
     pts_u1=LG.u1_agv_route((spare_cell['x'],spare_cell['y'],z0),(bx,u1_y,z0),branch)
@@ -582,23 +687,29 @@ async def carton_trip(name,dest,branch):
     async with U1_LOCKS[(dest,b)]:
         st=U1_STATE[(dest,b)]
         rack=st['active_rack']
+        rack_idx=st['active_rack_idx']
         tray_slot=len(st['cartons'])
+        trolley_slot=len(st['trolley_cartons'])
         rack_pose=LG.u1_rack_pose(dest,b)
         loose_event('WORKER_OPEN_CARTON',carton=name,floor=dest,branch=b,rack=rack)
-        placed_meds=await u1_operator_cycle(dest,b,name,rack_pose,tray_slot)
+        placed_meds=await u1_operator_cycle(dest,b,name,rack_pose,rack_idx,trolley_slot,tray_slot)
         st['cartons'].append((name,placed_meds))
+        st['trolley_cartons'].append(name)
         loose_event('CARTON_PLACED_ON_RACK',carton=name,floor=dest,branch=b,rack=rack,slot=tray_slot,med_boxes=[m[0] for m in placed_meds])
         if len(st['cartons'])>=U1_PER_RACK:
             store_cell=st['empty_cell']
-            next_rack,spare_cell,old_meds=st['spares'].pop(0)
+            next_rack,next_rack_idx,spare_cell,old_meds=st['spares'].pop(0)
             carried_meds=[item for _,meds in st['cartons'] for item in meds]
             loose_event('AGV_RACK_PICKUP',floor=dest,branch=b,rack=rack,cartons=[c for c,_ in st['cartons']])
             await u1_agv_swap_cycle(dest,b,rack,carried_meds,store_cell,next_rack,spare_cell,old_meds)
-            st['spares'].append((rack,store_cell,carried_meds))
+            st['spares'].append((rack,rack_idx,store_cell,carried_meds))
             st['active_rack']=next_rack
+            st['active_rack_idx']=next_rack_idx
             st['empty_cell']=spare_cell
             st['cartons']=[]
             st['swaps']+=1
+        if len(st['trolley_cartons'])>=TROLLEY_CAP:
+            await u1_trolley_swap_cycle(dest,b,list(st['trolley_cartons']))
     loose_stats['cartons_delivered']+=1
     loose_stats['per_floor'][dest]=loose_stats['per_floor'].get(dest,0)+1
 
@@ -616,11 +727,12 @@ async def _z05_move_worker(floor,worker_idx,dur,x=None,y=None,yaw=None,bend=None
         walk_speed=max(.1,float(C.get('z05_walk_speed',1.1)))
         dur=max(.04,dist/walk_speed)
     steps=max(1,round(dist/STEP)) if walk else 0
+    upper_only=(not walk and abs(b['yaw']-a['yaw'])<1e-6 and dist<1e-6)
     c_name=carry_carton or (carton_to[0] if carton_to else None)
     c0=poses[c_name] if c_name else None
     def at(q):
         k={key:a[key]+(b[key]-a[key])*q for key in a}
-        out=LG.operator_pose(wid,k['x'],k['y'],k['yaw'],k['bend'],k['arm'],.35*math.sin(math.pi*steps*q) if walk else 0.,z0=z0)
+        out=LG.operator_pose(wid,k['x'],k['y'],k['yaw'],k['bend'],k['arm'],.35*math.sin(math.pi*steps*q) if walk else 0.,z0=z0,upper_only=upper_only)
         if carry_carton:
             out[carry_carton]=LG.held_carton(k['x'],k['y'],k['yaw'],k['bend'],k['arm'],z0=z0)
         elif carton_to is not None:
@@ -652,62 +764,69 @@ async def z05_operator_deliver_one(floor,worker_idx,batch,carton,stack_pos,u2_id
     await _z05_move_worker(floor,worker_idx,.25,carton_to=(carton,grab))
     await _z05_move_worker(floor,worker_idx,.40,bend=CARRY[0],arm=CARRY[1],carry_carton=carton)
     if not batch['items']:
-        batch['done_event'].set()
+        send({batch['deck']:(batch['spot_xy'][0],batch['spot_xy'][1],-5,0)},transmit=not args.fast)
     head_to_u2=math.atan2(dy_stand-py,dx_stand-px)
     await _z05_move_worker(floor,worker_idx,.22,yaw=head_to_u2,carry_carton=carton)
     await _z05_move_worker(floor,worker_idx,0.,x=dx_stand,y=dy_stand,carry_carton=carton,walk=True)
     await _z05_move_worker(floor,worker_idx,.18,yaw=dyaw,carry_carton=carton)
-    prev_task=Z05_FLOOR_STATE[floor]['u2_active_task'][u2_idx]
-    if prev_task is not None and not prev_task.done():
-        await prev_task
-    await _z05_move_worker(floor,worker_idx,.40,bend=drop_bend,arm=drop_arm,carry_carton=carton)
-    await _z05_move_worker(floor,worker_idx,.25,carton_to=(carton,drop_pose))
-    await _z05_move_worker(floor,worker_idx,.30,bend=0.,arm=0.)
-    loose_event('Z05_CARTON_DELIVERED_TO_U2',job=batch['job'],floor=floor,zone=batch['zone'],worker=worker_idx,carton=carton,u2_station=u2_idx)
-    t=asyncio.create_task(u2_carton_trip(floor,u2_idx,carton,batch['job']))
-    Z05_FLOOR_STATE[floor]['u2_active_task'][u2_idx]=t
-    batch['u2_tasks'].append(t)
+    async with U2_DELIVERY_LOCKS[(floor,u2_idx)]:
+        prev_task=Z05_FLOOR_STATE[floor]['u2_active_task'][u2_idx]
+        if prev_task is not None and not prev_task.done():
+            await prev_task
+        await _z05_move_worker(floor,worker_idx,.40,bend=drop_bend,arm=drop_arm,carry_carton=carton)
+        await _z05_move_worker(floor,worker_idx,.25,carton_to=(carton,drop_pose))
+        await _z05_move_worker(floor,worker_idx,.30,bend=0.,arm=0.)
+        loose_event('Z05_CARTON_DELIVERED_TO_U2',job=batch['job'],floor=floor,zone=batch['zone'],worker=worker_idx,carton=carton,u2_station=u2_idx)
+        t=asyncio.create_task(u2_carton_trip(floor,u2_idx,carton,batch['job']))
+        Z05_FLOOR_STATE[floor]['u2_active_task'][u2_idx]=t
+        batch['u2_tasks'].append(t)
+        if len(batch['u2_tasks'])>=batch['total_items']:
+            batch['done_event'].set()
 
 async def z05_worker_loop(floor,worker_idx):
     """Flexible Zone 05 worker coroutine: moves to whichever Zone 05 unpack zone (0 or 1) has cartons waiting,
     and distributes them across all 6 U2 stations (0..5) at constant walking speed."""
-    fst=Z05_FLOOR_STATE[floor]
-    n_u2=len(LG.U2_WORKERS)
-    while True:
-        batch=None
-        for z_cand in (worker_idx,1-worker_idx):
-            b_cand=fst['zones'].get(z_cand)
-            if b_cand is not None and b_cand['items']:
-                batch=b_cand
+    async with Z05_WORKER_LOCKS[(floor,worker_idx)]:
+        fst=Z05_FLOOR_STATE[floor]
+        n_u2=len(LG.U2_WORKERS)
+        while True:
+            while True:
+                batch=None
+                for z_cand in (worker_idx,1-worker_idx):
+                    b_cand=fst['zones'].get(z_cand)
+                    if b_cand is not None and b_cand['items']:
+                        batch=b_cand
+                        break
+                if batch is None:
+                    break
+                carton,stack_pos=batch['items'].pop(0)
+                u2_idx=None
+                for k in range(n_u2):
+                    cand=(fst['next_u2']+k)%n_u2
+                    t_cand=fst['u2_active_task'][cand]
+                    if t_cand is None or t_cand.done():
+                        u2_idx=cand
+                        fst['next_u2']=(cand+1)%n_u2
+                        break
+                if u2_idx is None:
+                    u2_idx=fst['next_u2']%n_u2
+                    fst['next_u2']=(u2_idx+1)%n_u2
+                await z05_operator_deliver_one(floor,worker_idx,batch,carton,stack_pos,u2_idx)
+            sx,sy,syaw,_=LG.z05_station(floor,worker_idx)
+            state=fst['worker_poses'][worker_idx]
+            if math.hypot(sx-state['x'],sy-state['y'])>1e-3:
+                head_home=math.atan2(sy-state['y'],sx-state['x'])
+                await _z05_move_worker(floor,worker_idx,.22,yaw=head_home)
+                await _z05_move_worker(floor,worker_idx,0.,x=sx,y=sy,walk=True)
+            await _z05_move_worker(floor,worker_idx,.18,yaw=syaw,bend=0.,arm=0.)
+            if not any(b_cand is not None and b_cand['items'] for b_cand in fst['zones'].values()):
                 break
-        if batch is None:
-            break
-        carton,stack_pos=batch['items'].pop(0)
-        u2_idx=None
-        for k in range(n_u2):
-            cand=(fst['next_u2']+k)%n_u2
-            t_cand=fst['u2_active_task'][cand]
-            if t_cand is None or t_cand.done():
-                u2_idx=cand
-                fst['next_u2']=(cand+1)%n_u2
-                break
-        if u2_idx is None:
-            u2_idx=fst['next_u2']%n_u2
-            fst['next_u2']=(u2_idx+1)%n_u2
-        await z05_operator_deliver_one(floor,worker_idx,batch,carton,stack_pos,u2_idx)
-    sx,sy,syaw,_=LG.z05_station(floor,worker_idx)
-    state=fst['worker_poses'][worker_idx]
-    if math.hypot(sx-state['x'],sy-state['y'])>1e-3:
-        head_home=math.atan2(sy-state['y'],sx-state['x'])
-        await _z05_move_worker(floor,worker_idx,.22,yaw=head_home)
-        await _z05_move_worker(floor,worker_idx,0.,x=sx,y=sy,walk=True)
-    await _z05_move_worker(floor,worker_idx,.18,yaw=syaw,bend=0.,arm=0.)
 
-async def u2_operator_cycle(floor,u2_idx,carton,rack_pose,rack_idx,tray_slot=0):
+async def u2_operator_cycle(floor,u2_idx,carton,rack_pose,rack_idx,trolley_slot,tray_slot=0):
     """U2 put-away worker at (floor, u2_idx):
     1. Bends down and opens the carton placed on the floor in front of them, revealing 3 yellow medicine boxes inside.
     2. Picks each yellow medicine box (3 turns) from the carton on the ground, turns 180 deg, and places it into the hollow blue tray on the U2 rack behind them.
-    3. Clears the empty carton shell from the floor."""
+    3. Picks up the empty carton shell from the floor and places it into the adjacent U2 Trolley."""
     wid=LG.u2_worker_id(floor,u2_idx)
     sx,sy,syaw,z0=LG.u2_station(floor,u2_idx)
     open_s=float(C.get('u2_open_carton_s',4.0))
@@ -716,7 +835,7 @@ async def u2_operator_cycle(floor,u2_idx,carton,rack_pose,rack_idx,tray_slot=0):
     pick_x=sx+.22;pick_bend,pick_arm=.86,.52
     place_x=sx-.10;place_bend,place_arm=.14,1.14
     med_count=int(C.get('u2_med_boxes_per_carton',LG.U1_MED_PER_CARTON))
-    med_names=[f'u2_med_{floor}_{u2_idx}_{rack_idx}_{m}' for m in range(med_count)]
+    med_names=[f'u2_med_{floor}_{u2_idx}_{m}' for m in range(med_count)]
     c_pose=poses[carton]
     state={'x':sx,'y':sy,'yaw':syaw,'bend':0.,'arm':0.}
     async def phase(dur,x=None,y=None,yaw=None,bend=None,arm=None,carry_item=None,item_to=None,walk=False):
@@ -724,11 +843,12 @@ async def u2_operator_cycle(floor,u2_idx,carton,rack_pose,rack_idx,tray_slot=0):
              'yaw':a['yaw'] if yaw is None else a['yaw']+math.atan2(math.sin(yaw-a['yaw']),math.cos(yaw-a['yaw'])),
              'bend':a['bend'] if bend is None else bend,'arm':a['arm'] if arm is None else arm}
         steps=max(1,round(math.hypot(b['x']-a['x'],b['y']-a['y'])/STEP)) if walk else 0
+        upper_only=(not walk and abs(b['yaw']-a['yaw'])<1e-6 and abs(b['x']-a['x'])<1e-6 and abs(b['y']-a['y'])<1e-6)
         item_name=carry_item or (item_to[0] if item_to else None)
         i0=poses[item_name] if item_name else None
         def at(q):
             k={key:a[key]+(b[key]-a[key])*q for key in a}
-            out=LG.operator_pose(wid,k['x'],k['y'],k['yaw'],k['bend'],k['arm'],.30*math.sin(math.pi*steps*q) if walk else 0.,z0=z0)
+            out=LG.operator_pose(wid,k['x'],k['y'],k['yaw'],k['bend'],k['arm'],.30*math.sin(math.pi*steps*q) if walk else 0.,z0=z0,upper_only=upper_only)
             if carry_item:
                 out[carry_item]=LG.held_carton(k['x'],k['y'],k['yaw'],k['bend'],k['arm'],z0=z0)
             elif item_to is not None:
@@ -758,10 +878,69 @@ async def u2_operator_cycle(floor,u2_idx,carton,rack_pose,rack_idx,tray_slot=0):
         loose_event('U2_MED_BOX_PLACED_IN_TRAY',carton=carton,med_box=m_name,box_index=m,floor=floor,u2_station=u2_idx)
         await phase(d[6],x=sx,y=sy,bend=0.,arm=0.,walk=True)
         await phase(d[7],yaw=syaw)
-    # 3. Automatically clear the empty carton shell from the floor
-    send({carton:(c_pose[0],c_pose[1],-5,0)},transmit=not args.fast)
-    loose_event('U2_EMPTY_CARTON_CLEARED',carton=carton,floor=floor,u2_station=u2_idx)
+    # 3. Pick up the empty carton shell from the floor and place it into the adjacent U2 Trolley
+    t_pose=LG.u2_trolley_pose(floor,u2_idx)
+    target_in_trolley=LG.trolley_carton_pose(t_pose,trolley_slot)
+    t_yaw=math.atan2(target_in_trolley[1]-sy,target_in_trolley[0]-sx)
+    await phase(d[0],x=pick_x,y=sy,yaw=syaw,bend=pick_bend,arm=pick_arm,walk=True)
+    grab_c=LG.held_carton(pick_x,sy,syaw,pick_bend,pick_arm,z0=z0)
+    await phase(d[1],item_to=(carton,grab_c))
+    await phase(d[2],x=sx,y=sy,bend=CARRY[0],arm=CARRY[1],carry_item=carton,walk=True)
+    await phase(d[3],yaw=t_yaw,carry_item=carton)
+    await phase(d[4],bend=.22,arm=.95,carry_item=carton)
+    await phase(d[5],item_to=(carton,target_in_trolley))
+    await phase(d[6],x=sx,y=sy,yaw=syaw,bend=0.,arm=0.)
+    loose_event('U2_EMPTY_CARTON_IN_TROLLEY',carton=carton,floor=floor,u2_station=u2_idx,slot=trolley_slot)
     return placed
+
+async def u2_trolley_swap_cycle(floor,u2_idx,cartons_in_trolley):
+    """When U2 trolley reaches 5 empty cartons, U2 AGV transports the full trolley to Khu 06 and brings an empty trolley back."""
+    agv=f'u2_agv_{floor}_{u2_idx}'
+    rx,ry,z0,ryaw=LG.u2_rack_pose(floor,u2_idx)
+    tx,ty,_,tyaw=LG.u2_trolley_pose(floor,u2_idx)
+    st=U2_STATE[(floor,u2_idx)]
+    trolley=st['active_trolley']
+    k06_slot=st['k06_slot']
+    kx,ky,_,kyaw=LG.k06_slot_pose(floor,k06_slot)
+    speed=float(C.get('u2_agv_speed',C.get('u1_agv_speed',0.45)))
+    lift_z=.03
+    # 1. Move AGV from U2 rack to U2 trolley
+    pts_to_t=LG.u2_k06_route((rx,ry,z0),(tx,ty,z0),u2_idx)
+    len_to_t=LG.length(pts_to_t)
+    await engine.move({agv:LG.along(pts_to_t,len_to_t)},speed=speed,duration=max(.1,len_to_t/speed),
+                      transform=lambda q:{agv:LG.along(pts_to_t,q*len_to_t)},shape=blend,exact=True)
+    # 2. Carry full trolley (+ 5 empty cartons) to Khu 06
+    pts_k06=LG.u2_k06_route((tx,ty,z0),(kx,ky,z0),u2_idx)
+    len_k06=LG.length(pts_k06)
+    def at_k06(q):
+        ax,ay,az,ayaw=LG.along(pts_k06,q*len_k06)
+        tp=(ax,ay,z0+lift_z,tyaw)
+        out={agv:(ax,ay,z0,ayaw),trolley:tp}
+        for idx,c_name in enumerate(cartons_in_trolley):
+            out[c_name]=LG.trolley_carton_pose(tp,idx)
+        return out
+    await engine.move(at_k06(1.),speed=speed,duration=max(.1,len_k06/speed),transform=at_k06,shape=blend,exact=True)
+    send({trolley:(kx,ky,z0,kyaw),**{c_name:(kx,ky,-5,0) for c_name in cartons_in_trolley}},transmit=not args.fast)
+    for c_name in cartons_in_trolley:
+        FREE_Z05_CARTONS[floor].put_nowait(c_name)
+    loose_event('U2_TROLLEY_DELIVERED_TO_K06',floor=floor,u2_station=u2_idx,trolley=trolley,k06_slot=k06_slot)
+    # 3. Bring empty replacement trolley from Khu 06 back to U2 station
+    pts_back=LG.u2_k06_route((kx,ky,z0),(tx,ty,z0),u2_idx)
+    len_back=LG.length(pts_back)
+    def at_back(q):
+        ax,ay,az,ayaw=LG.along(pts_back,q*len_back)
+        return {agv:(ax,ay,z0,ayaw),trolley:(ax,ay,z0+lift_z,tyaw)}
+    await engine.move(at_back(1.),speed=speed,duration=max(.1,len_back/speed),transform=at_back,shape=blend,exact=True)
+    send({trolley:(tx,ty,z0,tyaw)},transmit=not args.fast)
+    # 4. Return AGV to U2 rack position
+    pts_home=LG.u2_k06_route((tx,ty,z0),(rx,ry,z0),u2_idx)
+    len_home=LG.length(pts_home)
+    await engine.move({agv:LG.along(pts_home,len_home)},speed=speed,duration=max(.1,len_home/speed),
+                      transform=lambda q:{agv:LG.along(pts_home,q*len_home)},shape=blend,exact=True)
+    send({agv:(rx,ry,z0,0.)},transmit=not args.fast)
+    st['trolley_cartons']=[]
+    st['trolley_swaps']+=1
+    loose_event('U2_REPLACEMENT_TROLLEY_READY',floor=floor,u2_station=u2_idx,trolley=trolley)
 
 async def u2_agv_swap_cycle(floor,u2_idx,full_rack,meds_on_rack,store_cell,next_rack,spare_cell,old_spare_meds=()):
     """U2 AGV carries full_rack (+ yellow medicine boxes in blue tray) along agv_paths to Kho 04, then brings next_rack to U2."""
@@ -781,15 +960,13 @@ async def u2_agv_swap_cycle(floor,u2_idx,full_rack,meds_on_rack,store_cell,next_
         return out
     await engine.move(at_store(1.),speed=speed,duration=max(.1,len_store/speed),transform=at_store,shape=blend,exact=True)
     settled=(store_cell['x'],store_cell['y'],z0,0.)
-    send({full_rack:settled,**{m_name:LG.u1_med_on_rack(settled,m_idx,t_slot) for m_name,m_idx,t_slot in meds_on_rack}},transmit=not args.fast)
+    send({full_rack:settled,**{m_name:(settled[0],settled[1],-5,0) for m_name,_,_ in meds_on_rack}},transmit=not args.fast)
     loose_event('U2_AGV_RACK_STORED',floor=floor,u2_station=u2_idx,rack=full_rack,warehouse='04',cell=[round(store_cell['x'],3),round(store_cell['y'],3)])
     # 2. Drive empty AGV to the replacement rack cell in Kho 04
     pts_spare=LG.u2_agv_route((store_cell['x'],store_cell['y'],z0),(spare_cell['x'],spare_cell['y'],z0),u2_idx)
     len_spare=LG.length(pts_spare)
     await engine.move({agv:LG.along(pts_spare,len_spare)},speed=speed,duration=max(.1,len_spare/speed),
                       transform=lambda q:{agv:LG.along(pts_spare,q*len_spare)},shape=blend,exact=True)
-    if old_spare_meds:
-        send({m_name:poses[m_name][:2]+(-5,0) for m_name,_,_ in old_spare_meds},transmit=not args.fast)
     # 3. Pick up replacement empty rack in Kho 04 and bring it out to U2 station behind the U2 worker
     loose_event('U2_AGV_REPLACEMENT_RACK_PICKUP',floor=floor,u2_station=u2_idx,rack=next_rack,from_cell=[round(spare_cell['x'],3),round(spare_cell['y'],3)])
     pts_u2=LG.u2_agv_route((spare_cell['x'],spare_cell['y'],z0),(rx,ry,z0),u2_idx)
@@ -808,10 +985,12 @@ async def u2_carton_trip(floor,u2_idx,carton,job):
         rack=st['active_rack']
         rack_idx=st['active_rack_idx']
         tray_slot=len(st['cartons'])
+        trolley_slot=len(st['trolley_cartons'])
         rack_pose=LG.u2_rack_pose(floor,u2_idx)
         loose_event('U2_WORKER_OPEN_CARTON',job=job,carton=carton,floor=floor,u2_station=u2_idx,rack=rack)
-        placed_meds=await u2_operator_cycle(floor,u2_idx,carton,rack_pose,rack_idx,tray_slot)
+        placed_meds=await u2_operator_cycle(floor,u2_idx,carton,rack_pose,rack_idx,trolley_slot,tray_slot)
         st['cartons'].append((carton,placed_meds))
+        st['trolley_cartons'].append(carton)
         loose_event('U2_CARTON_PLACED_ON_RACK',job=job,carton=carton,floor=floor,u2_station=u2_idx,rack=rack,slot=tray_slot,med_boxes=[m[0] for m in placed_meds])
         if len(st['cartons'])>=U2_PER_RACK:
             store_cell=st['empty_cell']
@@ -825,6 +1004,200 @@ async def u2_carton_trip(floor,u2_idx,carton,job):
             st['empty_cell']=spare_cell
             st['cartons']=[]
             st['swaps']+=1
+        if len(st['trolley_cartons'])>=TROLLEY_CAP:
+            await u2_trolley_swap_cycle(floor,u2_idx,list(st['trolley_cartons']))
+
+# ---------------------------------------------------------------- Khu P1 (14 Picking Stations: North 0..6 & West 7..13) <-> Kho 04 & Khu 06
+async def p1_operator_cycle(floor,st_idx,carton,rack_idx):
+    """P1 picking worker at (floor, st_idx):
+    1. Turns to the P1 Trolley (at st['mark']), picks 1 empty carton shell, and places it onto the working edge of the desk.
+    2. Picks 3 yellow medicine box clusters (m=0..2) from the loaded Rack in front of the station (st['rack']) and places them into the carton on the desk.
+    3. Picks up the packed carton, moves it aside onto the far end of the desk, and the packed carton disappears."""
+    wid=LG.p1_worker_id(floor,st_idx)
+    sx,sy,syaw,z0=LG.p1_station(floor,st_idx)
+    rx,ry,_,_=LG.p1_rack_pose(floor,st_idx)
+    tx,ty,_,_=LG.p1_trolley_pose(floor,st_idx)
+    active_c_pose=LG.p1_active_carton_pose(floor,st_idx)
+    aside_c_pose=LG.p1_aside_carton_pose(floor,st_idx)
+    pick_s=float(C.get('p1_pick_box_s',4.5))
+    d=[f*pick_s for f in U1_PHASES]
+    med_count=int(C.get('p1_med_boxes_per_carton',LG.U1_MED_PER_CARTON))
+    med_names=[f'p1_med_{floor}_{st_idx}_{m}' for m in range(med_count)]
+    state={'x':sx,'y':sy,'yaw':syaw,'bend':0.,'arm':0.}
+    async def phase(dur,x=None,y=None,yaw=None,bend=None,arm=None,carry_item=None,item_to=None,walk=False):
+        a=dict(state);b={'x':a['x'] if x is None else x,'y':a['y'] if y is None else y,
+             'yaw':a['yaw'] if yaw is None else a['yaw']+math.atan2(math.sin(yaw-a['yaw']),math.cos(yaw-a['yaw'])),
+             'bend':a['bend'] if bend is None else bend,'arm':a['arm'] if arm is None else arm}
+        steps=max(1,round(math.hypot(b['x']-a['x'],b['y']-a['y'])/STEP)) if walk else 0
+        upper_only=(not walk and abs(b['yaw']-a['yaw'])<1e-6 and abs(b['x']-a['x'])<1e-6 and abs(b['y']-a['y'])<1e-6)
+        item_name=carry_item or (item_to[0] if item_to else None)
+        i0=poses[item_name] if item_name else None
+        def at(q):
+            k={key:a[key]+(b[key]-a[key])*q for key in a}
+            out=LG.operator_pose(wid,k['x'],k['y'],k['yaw'],k['bend'],k['arm'],.30*math.sin(math.pi*steps*q) if walk else 0.,z0=z0,upper_only=upper_only)
+            if carry_item:
+                out[carry_item]=LG.held_carton(k['x'],k['y'],k['yaw'],k['bend'],k['arm'],z0=z0)
+            elif item_to is not None:
+                t_name,t_pose=item_to
+                out[t_name]=tuple(i0[j]+(t_pose[j]-i0[j])*q for j in range(4))
+            return out
+        end=at(1.)
+        await engine.move(end,duration=max(.04,dur),transform=at,shape=(lambda t:t) if walk else blend,exact=True)
+        state.update(b)
+    # 1. Pick 1 empty carton from the P1 Trolley and place it on the working edge of the desk
+    trolley_yaw=math.atan2(ty-sy,tx-sx)
+    desk_yaw=math.atan2(active_c_pose[1]-sy,active_c_pose[0]-sx)
+    await phase(d[0],yaw=trolley_yaw,bend=.22,arm=.88)
+    grab_c=LG.held_carton(sx,sy,trolley_yaw,.22,.88,z0=z0)
+    await phase(d[1],item_to=(carton,grab_c))
+    await phase(d[2],yaw=desk_yaw,bend=CARRY[0],arm=CARRY[1],carry_item=carton)
+    await phase(d[3],bend=.25,arm=.85,carry_item=carton)
+    await phase(d[4],item_to=(carton,active_c_pose))
+    loose_event('P1_EMPTY_CARTON_PLACED_ON_DESK',floor=floor,p1_station=st_idx,carton=carton)
+    # 2. Pick 3 yellow medicine box clusters from the P1 Rack and place them into the carton on the desk
+    rack_yaw=math.atan2(ry-sy,rx-sx)
+    for m,m_name in enumerate(med_names):
+        target_in_c=LG.p1_med_in_carton(active_c_pose,m)
+        await phase(d[0],yaw=rack_yaw,bend=.14,arm=1.10)
+        grab_m=LG.held_carton(sx,sy,rack_yaw,.14,1.10,z0=z0)
+        await phase(d[1],item_to=(m_name,grab_m))
+        await phase(d[2],yaw=desk_yaw,bend=CARRY[0],arm=CARRY[1],carry_item=m_name)
+        await phase(d[3],bend=.26,arm=.82,carry_item=m_name)
+        await phase(d[4],item_to=(m_name,target_in_c))
+        loose_event('P1_MED_BOX_PACKED',floor=floor,p1_station=st_idx,carton=carton,med_box=m_name,box_index=m)
+    # 3. Move packed carton aside onto the desk, then packed carton + its 3 yellow medicine boxes disappear
+    aside_yaw=math.atan2(aside_c_pose[1]-sy,aside_c_pose[0]-sx)
+    await phase(d[0],yaw=desk_yaw,bend=.25,arm=.85)
+    grab_packed=LG.held_carton(sx,sy,desk_yaw,.25,.85,z0=z0)
+    send({m_name:(active_c_pose[0],active_c_pose[1],-5,0) for m_name in med_names},transmit=not args.fast)
+    await phase(d[1],item_to=(carton,grab_packed))
+    await phase(d[2],yaw=aside_yaw,bend=.22,arm=.88,carry_item=carton)
+    await phase(d[3],item_to=(carton,aside_c_pose))
+    await phase(d[4],yaw=syaw,bend=0.,arm=0.)
+    send({carton:(aside_c_pose[0],aside_c_pose[1],-5,0)},transmit=not args.fast)
+    loose_event('P1_PACKED_CARTON_COMPLETED',floor=floor,p1_station=st_idx,carton=carton)
+
+async def p1_agv_rack_swap_cycle(floor,st_idx,empty_rack,store_cell,next_rack,next_rack_idx,spare_cell):
+    """After every packed carton (3 yellow medicine box turns), P1 AGV returns the now-empty rack to Kho 04
+    and brings out a new loaded rack (carrying 3 yellow medicine boxes) from Kho 04 to st['rack']."""
+    agv=f'p1_agv_{floor}_{st_idx}'
+    rx,ry,z0,ryaw=LG.p1_rack_pose(floor,st_idx)
+    speed=float(C.get('p1_agv_speed',C.get('u1_agv_speed',0.45)))
+    lift_z=.03
+    med_count=int(C.get('p1_med_boxes_per_carton',LG.U1_MED_PER_CARTON))
+    next_meds=[f'p1_med_{floor}_{st_idx}_{m}' for m in range(med_count)]
+    # 1. Carry now-empty rack from P1 station into Kho 04 empty cell
+    pts_store=LG.p1_agv_route((rx,ry,z0),(store_cell['x'],store_cell['y'],z0),st_idx)
+    len_store=LG.length(pts_store)
+    def at_store(q):
+        ax,ay,az,ayaw=LG.along(pts_store,q*len_store)
+        return {agv:(ax,ay,z0,ayaw),empty_rack:(ax,ay,z0+lift_z,ryaw)}
+    await engine.move(at_store(1.),speed=speed,duration=max(.1,len_store/speed),transform=at_store,shape=blend,exact=True)
+    settled_empty=(store_cell['x'],store_cell['y'],z0,store_cell.get('yaw',0.))
+    send({empty_rack:settled_empty},transmit=not args.fast)
+    loose_event('P1_AGV_EMPTY_RACK_STORED',floor=floor,p1_station=st_idx,rack=empty_rack,warehouse='04',cell=[round(store_cell['x'],3),round(store_cell['y'],3)])
+    # 2. Drive empty AGV to the loaded rack cell in Kho 04
+    pts_spare=LG.p1_agv_route((store_cell['x'],store_cell['y'],z0),(spare_cell['x'],spare_cell['y'],z0),st_idx)
+    len_spare=LG.length(pts_spare)
+    await engine.move({agv:LG.along(pts_spare,len_spare)},speed=speed,duration=max(.1,len_spare/speed),
+                      transform=lambda q:{agv:LG.along(pts_spare,q*len_spare)},shape=blend,exact=True)
+    # 3. Pick up loaded rack (+ 3 yellow medicine boxes) from Kho 04 and bring it out to P1 station
+    spare_r_pose=(spare_cell['x'],spare_cell['y'],z0,spare_cell.get('yaw',0.))
+    send({next_meds[m]:LG.u1_med_on_rack(spare_r_pose,m,0) for m in range(med_count)},transmit=not args.fast)
+    loose_event('P1_AGV_LOADED_RACK_PICKUP',floor=floor,p1_station=st_idx,rack=next_rack,from_cell=[round(spare_cell['x'],3),round(spare_cell['y'],3)])
+    pts_p1=LG.p1_agv_route((spare_cell['x'],spare_cell['y'],z0),(rx,ry,z0),st_idx)
+    len_p1=LG.length(pts_p1)
+    def at_p1(q):
+        ax,ay,az,ayaw=LG.along(pts_p1,q*len_p1)
+        r_pose=(ax,ay,z0+lift_z,ryaw)
+        out={agv:(ax,ay,z0,ayaw),next_rack:r_pose}
+        for m,m_name in enumerate(next_meds):
+            out[m_name]=LG.u1_med_on_rack(r_pose,m,0)
+        return out
+    await engine.move(at_p1(1.),speed=speed,duration=max(.1,len_p1/speed),transform=at_p1,shape=blend,exact=True)
+    settled_p1=(rx,ry,z0,ryaw)
+    send({agv:(rx,ry,z0,ryaw),next_rack:settled_p1,**{next_meds[m]:LG.u1_med_on_rack(settled_p1,m,0) for m in range(med_count)}},transmit=not args.fast)
+    loose_event('P1_AGV_LOADED_RACK_READY',floor=floor,p1_station=st_idx,rack=next_rack)
+
+async def p1_agv_trolley_swap_cycle(floor,st_idx):
+    """When all 5 empty cartons in the P1 Trolley have been used, P1 AGV takes the empty Trolley back to Khu 06
+    and brings out a full Trolley (containing 5 empty cartons) from Khu 06 to st['mark']."""
+    agv=f'p1_agv_{floor}_{st_idx}'
+    rx,ry,z0,ryaw=LG.p1_rack_pose(floor,st_idx)
+    tx,ty,_,tyaw=LG.p1_trolley_pose(floor,st_idx)
+    st=P1_STATE[(floor,st_idx)]
+    trolley=st['active_trolley']
+    k06_slot=st['k06_slot']
+    kx,ky,_,kyaw=LG.k06_slot_pose(floor,k06_slot)
+    speed=float(C.get('p1_agv_speed',C.get('u1_agv_speed',0.45)))
+    lift_z=.03
+    carton_names=[f'p1_carton_{floor}_{st_idx}_{c}' for c in range(TROLLEY_CAP)]
+    # 1. Move P1 AGV from P1 rack to P1 trolley
+    pts_to_t=LG.p1_k06_route((rx,ry,z0),(tx,ty,z0),st_idx)
+    len_to_t=LG.length(pts_to_t)
+    await engine.move({agv:LG.along(pts_to_t,len_to_t)},speed=speed,duration=max(.1,len_to_t/speed),
+                      transform=lambda q:{agv:LG.along(pts_to_t,q*len_to_t)},shape=blend,exact=True)
+    # 2. Carry empty trolley from P1 station to Khu 06
+    pts_k06=LG.p1_k06_route((tx,ty,z0),(kx,ky,z0),st_idx)
+    len_k06=LG.length(pts_k06)
+    def at_k06(q):
+        ax,ay,az,ayaw=LG.along(pts_k06,q*len_k06)
+        return {agv:(ax,ay,z0,ayaw),trolley:(ax,ay,z0+lift_z,tyaw)}
+    await engine.move(at_k06(1.),speed=speed,duration=max(.1,len_k06/speed),transform=at_k06,shape=blend,exact=True)
+    send({trolley:(kx,ky,z0,kyaw)},transmit=not args.fast)
+    loose_event('P1_EMPTY_TROLLEY_RETURNED_TO_K06',floor=floor,p1_station=st_idx,trolley=trolley,k06_slot=k06_slot)
+    # 3. Pick up full trolley (+ 5 empty cartons) from Khu 06 and bring it to P1 station
+    pts_back=LG.p1_k06_route((kx,ky,z0),(tx,ty,z0),st_idx)
+    len_back=LG.length(pts_back)
+    def at_back(q):
+        ax,ay,az,ayaw=LG.along(pts_back,q*len_back)
+        tp=(ax,ay,z0+lift_z,tyaw)
+        out={agv:(ax,ay,z0,ayaw),trolley:tp}
+        for idx,c_name in enumerate(carton_names):
+            out[c_name]=LG.trolley_carton_pose(tp,idx)
+        return out
+    await engine.move(at_back(1.),speed=speed,duration=max(.1,len_back/speed),transform=at_back,shape=blend,exact=True)
+    settled_t=(tx,ty,z0,tyaw)
+    send({trolley:settled_t,**{c_name:LG.trolley_carton_pose(settled_t,idx) for idx,c_name in enumerate(carton_names)}},transmit=not args.fast)
+    # 4. Return P1 AGV to P1 rack position
+    pts_home=LG.p1_k06_route((tx,ty,z0),(rx,ry,z0),st_idx)
+    len_home=LG.length(pts_home)
+    await engine.move({agv:LG.along(pts_home,len_home)},speed=speed,duration=max(.1,len_home/speed),
+                      transform=lambda q:{agv:LG.along(pts_home,q*len_home)},shape=blend,exact=True)
+    send({agv:(rx,ry,z0,ryaw)},transmit=not args.fast)
+    st['trolley_remaining']=list(reversed(carton_names))
+    st['trolley_swaps']+=1
+    loose_event('P1_FULL_TROLLEY_READY',floor=floor,p1_station=st_idx,trolley=trolley)
+
+async def p1_station_loop(floor,st_idx):
+    """Continuous picking loop for P1 station (floor, st_idx) across both North (0..6) and West (7..13) rows."""
+    row=0 if st_idx<7 else 1
+    row_sem=P1_ROW_SEMAPHORES[(floor,row)]
+    await engine.until(.5+.25*(st_idx%7)+.2*(floor-1))
+    while p1_running:
+        async with row_sem:
+            if not p1_running:break
+            async with P1_LOCKS[(floor,st_idx)]:
+                st=P1_STATE[(floor,st_idx)]
+                if not st['trolley_remaining']:
+                    await p1_agv_trolley_swap_cycle(floor,st_idx)
+                carton=st['trolley_remaining'].pop(0)
+                rack=st['active_rack']
+                rack_idx=st['active_rack_idx']
+                await p1_operator_cycle(floor,st_idx,carton,rack_idx)
+                st['cartons_packed']+=1
+                # Immediately after 1 packed carton (3 yellow medicine box turns), swap the empty rack for a new loaded rack from Kho 04
+                store_cell=st['empty_cell']
+                next_rack,next_rack_idx,spare_cell=st['spares'].pop(0)
+                await p1_agv_rack_swap_cycle(floor,st_idx,rack,store_cell,next_rack,next_rack_idx,spare_cell)
+                st['spares'].append((rack,rack_idx,store_cell))
+                st['active_rack']=next_rack
+                st['active_rack_idx']=next_rack_idx
+                st['empty_cell']=spare_cell
+                st['rack_swaps']+=1
+                if not st['trolley_remaining'] and p1_running:
+                    await p1_agv_trolley_swap_cycle(floor,st_idx)
+        await engine.until(scheduler.time+.1)
 
 async def z05_unpack_pallet(floor,zone,spot_xy,pallet_model,job):
     """When an outbound pallet from Kho 01 stops at its dedicated Zone 05 unpack zone (floor, zone, spot_xy):
@@ -835,7 +1208,7 @@ async def z05_unpack_pallet(floor,zone,spot_xy,pallet_model,job):
         z0=LG.LEVELS[floor-1]
         z05_per=int(C.get('z05_cartons_per_pallet',LG.Z05_CARTONS_PER_PALLET))
         deck=f'z05_deck_{floor}_{zone}'
-        cartons=[f'z05_carton_{floor}_{zone}_{c}' for c in range(z05_per)]
+        cartons=[await FREE_Z05_CARTONS[floor].get() for _ in range(z05_per)]
         stack=LG.z05_stack_positions(spot_xy,floor,z05_per)
         send({pallet_model:(spot_xy[0],spot_xy[1],-5,0),deck:(spot_xy[0],spot_xy[1],z0,0.),
               **{c:p for c,p in zip(cartons,stack)}},transmit=not args.fast)
@@ -847,6 +1220,7 @@ async def z05_unpack_pallet(floor,zone,spot_xy,pallet_model,job):
             'spot_xy':spot_xy,
             'deck':deck,
             'items':list(zip(cartons,stack)),
+            'total_items':z05_per,
             'u2_tasks':[],
             'done_event':asyncio.Event(),
         }
@@ -883,10 +1257,11 @@ async def operator_cycle(i,op,spot,carton,stack_pos):
              'yaw':a['yaw'] if yaw is None else a['yaw']+math.atan2(math.sin(yaw-a['yaw']),math.cos(yaw-a['yaw'])),
              'bend':a['bend'] if bend is None else bend,'arm':a['arm'] if arm is None else arm}
         steps=max(1,round(math.hypot(b['x']-a['x'],b['y']-a['y'])/STEP)) if walk else 0
+        upper_only=(not walk and abs(b['yaw']-a['yaw'])<1e-6 and abs(b['x']-a['x'])<1e-6 and abs(b['y']-a['y'])<1e-6)
         c0=poses[carton]
         def at(q):
             k={key:a[key]+(b[key]-a[key])*q for key in a}
-            out=LG.operator_pose(i,k['x'],k['y'],k['yaw'],k['bend'],k['arm'],.35*math.sin(math.pi*steps*q) if walk else 0.)
+            out=LG.operator_pose(i,k['x'],k['y'],k['yaw'],k['bend'],k['arm'],.35*math.sin(math.pi*steps*q) if walk else 0.,upper_only=upper_only)
             if carry: out[carton]=LG.held_carton(k['x'],k['y'],k['yaw'],k['bend'],k['arm'])
             elif carton_to is not None: out[carton]=tuple(c0[j]+(carton_to[j]-c0[j])*q for j in range(4))
             return out
@@ -918,8 +1293,9 @@ async def loose_goods():
     free=[asyncio.Semaphore(1) for _ in LOOSE_SPOTS];counter={'carton':0,'branch':{}}
     async def unpack(k):
         s=k%len(LOOSE_SPOTS);await free[s].acquire();spot=LOOSE_SPOTS[s];deck=f'loose_pallet_{s}'
-        stack=LG.stack_positions(spot,LOOSE_PER);names=[f'carton_{k*LOOSE_PER+j}' for j in range(LOOSE_PER)]
+        stack=LG.stack_positions(spot,LOOSE_PER)
         async def receive(dock_i,cartons):
+            names=[await FREE_CARTONS.get() for _ in range(LOOSE_PER)]
             send({n:poses[n][:2]+(-5,0) for n in cartons},transmit=not args.fast)
             send({n:p+(spot[2],) for n,p in zip(names,stack)},transmit=not args.fast)
             loose_event('LOOSE_PALLET_ON_SPOT',pallet=k,spot=s)
@@ -932,7 +1308,7 @@ async def loose_goods():
                 background_tasks.append(asyncio.create_task(carton_trip(n,dest,br)))
             loose_stats['pallets_unpacked']+=1
             loose_event('LOOSE_PALLET_EMPTY',pallet=k,spot=s)
-        await dock_flow.prepare('odd',k,spot,names,receive)
+        await dock_flow.prepare('odd',k,spot,list(range(LOOSE_PER)),receive)
         free[s].release()
     jobs=[]
     for k in range(LOOSE_PALLETS):
@@ -988,6 +1364,7 @@ async def outbound_worker(worker):
             event(job,'COMPLETE');completed+=1;outbound_active-=1
 
 async def main():
+    global p1_running
     for key in ['inbound_interval_s','outbound_interval_s']:
         if not isinstance(C[key],(int,float)) or isinstance(C[key],bool) or not math.isfinite(C[key]) or C[key]<=0:raise ValueError(f'{key} must be positive')
     for key in ['agv_following_gap_m','speed_multiplier','agv_speed','lift_speed','shuttle_speed','conveyor_speed','agv_acceleration','lift_acceleration','shuttle_acceleration','conveyor_acceleration','agv_jerk','lift_jerk','shuttle_jerk','conveyor_jerk','agv_angular_speed','agv_angular_acceleration','agv_angular_jerk','lift_settle_s','shuttle_positioning_s','shuttle_turn_s','shuttle_lift_s','shuttle_availability','shuttle_utilization','lift_availability','lift_utilization']:
@@ -1007,6 +1384,7 @@ async def main():
             bx,u1_y,z0,_=LG.u1_rack_pose(f,b)
             poses[f'u1_agv_{f}_{b}']=(bx,u1_y,z0,math.pi/2)
             poses[f'u1_rack_{f}_{b}_0']=(bx,u1_y,z0,0.)
+            poses[f'u1_trolley_{f}_{b}']=LG.u1_trolley_pose(f,b)
             for r_idx in range(1,LG.U1_RACKS_PER_BRANCH):
                 cell=LG.U1_BRANCH_CELLS[b][r_idx]
                 poses[f'u1_rack_{f}_{b}_{r_idx}']=(cell['x'],cell['y'],z0,cell.get('yaw',0.))
@@ -1014,30 +1392,54 @@ async def main():
             rx,ry,z0,ryaw=LG.u2_rack_pose(f,u2_idx)
             poses[f'u2_agv_{f}_{u2_idx}']=(rx,ry,z0,0.)
             poses[f'u2_rack_{f}_{u2_idx}_0']=(rx,ry,z0,ryaw)
+            poses[f'u2_trolley_{f}_{u2_idx}']=LG.u2_trolley_pose(f,u2_idx)
             for r_idx in range(1,LG.U2_RACKS_PER_STATION):
                 cell=LG.U2_STATION_CELLS[u2_idx][r_idx]
                 poses[f'u2_rack_{f}_{u2_idx}_{r_idx}']=(cell['x'],cell['y'],z0,cell.get('yaw',0.))
+        for st_idx in range(len(LG.P1_STATIONS)):
+            rx,ry,z0,ryaw=LG.p1_rack_pose(f,st_idx)
+            poses[f'p1_agv_{f}_{st_idx}']=(rx,ry,z0,ryaw)
+            poses[f'p1_rack_{f}_{st_idx}_0']=(rx,ry,z0,ryaw)
+            t_pose=LG.p1_trolley_pose(f,st_idx)
+            poses[f'p1_trolley_{f}_{st_idx}']=t_pose
+            for c_idx in range(TROLLEY_CAP):
+                poses[f'p1_carton_{f}_{st_idx}_{c_idx}']=LG.trolley_carton_pose(t_pose,c_idx)
+            for m in range(LG.U1_MED_PER_CARTON):
+                poses[f'p1_med_{f}_{st_idx}_{m}']=LG.u1_med_on_rack((rx,ry,z0,ryaw),m,0)
+            for r_idx in range(1,LG.P1_RACKS_PER_STATION):
+                cell=LG.P1_STATION_CELLS[st_idx][r_idx]
+                c_pose=(cell['x'],cell['y'],z0,cell.get('yaw',0.))
+                poses[f'p1_rack_{f}_{st_idx}_{r_idx}']=c_pose
     for i in range(2):
         for direction in ['in','out']:poses[f'{direction}_lift_{i}']=tuple(LAYOUT.data['ports'][direction][i]['lift'])+(.3,)
-    for j in range(C['jobs']):poses[f'pallet_{j}']=inbound_pickup_position(j)
+    use_barcode=C.get('inbound_classification')=='barcode' and bool(LOOSE_SPOTS)
+    even_jobs=[j for j in range(C['jobs']) if not use_barcode or inbound_classification(j)=='even']
+    for j in even_jobs:poses[f'pallet_{j}']=inbound_pickup_position(j)
     # Loads appear at configured arrival times, rather than all being present initially.
-    send({f'pallet_{j}':(inbound_pickup_position(j)[0],-17,-5,0) for j in range(C['jobs'])})
+    send({f'pallet_{j}':(inbound_pickup_position(j)[0],-17,-5,0) for j in even_jobs})
     if LOOSE_PALLETS:   # loose-goods pallet decks and cartons start hidden below their spot
-        hidden={f'loose_pallet_{s}':(sp[0],sp[1],-5,sp[2]) for s,sp in enumerate(LOOSE_SPOTS)}
-        hidden.update({f'carton_{i}':(LOOSE_SPOTS[0][0],LOOSE_SPOTS[0][1],-5,0) for i in range(LOOSE_PALLETS*LOOSE_PER)})
-        hidden.update({f'med_{i}_{m}':(LOOSE_SPOTS[0][0],LOOSE_SPOTS[0][1],-5,0) for i in range(LOOSE_PALLETS*LOOSE_PER) for m in range(LG.U1_MED_PER_CARTON)})
-        z05_per=int(C.get('z05_cartons_per_pallet',LG.Z05_CARTONS_PER_PALLET))
+        while not FREE_CARTONS.empty():FREE_CARTONS.get_nowait()
+        for i in range(LOOSE_CARTON_POOL):FREE_CARTONS.put_nowait(f'carton_{i}')
         for f in LG.floors():
+            while not FREE_Z05_CARTONS[f].empty():FREE_Z05_CARTONS[f].get_nowait()
+            for c_idx in range(Z05_CARTON_POOL):FREE_Z05_CARTONS[f].put_nowait(f'z05_carton_{f}_{c_idx}')
+        hidden={f'loose_pallet_{s}':(sp[0],sp[1],-5,sp[2]) for s,sp in enumerate(LOOSE_SPOTS)}
+        hidden.update({f'carton_{i}':(LOOSE_SPOTS[0][0],LOOSE_SPOTS[0][1],-5,0) for i in range(LOOSE_CARTON_POOL)})
+        for f in LG.floors():
+            for b in range(len(LG.BRANCHES)):
+                bx,u1_y,_,_=LG.u1_rack_pose(f,b)
+                for m in range(LG.U1_MED_PER_CARTON):
+                    hidden[f'u1_med_{f}_{b}_{m}']=(bx,u1_y,-5,0)
             for z_idx in range(len(LG.Z05_WORKERS)):
                 wx,wy,_,_=LG.z05_station(f,z_idx)
                 hidden[f'z05_deck_{f}_{z_idx}']=(wx,wy,-5,0)
-                for c_idx in range(z05_per):
-                    hidden[f'z05_carton_{f}_{z_idx}_{c_idx}']=(wx,wy,-5,0)
+            w0x,w0y,_,_=LG.z05_station(f,0)
+            for c_idx in range(Z05_CARTON_POOL):
+                hidden[f'z05_carton_{f}_{c_idx}']=(w0x,w0y,-5,0)
             for u2_idx in range(len(LG.U2_WORKERS)):
                 rx,ry,_,_=LG.u2_rack_pose(f,u2_idx)
-                for r_idx in range(LG.U2_RACKS_PER_STATION):
-                    for m in range(LG.U1_MED_PER_CARTON):
-                        hidden[f'u2_med_{f}_{u2_idx}_{r_idx}_{m}']=(rx,ry,-5,0)
+                for m in range(LG.U1_MED_PER_CARTON):
+                    hidden[f'u2_med_{f}_{u2_idx}_{m}']=(rx,ry,-5,0)
         send(hidden,transmit=False)
         for i,op in enumerate(LG.OPERATORS):send(LG.operator_pose(i,*LG.station(op)),transmit=False)   # operators at the belt
         anim_ops={}
@@ -1051,12 +1453,17 @@ async def main():
             for u2_idx in range(len(LG.U2_WORKERS)):
                 wx,wy,wyaw,wz=LG.u2_station(f,u2_idx)
                 anim_ops.update(LG.operator_pose(LG.u2_worker_id(f,u2_idx),wx,wy,wyaw,z0=wz))
+            for st_idx in range(len(LG.P1_STATIONS)):
+                wx,wy,wyaw,wz=LG.p1_station(f,st_idx)
+                anim_ops.update(LG.operator_pose(LG.p1_worker_id(f,st_idx),wx,wy,wyaw,z0=wz))
         send(anim_ops,transmit=False)
     for i in range(C.get('initial_outbound_pallets',0)):
         level=(i+4)%9;sid=LAYOUT.job_slots[i%len(LAYOUT.job_slots)];p=f'pallet_out_{i}'
         poses[p]=LAYOUT.slot_point(sid)+(C['storage_levels'][level],0)
         await stored.put((C['jobs']+i,level,sid,i%2,p))
     dock_flow.initialize()
+    p1_running=True
+    p1_tasks=[asyncio.create_task(p1_station_loop(f,st_idx)) for f in LG.floors() for st_idx in range(len(LG.P1_STATIONS))]
     total=min(args.jobs,C['jobs']);ticker=asyncio.create_task(engine.run())
     even_total=sum(1 for job in range(total) if inbound_classification(job)=='even')
     workers=asyncio.gather(arrivals(total),requests(even_total),agv_worker(0),agv_worker(1),outbound_worker(0),outbound_worker(1),loose_goods())
@@ -1064,6 +1471,9 @@ async def main():
     if ticker in done:await ticker
     await workers
     await asyncio.gather(*background_tasks)
+    p1_running=False
+    if p1_tasks:
+        await asyncio.gather(*p1_tasks)
     engine.running=False;await ticker
     if args.fast:send(dict(poses))
     report={'complete':completed,'inbound_stored':stored_count,'remaining_stored':stored.qsize(),'jobs_requested':total,'events':len(events),'swept_pose_checks':route_checks,'rail_contact_checks':rail_checks,

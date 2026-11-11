@@ -122,7 +122,7 @@ def visuals(c):
                 rounds.append(cylinder(f'bolt{a}_{side}_{k}',x+.225*math.cos(q),y+side*.19,.5+.225*math.sin(q),.025,.035,BLACK,math.pi/2))
             b('mudguard',x,side*(W/2-.13),1.045,1.12,.43,.09,BLACK)
             b('mudflap',x-.57,side*(W/2-.13),.38,.035,.38,.52,BLACK)
-    return merge_boxes('truck_details',v)+[cab_visual]+rounds+transparent
+    return merge_boxes('truck_details',v+rounds)+[cab_visual]+transparent
 
 def bevel_cab(cx,w):
     """Bevelled red shell; +X is front, corners narrowed for wraparound screen."""
