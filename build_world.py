@@ -222,7 +222,6 @@ for i in range(C.get('initial_outbound_pallets',0)):
 
 header='''<?xml version="1.0"?><sdf version="1.9"><world name="warehouse">
 <physics name="physics" type="ignored"><max_step_size>0.05</max_step_size><real_time_factor>1</real_time_factor></physics>
-<plugin filename="gz-sim-physics-system" name="gz::sim::systems::Physics"/>
 <plugin filename="gz-sim-user-commands-system" name="gz::sim::systems::UserCommands"/>
 <plugin filename="gz-sim-scene-broadcaster-system" name="gz::sim::systems::SceneBroadcaster"/>
 <scene><ambient>.5 .5 .5 1</ambient><background>.72 .76 .80 1</background><shadows>false</shadows></scene>

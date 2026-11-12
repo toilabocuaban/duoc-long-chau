@@ -151,6 +151,7 @@ U1_RACKS_PER_BRANCH = FF.U1_RACKS_PER_BRANCH
 U1_BRANCH_CELLS = FF.U1_BRANCH_CELLS
 U1_RACK_CARTON_Z = 1.24
 U1_MED_PER_CARTON = 3
+P1_MED_PER_CARTON = 15
 MED_YELLOW = '.98 .78 .10 1'
 MED_WHITE = '.96 .96 .94 1'
 MED_ORANGE = '.95 .42 .08 1'
@@ -192,7 +193,8 @@ def u1_med_on_rack(rack_pose, m, tray_slot=0):
     tx = -.295 if tray_slot % 2 == 0 else .295
     dx_local = tx + (m - (U1_MED_PER_CARTON - 1) / 2) * .165
     dx, dy = _rot(ryaw, (dx_local, 0.))
-    return (rx + dx, ry + dy, rz + U1_RACK_CARTON_Z, ryaw)
+    z_off = max(.48, U1_RACK_CARTON_Z - (tray_slot // 2) * .34)
+    return (rx + dx, ry + dy, rz + z_off, ryaw)
 
 def u1_carton_on_rack(rack_pose, slot=0):
     """World pose (x, y, z, yaw) of the first medicine box / slot in a hollow blue tray on a U1 rack."""
@@ -352,13 +354,15 @@ def u2_k06_route(start_xyz, end_xyz, u2_idx=0):
     """3D polyline along CAD agv_paths connecting a U2 trolley position and Khu 06."""
     x1, y1, z = start_xyz[:3]
     x2, y2 = end_xyz[:2]
-    if abs(x1 - (-7.95)) < .5:
+    if max(abs(x1 - x2), abs(y1 - y2)) < 2.5:
+        raw = [(x1, y1, z), (-10.067, y1, z), (-10.067, y2, z), (x2, y2, z)]
+    elif abs(x1 - (-7.95)) < .5:
         raw = [(x1, y1, z), (-10.067, y1, z), (-10.067, 13.795, z), (x2, 13.795, z), (x2, y2, z)]
     else:
         raw = [(x1, y1, z), (x1, 13.795, z), (-10.067, 13.795, z), (-10.067, y2, z), (x2, y2, z)]
     pts = [raw[0]]
     for p in raw[1:]:
-        if math.hypot(p[0] - pts[-1][0], p[1] - pts[-1][1]) > 1e-4:
+        if math.hypot(p[0] - pts[-1][0], p[1] - pts[-1][1]) > 1e-3:
             pts.append(p)
     return pts
 
@@ -425,7 +429,9 @@ def p1_agv_route(start_xyz, end_xyz, st_idx):
     st = P1_STATIONS[idx]
     rx, ry = FF.cx(st['rack']), FF.cy(st['rack'])
     raw = [(x1, y1, z)]
-    if idx >= 7:
+    if abs(y1 - y2) < 1e-2 and abs(x1 - rx) > .5 and abs(x2 - rx) > .5:
+        raw.append((x2, y2, z))
+    elif idx >= 7:
         if abs(x1 - rx) < 1e-2 and abs(y1 - corr_y) > 1e-2:
             raw += [(-45.706, y1, z), (-45.706, corr_y, z)]
         elif abs(y1 - corr_y) > 1e-2:
@@ -433,33 +439,53 @@ def p1_agv_route(start_xyz, end_xyz, st_idx):
         if abs(x2 - rx) < 1e-2 and abs(y2 - corr_y) > 1e-2:
             raw += [(-45.706, corr_y, z), (-45.706, y2, z), (x2, y2, z)]
         else:
-            raw += [(x2, corr_y, z), (x2, y2, z)]
+            if abs(y2 - corr_y) > 1e-2:
+                raw.append((x2, corr_y, z))
+            raw.append((x2, y2, z))
     else:
         raw += [(x1, corr_y, z), (x2, corr_y, z), (x2, y2, z)]
     pts = [raw[0]]
     for p in raw[1:]:
-        if math.hypot(p[0] - pts[-1][0], p[1] - pts[-1][1]) > 1e-4:
+        if math.hypot(p[0] - pts[-1][0], p[1] - pts[-1][1]) > 1e-3:
             pts.append(p)
     return pts
 
 def p1_k06_route(start_xyz, end_xyz, st_idx):
-    """3D polyline along CAD perimeter agv_paths connecting P1 trolley mark and Khu 06."""
+    """3D polyline along CAD agv_paths connecting P1 rack/trolley mark and Khu 06 without crossing desks or racks."""
     idx = st_idx % len(P1_STATIONS)
     x1, y1, z = start_xyz[:3]
     x2, y2 = end_xyz[:2]
-    if idx < 7:
-        if y1 > 40.:
-            raw = [(x1, y1, z), (x1, 45.291, z), (-10.067, 45.291, z), (-10.067, 13.795, z), (x2, 13.795, z), (x2, y2, z)]
+    _, _, corr_y = P1_CELL_MAP[idx]
+    if max(abs(x1 - x2), abs(y1 - y2)) < 3.0:
+        if idx < 7:
+            gx = max(x1, x2) + .95
+            if y1 < y2:
+                raw = [(x1, y1, z), (x1, 45.291, z), (gx, 45.291, z), (gx, y2, z), (x2, y2, z)]
+            else:
+                raw = [(x1, y1, z), (gx, y1, z), (gx, 45.291, z), (x2, 45.291, z), (x2, y2, z)]
         else:
-            raw = [(x1, y1, z), (x1, 13.795, z), (-10.067, 13.795, z), (-10.067, 45.291, z), (x2, 45.291, z), (x2, y2, z)]
+            gy = min(y1, y2) - .95
+            if x1 > x2:
+                raw = [(x1, y1, z), (-45.706, y1, z), (-45.706, gy, z), (x2, gy, z), (x2, y2, z)]
+            else:
+                raw = [(x1, y1, z), (x1, gy, z), (-45.706, gy, z), (-45.706, y2, z), (x2, y2, z)]
+    elif idx < 7:
+        if y1 > 40.:
+            gx = x1 + .95
+            raw = [(x1, y1, z), (gx, y1, z), (gx, 45.291, z), (-10.067, 45.291, z), (-10.067, 13.795, z), (x2, 13.795, z), (x2, y2, z)]
+        else:
+            gx = x2 + .95
+            raw = [(x1, y1, z), (x1, 13.795, z), (-10.067, 13.795, z), (-10.067, 45.291, z), (gx, 45.291, z), (gx, y2, z), (x2, y2, z)]
     else:
         if x1 < -40.:
-            raw = [(x1, y1, z), (-45.706, y1, z), (-45.706, 45.291, z), (-10.067, 45.291, z), (-10.067, 13.795, z), (x2, 13.795, z), (x2, y2, z)]
+            gy = y1 - .95
+            raw = [(x1, y1, z), (x1, gy, z), (-45.706, gy, z), (-45.706, corr_y, z), (-10.067, corr_y, z), (-10.067, 13.795, z), (x2, 13.795, z), (x2, y2, z)]
         else:
-            raw = [(x1, y1, z), (x1, 13.795, z), (-10.067, 13.795, z), (-10.067, 45.291, z), (-45.706, 45.291, z), (-45.706, y2, z), (x2, y2, z)]
+            gy = y2 - .95
+            raw = [(x1, y1, z), (x1, 13.795, z), (-10.067, 13.795, z), (-10.067, corr_y, z), (-45.706, corr_y, z), (-45.706, gy, z), (x2, gy, z), (x2, y2, z)]
     pts = [raw[0]]
     for p in raw[1:]:
-        if math.hypot(p[0] - pts[-1][0], p[1] - pts[-1][1]) > 1e-4:
+        if math.hypot(p[0] - pts[-1][0], p[1] - pts[-1][1]) > 1e-3:
             pts.append(p)
     return pts
 

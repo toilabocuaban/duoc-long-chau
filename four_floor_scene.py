@@ -106,11 +106,11 @@ def u1_rack_parts():
     return rack_parts(hollow_trays=True)
 
 def p1_rack_parts():
-    """P1 picking rack: hollow blue plastic trays with pre-stocked yellow medicine boxes on the lower shelves."""
+    """P1 picking rack: hollow blue plastic trays with pre-stocked yellow medicine boxes on all shelves."""
     p = rack_parts(hollow_trays=True)
     med_col = '.95 .76 .08 1'; strip_col = '.12 .42 .78 1'; cap_col = '.96 .97 .98 1'
-    for z in (.40, .74, 1.08):
-        for tx in (-.295, .295):
+    for z in (.40, .74, 1.08, 1.42):
+        for tx in ((-.295, .295) if z < 1.3 else (.295,)):
             for m in range(3):
                 mx = tx + (m - 1) * .17
                 p.append((mx, 0, z + .095, .14, .26, .15, med_col, 0))
@@ -585,7 +585,6 @@ def context():
 
 HEADER = '''<?xml version="1.0"?><sdf version="1.9"><world name="four_floor">
 <physics name="physics" type="ignored"><max_step_size>0.01</max_step_size><real_time_factor>1</real_time_factor></physics>
-<plugin filename="gz-sim-physics-system" name="gz::sim::systems::Physics"/>
 <plugin filename="gz-sim-user-commands-system" name="gz::sim::systems::UserCommands"/>
 <plugin filename="gz-sim-scene-broadcaster-system" name="gz::sim::systems::SceneBroadcaster"/>
 <scene><ambient>.55 .55 .55 1</ambient><background>.72 .76 .80 1</background><shadows>false</shadows></scene>

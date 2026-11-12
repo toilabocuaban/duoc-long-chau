@@ -62,14 +62,17 @@ def merge_boxes(name,visuals):
         raise ValueError('Box or cylinder geometry required for structural batching')
     result=list(passthrough)
     batches=[(color,tris[a:a+21000]) for color,tris in groups.items() for a in range(0,len(tris),21000)]
+    pack_tri=struct.Struct('<12fH').pack
+    hdr=b'Warehouse structural members'.ljust(80,b'\0')
     for i,(color,tris) in enumerate(batches):
         path=ROOT/'assets'/f'{name}_{i}.stl';path.parent.mkdir(exist_ok=True)
-        with path.open('wb') as f:
-            f.write(b'Warehouse structural members'.ljust(80,b'\0'));f.write(struct.pack('<I',len(tris)))
-            for a,b,c in tris:
-                u=[b[j]-a[j] for j in range(3)];v=[c[j]-a[j] for j in range(3)]
-                n=[u[1]*v[2]-u[2]*v[1],u[2]*v[0]-u[0]*v[2],u[0]*v[1]-u[1]*v[0]]
-                norm=math.sqrt(sum(x*x for x in n)) or 1.0;n=[x/norm for x in n]
-                f.write(struct.pack('<12fH',*n,*a,*b,*c,0))
+        chunks=[hdr,struct.pack('<I',len(tris))]
+        for a,b,c in tris:
+            u0,u1,u2=b[0]-a[0],b[1]-a[1],b[2]-a[2]
+            v0,v1,v2=c[0]-a[0],c[1]-a[1],c[2]-a[2]
+            n0,n1,n2=u1*v2-u2*v1,u2*v0-u0*v2,u0*v1-u1*v0
+            norm=math.sqrt(n0*n0+n1*n1+n2*n2) or 1.0
+            chunks.append(pack_tri(n0/norm,n1/norm,n2/norm,*a,*b,*c,0))
+        path.write_bytes(b''.join(chunks))
         result.append(f'<visual name="{name}_{i}"><geometry><mesh><uri>{escape(str(path))}</uri></mesh></geometry><material><ambient>{color}</ambient><diffuse>{color}</diffuse><specular>.35 .35 .35 1</specular></material></visual>')
     return result

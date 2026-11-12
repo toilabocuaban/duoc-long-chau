@@ -44,7 +44,7 @@ U2_PER_RACK=max(1,int(C.get('u2_cartons_per_rack',1)))
 U2_LOCKS={(f,u2_idx):asyncio.Lock() for f in LG.floors() for u2_idx in range(len(LG.U2_WORKERS))}
 U2_DELIVERY_LOCKS={(f,u2_idx):asyncio.Lock() for f in LG.floors() for u2_idx in range(len(LG.U2_WORKERS))}
 P1_LOCKS={(f,st_idx):asyncio.Lock() for f in LG.floors() for st_idx in range(len(LG.P1_STATIONS))}
-P1_ROW_SEMAPHORES={(f,row):asyncio.Semaphore(2 if f==1 else 1) for f in LG.floors() for row in (0,1)}
+P1_ROW_SEMAPHORES={(f,row):asyncio.Semaphore(2) for f in LG.floors() for row in (0,1)}
 LOOSE_CARTON_POOL=max(180,int(C.get('loose_pallets',0))*int(C.get('loose_cartons_per_pallet',0)))
 Z05_CARTON_POOL=max(80,len(LG.Z05_WORKERS)*int(C.get('z05_cartons_per_pallet',LG.Z05_CARTONS_PER_PALLET))*2)
 FREE_CARTONS=asyncio.Queue()
@@ -1008,28 +1008,34 @@ async def u2_carton_trip(floor,u2_idx,carton,job):
             await u2_trolley_swap_cycle(floor,u2_idx,list(st['trolley_cartons']))
 
 # ---------------------------------------------------------------- Khu P1 (14 Picking Stations: North 0..6 & West 7..13) <-> Kho 04 & Khu 06
+P1_PHASES=(.22,.14,.28,.20,.16)
+
 async def p1_operator_cycle(floor,st_idx,carton,rack_idx):
     """P1 picking worker at (floor, st_idx):
     1. Turns to the P1 Trolley (at st['mark']), picks 1 empty carton shell, and places it onto the working edge of the desk.
-    2. Picks 3 yellow medicine box clusters (m=0..2) from the loaded Rack in front of the station (st['rack']) and places them into the carton on the desk.
+    2. Picks 15 yellow medicine box clusters (5 trays x 3 clusters) from the loaded Rack in front of the station (st['rack']) and places them into the carton on the desk.
     3. Picks up the packed carton, moves it aside onto the far end of the desk, and the packed carton disappears."""
     wid=LG.p1_worker_id(floor,st_idx)
     sx,sy,syaw,z0=LG.p1_station(floor,st_idx)
-    rx,ry,_,_=LG.p1_rack_pose(floor,st_idx)
+    r_pose=LG.p1_rack_pose(floor,st_idx)
+    rx,ry,_,_=r_pose
     tx,ty,_,_=LG.p1_trolley_pose(floor,st_idx)
     active_c_pose=LG.p1_active_carton_pose(floor,st_idx)
     aside_c_pose=LG.p1_aside_carton_pose(floor,st_idx)
-    pick_s=float(C.get('p1_pick_box_s',4.5))
-    d=[f*pick_s for f in U1_PHASES]
-    med_count=int(C.get('p1_med_boxes_per_carton',LG.U1_MED_PER_CARTON))
-    med_names=[f'p1_med_{floor}_{st_idx}_{m}' for m in range(med_count)]
+    base_pick_s=float(C.get('p1_pick_box_s',2.8))
+    time_scale=1. if args.fast else max(1.,float(C.get('speed_multiplier',1.))*.55)
+    pick_s=base_pick_s*time_scale*(.85+.05*(st_idx%7))
+    d=[f*pick_s for f in P1_PHASES]
+    total_meds=int(C.get('p1_med_boxes_per_carton',LG.P1_MED_PER_CARTON))
+    batch_size=LG.U1_MED_PER_CARTON
+    med_names=[f'p1_med_{floor}_{st_idx}_{m}' for m in range(batch_size)]
     state={'x':sx,'y':sy,'yaw':syaw,'bend':0.,'arm':0.}
     async def phase(dur,x=None,y=None,yaw=None,bend=None,arm=None,carry_item=None,item_to=None,walk=False):
         a=dict(state);b={'x':a['x'] if x is None else x,'y':a['y'] if y is None else y,
              'yaw':a['yaw'] if yaw is None else a['yaw']+math.atan2(math.sin(yaw-a['yaw']),math.cos(yaw-a['yaw'])),
              'bend':a['bend'] if bend is None else bend,'arm':a['arm'] if arm is None else arm}
         steps=max(1,round(math.hypot(b['x']-a['x'],b['y']-a['y'])/STEP)) if walk else 0
-        upper_only=(not walk and abs(b['yaw']-a['yaw'])<1e-6 and abs(b['x']-a['x'])<1e-6 and abs(b['y']-a['y'])<1e-6)
+        upper_only=(not walk and abs(b['x']-a['x'])<1e-6 and abs(b['y']-a['y'])<1e-6)
         item_name=carry_item or (item_to[0] if item_to else None)
         i0=poses[item_name] if item_name else None
         def at(q):
@@ -1054,18 +1060,26 @@ async def p1_operator_cycle(floor,st_idx,carton,rack_idx):
     await phase(d[3],bend=.25,arm=.85,carry_item=carton)
     await phase(d[4],item_to=(carton,active_c_pose))
     loose_event('P1_EMPTY_CARTON_PLACED_ON_DESK',floor=floor,p1_station=st_idx,carton=carton)
-    # 2. Pick 3 yellow medicine box clusters from the P1 Rack and place them into the carton on the desk
+    # 2. Pick 15 yellow medicine box clusters from the P1 Rack and place them into the carton on the desk
     rack_yaw=math.atan2(ry-sy,rx-sx)
-    for m,m_name in enumerate(med_names):
+    for box_idx in range(total_meds):
+        if not p1_running:
+            break
+        m=box_idx%batch_size
+        tray_slot=box_idx//batch_size
+        if m==0:
+            send({med_names[k]:LG.u1_med_on_rack(r_pose,k,tray_slot) for k in range(batch_size)},transmit=not args.fast)
+        m_name=med_names[m]
         target_in_c=LG.p1_med_in_carton(active_c_pose,m)
-        await phase(d[0],yaw=rack_yaw,bend=.14,arm=1.10)
-        grab_m=LG.held_carton(sx,sy,rack_yaw,.14,1.10,z0=z0)
+        reach_bend=.14+.08*(tray_slot//2)
+        await phase(d[0],yaw=rack_yaw,bend=reach_bend,arm=1.10)
+        grab_m=LG.held_carton(sx,sy,rack_yaw,reach_bend,1.10,z0=z0)
         await phase(d[1],item_to=(m_name,grab_m))
         await phase(d[2],yaw=desk_yaw,bend=CARRY[0],arm=CARRY[1],carry_item=m_name)
         await phase(d[3],bend=.26,arm=.82,carry_item=m_name)
         await phase(d[4],item_to=(m_name,target_in_c))
-        loose_event('P1_MED_BOX_PACKED',floor=floor,p1_station=st_idx,carton=carton,med_box=m_name,box_index=m)
-    # 3. Move packed carton aside onto the desk, then packed carton + its 3 yellow medicine boxes disappear
+        loose_event('P1_MED_BOX_PACKED',floor=floor,p1_station=st_idx,carton=carton,med_box=m_name,box_index=box_idx)
+    # 3. Move packed carton aside onto the desk, then packed carton + its yellow medicine boxes disappear
     aside_yaw=math.atan2(aside_c_pose[1]-sy,aside_c_pose[0]-sx)
     await phase(d[0],yaw=desk_yaw,bend=.25,arm=.85)
     grab_packed=LG.held_carton(sx,sy,desk_yaw,.25,.85,z0=z0)
@@ -1075,16 +1089,16 @@ async def p1_operator_cycle(floor,st_idx,carton,rack_idx):
     await phase(d[3],item_to=(carton,aside_c_pose))
     await phase(d[4],yaw=syaw,bend=0.,arm=0.)
     send({carton:(aside_c_pose[0],aside_c_pose[1],-5,0)},transmit=not args.fast)
-    loose_event('P1_PACKED_CARTON_COMPLETED',floor=floor,p1_station=st_idx,carton=carton)
+    loose_event('P1_PACKED_CARTON_COMPLETED',floor=floor,p1_station=st_idx,carton=carton,med_boxes_packed=total_meds)
 
 async def p1_agv_rack_swap_cycle(floor,st_idx,empty_rack,store_cell,next_rack,next_rack_idx,spare_cell):
-    """After every packed carton (3 yellow medicine box turns), P1 AGV returns the now-empty rack to Kho 04
-    and brings out a new loaded rack (carrying 3 yellow medicine boxes) from Kho 04 to st['rack']."""
+    """After every packed carton (15 yellow medicine box turns), P1 AGV returns the now-empty rack to Kho 04
+    and brings out a new loaded rack from Kho 04 to st['rack']."""
     agv=f'p1_agv_{floor}_{st_idx}'
     rx,ry,z0,ryaw=LG.p1_rack_pose(floor,st_idx)
-    speed=float(C.get('p1_agv_speed',C.get('u1_agv_speed',0.45)))
+    speed=float(C.get('p1_agv_speed',1.2))
     lift_z=.03
-    med_count=int(C.get('p1_med_boxes_per_carton',LG.U1_MED_PER_CARTON))
+    med_count=LG.U1_MED_PER_CARTON
     next_meds=[f'p1_med_{floor}_{st_idx}_{m}' for m in range(med_count)]
     # 1. Carry now-empty rack from P1 station into Kho 04 empty cell
     pts_store=LG.p1_agv_route((rx,ry,z0),(store_cell['x'],store_cell['y'],z0),st_idx)
@@ -1129,7 +1143,7 @@ async def p1_agv_trolley_swap_cycle(floor,st_idx):
     trolley=st['active_trolley']
     k06_slot=st['k06_slot']
     kx,ky,_,kyaw=LG.k06_slot_pose(floor,k06_slot)
-    speed=float(C.get('p1_agv_speed',C.get('u1_agv_speed',0.45)))
+    speed=float(C.get('p1_agv_speed',1.2))
     lift_z=.03
     carton_names=[f'p1_carton_{floor}_{st_idx}_{c}' for c in range(TROLLEY_CAP)]
     # 1. Move P1 AGV from P1 rack to P1 trolley
@@ -1170,34 +1184,40 @@ async def p1_agv_trolley_swap_cycle(floor,st_idx):
     loose_event('P1_FULL_TROLLEY_READY',floor=floor,p1_station=st_idx,trolley=trolley)
 
 async def p1_station_loop(floor,st_idx):
-    """Continuous picking loop for P1 station (floor, st_idx) across both North (0..6) and West (7..13) rows."""
+    """Continuous picking loop for P1 station (floor, st_idx) across both North (0..6) and West (7..13) rows.
+    Every worker starts working immediately whenever a loaded rack is at their station; row_sem only regulates
+    concurrent AGV trips to Kho 04 / Khu 06 after the worker finishes packing 15 medicine boxes."""
     row=0 if st_idx<7 else 1
     row_sem=P1_ROW_SEMAPHORES[(floor,row)]
-    await engine.until(.5+.25*(st_idx%7)+.2*(floor-1))
+    await engine.until(.1+.15*(st_idx%7)+.05*(floor-1))
     while p1_running:
-        async with row_sem:
+        async with P1_LOCKS[(floor,st_idx)]:
+            st=P1_STATE[(floor,st_idx)]
+            if not st['trolley_remaining']:
+                async with row_sem:
+                    if not p1_running:break
+                    await p1_agv_trolley_swap_cycle(floor,st_idx)
             if not p1_running:break
-            async with P1_LOCKS[(floor,st_idx)]:
-                st=P1_STATE[(floor,st_idx)]
-                if not st['trolley_remaining']:
-                    await p1_agv_trolley_swap_cycle(floor,st_idx)
-                carton=st['trolley_remaining'].pop(0)
-                rack=st['active_rack']
-                rack_idx=st['active_rack_idx']
-                await p1_operator_cycle(floor,st_idx,carton,rack_idx)
-                st['cartons_packed']+=1
-                # Immediately after 1 packed carton (3 yellow medicine box turns), swap the empty rack for a new loaded rack from Kho 04
-                store_cell=st['empty_cell']
-                next_rack,next_rack_idx,spare_cell=st['spares'].pop(0)
+            carton=st['trolley_remaining'].pop(0)
+            rack=st['active_rack']
+            rack_idx=st['active_rack_idx']
+            await p1_operator_cycle(floor,st_idx,carton,rack_idx)
+            st['cartons_packed']+=1
+            # Immediately after 1 packed carton (15 yellow medicine box turns), swap the empty rack for a new loaded rack from Kho 04
+            store_cell=st['empty_cell']
+            next_rack,next_rack_idx,spare_cell=st['spares'].pop(0)
+            async with row_sem:
+                if not p1_running:break
                 await p1_agv_rack_swap_cycle(floor,st_idx,rack,store_cell,next_rack,next_rack_idx,spare_cell)
-                st['spares'].append((rack,rack_idx,store_cell))
-                st['active_rack']=next_rack
-                st['active_rack_idx']=next_rack_idx
-                st['empty_cell']=spare_cell
-                st['rack_swaps']+=1
-                if not st['trolley_remaining'] and p1_running:
+            st['spares'].append((rack,rack_idx,store_cell))
+            st['active_rack']=next_rack
+            st['active_rack_idx']=next_rack_idx
+            st['empty_cell']=spare_cell
+            st['rack_swaps']+=1
+            if not st['trolley_remaining'] and p1_running:
+                async with row_sem:
+                    if not p1_running:break
                     await p1_agv_trolley_swap_cycle(floor,st_idx)
-        await engine.until(scheduler.time+.1)
 
 async def z05_unpack_pallet(floor,zone,spot_xy,pallet_model,job):
     """When an outbound pallet from Kho 01 stops at its dedicated Zone 05 unpack zone (floor, zone, spot_xy):
