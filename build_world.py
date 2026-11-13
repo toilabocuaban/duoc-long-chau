@@ -109,7 +109,7 @@ truck_scene.add_scene(C,model)
 import four_floor_scene
 import loose_goods
 _spots=C.get('loose_pallet_spots',[])
-if _spots: four_floor_scene.ANIMATED_WORKER_AREAS={'carton_inbound','sorting','unpack','put_away','picking_station'}
+if _spots: four_floor_scene.ANIMATED_WORKER_AREAS={'carton_inbound','pallet_pick','sorting','unpack','put_away','picking_station'}
 parts.extend(four_floor_scene.models())
 import dock_flow
 dock_flow.scene(C,model,pallet_deck)
@@ -137,6 +137,9 @@ if _spots:
             wx,wy,wyaw,wz=loose_goods.p1_station(f,st_idx)
             for name,pose in loose_goods.operator_pose(loose_goods.p1_worker_id(f,st_idx),wx,wy,wyaw,z0=wz).items():
                 model(name,(pose[0],pose[1],pose[2],pose[5]),_part_mesh[name.split('_',1)[1]])
+    wx, wy, wyaw = -31.91375, -1.26, -math.pi / 2
+    for name, pose in loose_goods.operator_pose(500, wx, wy, wyaw, z0=0.).items():
+        model(name, (pose[0], pose[1], pose[2], pose[5]), _part_mesh[name.split('_', 1)[1]])
     _deck=merge_boxes('loose_deck',pallet_deck())
     for s,(x,y,yaw) in enumerate(_spots): model(f'loose_pallet_{s}',(x,y,-5,yaw),_deck)
     cl,cw,ch=loose_goods.CARTON
@@ -215,7 +218,7 @@ _use_barcode=C.get('inbound_classification')=='barcode' and bool(_spots)
 for i in range(C['jobs']):
     if _use_barcode and str(_seq[i%len(_seq)]).lower()!='even':
         continue
-    pallet(f'pallet_{i}',pickup_position(i))
+    pallet(f'pallet_{i}',(pickup_position(i)[0],-17,-5,pickup_position(i)[3]))
 for i in range(C.get('initial_outbound_pallets',0)):
     xy=LAYOUT.slot_point(LAYOUT.job_slots[i%len(LAYOUT.job_slots)])
     pallet(f'pallet_out_{i}',xy+(C['storage_levels'][(i+4)%9],0))

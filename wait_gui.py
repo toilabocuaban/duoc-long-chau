@@ -12,6 +12,7 @@ while time.monotonic()<deadline:
         print(f'   -> Đang tải môi trường 3D... ({elapsed}s)',flush=True)
     if '/gui/move_to/pose' in node.service_list():
         print(f'[2/3] Warehouse camera and rendering ready. ({elapsed}s)',flush=True)
+        print('[3/3] Cửa sổ mô phỏng 3D đã sẵn sàng! (Click vào biểu tượng Gazebo khối lập phương màu cam trên thanh Taskbar phía dưới để xem)',flush=True)
         break
     time.sleep(1)
 else: raise SystemExit('Gazebo GUI did not initialize within 180 seconds. See gazebo.log.')

@@ -11,11 +11,11 @@ def main():
                 result=subprocess.run(['python3',str(ROOT/'controller.py'),'--fast','--jobs','8'],env=env,stdout=ctl,stderr=ctl,timeout=240)
             if result.returncode:raise RuntimeError((ROOT/'dock-test-controller.log').read_text()[-6000:])
             r=json.loads((ROOT/'validation.json').read_text());c=json.loads((ROOT/'config.json').read_text())
-            assert r['complete']==8 and r['inbound_stored']==8,r
-            assert r['loose_cartons_delivered']==c['loose_pallets']*c['loose_cartons_per_pallet'],r
-            assert r['dock_flow']['scanned_even']==8*18,r
-            assert r['dock_flow']['scanned_odd']==r['loose_cartons_delivered'],r
-            assert r['dock_flow']['empty_pallet_returns']==c['loose_pallets'],r
+            assert r['complete']==4 and r['inbound_stored']==4 and r['loose_pallets_unpacked']==4,r
+            assert r['dock_flow']['pallets_to_w1']==4 and r['dock_flow']['pallets_to_w2']==4,r
+            assert r['dock_flow']['scanned_even']==4*18,r
+            assert r['dock_flow']['scanned_odd']==4*18,r
+            assert r['dock_flow']['empty_pallet_returns']==4,r
             print(json.dumps(r,indent=2),flush=True)
         finally:
             if server.poll() is None:

@@ -328,7 +328,7 @@ def people():
     return out
 
 FLOOR1_AREAS = {'carton_inbound', 'pallet_pick'}
-ANIMATED_WORKER_AREAS = {'carton_inbound', 'sorting', 'unpack', 'put_away', 'picking_station'} if C.get('loose_pallet_spots') else set()
+ANIMATED_WORKER_AREAS = {'carton_inbound', 'pallet_pick', 'sorting', 'unpack', 'put_away', 'picking_station'} if C.get('loose_pallet_spots') else set()
 TROLLEY_CAPACITY = 5
 K06_SLOTS_XY = [
     (-6.20, 14.895), (-4.80, 14.895), (-3.40, 14.895), (-2.00, 14.895),

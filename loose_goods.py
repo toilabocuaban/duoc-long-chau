@@ -119,15 +119,20 @@ def operator_pose(i, x, y, yaw, bend=0., arm=0., swing=0., z0=0., upper_only=Fal
     """Part poses (x, y, z, roll, pitch, yaw). bend: torso forward lean; arm: raise of the arms relative to
     the torso (0 = hanging along it); swing: leg swing angle; z0: floor base height."""
     n = part_names(i)
+    bounce = 0.018 * math.sin(swing)**2 if not upper_only else 0.
+    hip_z = z0 + HIP - bounce
     sx = SHOULDER[0] * math.cos(bend) + SHOULDER[1] * math.sin(bend)
     sz = -SHOULDER[0] * math.sin(bend) + SHOULDER[1] * math.cos(bend)
     dx, dy = _rot(yaw, (sx, 0))
-    out = {n['torso']: (x, y, z0 + HIP, 0., bend, yaw),
-           n['arms']: (x + dx, y + dy, z0 + HIP + sz, 0., bend - arm, yaw)}
+    arm_pitch = bend - arm
+    if abs(arm) < 1e-4 and abs(swing) > 1e-4:
+        arm_pitch += 0.35 * swing
+    out = {n['torso']: (x, y, hip_z, 0., bend, yaw),
+           n['arms']: (x + dx, y + dy, hip_z + sz, 0., arm_pitch, yaw)}
     if not upper_only:
         lx, ly = _rot(yaw, (0, LEG_Y))
-        out[n['legl']] = (x + lx, y + ly, z0 + HIP, 0., swing, yaw)
-        out[n['legr']] = (x - lx, y - ly, z0 + HIP, 0., -swing, yaw)
+        out[n['legl']] = (x + lx, y + ly, hip_z, 0., swing, yaw)
+        out[n['legr']] = (x - lx, y - ly, hip_z, 0., -swing, yaw)
     return out
 
 def held_carton(x, y, yaw, bend, arm, z0=0.):
@@ -467,12 +472,41 @@ def length(pts):
     return sum(math.dist(a, b) for a, b in zip(pts, pts[1:]))
 
 def along(pts, s):
-    """Pose (x, y, z, yaw) at arc length s along the polyline (yaw = horizontal heading)."""
+    """Pose (x, y, z, yaw) at arc length s along the polyline (yaw = horizontal heading with smooth corner blending)."""
+    segs = []
+    prev_th = 0.
     for a, b in zip(pts, pts[1:]):
         d = math.dist(a, b)
-        if s <= d or b is pts[-1]:
-            t = 0 if d == 0 else min(1., s / d)
-            yaw = math.atan2(b[1] - a[1], b[0] - a[0]) if math.hypot(b[0] - a[0], b[1] - a[1]) > 1e-6 else 0.
-            return tuple(a[j] + (b[j] - a[j]) * t for j in range(3)) + (yaw,)
-        s -= d
+        h = math.hypot(b[0] - a[0], b[1] - a[1])
+        th = math.atan2(b[1] - a[1], b[0] - a[0]) if h > 1e-6 else prev_th
+        prev_th = th
+        segs.append((a, b, d, th))
+
+    cur_s = s
+    for i, (a, b, d, th) in enumerate(segs):
+        if cur_s <= d or i == len(segs) - 1:
+            t = 0. if d == 0 else min(1., max(0., cur_s / d))
+            pos = tuple(a[j] + (b[j] - a[j]) * t for j in range(3))
+
+            yaw = th
+            if i < len(segs) - 1 and cur_s > d - 0.20:
+                next_th = segs[i + 1][3]
+                dth = math.atan2(math.sin(next_th - th), math.cos(next_th - th))
+                R = min(0.20, d / 2, segs[i + 1][2] / 2)
+                if R > 1e-4 and cur_s > d - R:
+                    v = (cur_s - d) / R
+                    u = (v + 1) / 2
+                    w = 3 * u * u - 2 * u * u * u
+                    yaw = th + dth * w
+            elif i > 0 and cur_s < 0.20:
+                prev_th = segs[i - 1][3]
+                dth = math.atan2(math.sin(th - prev_th), math.cos(th - prev_th))
+                R = min(0.20, segs[i - 1][2] / 2, d / 2)
+                if R > 1e-4 and cur_s < R:
+                    v = cur_s / R
+                    u = (v + 1) / 2
+                    w = 3 * u * u - 2 * u * u * u
+                    yaw = prev_th + dth * w
+            return pos + (yaw,)
+        cur_s -= d
     return tuple(pts[-1]) + (0.,)
