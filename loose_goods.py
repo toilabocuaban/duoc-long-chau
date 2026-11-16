@@ -304,6 +304,10 @@ def u2_agv_route(start_xyz, end_xyz, u2_idx):
 # ---------------------------------------------------------------- Empty Carton Trolleys <-> Khu 06 & Khu P1 (14 Stations)
 TROLLEY_CAPACITY = FF.TROLLEY_CAPACITY
 K06_SLOTS_XY = FF.K06_SLOTS_XY
+K06_INITIAL_SLOTS = FF.K06_INITIAL_SLOTS
+
+def k06_trolley_name(floor, k):
+    return f'k06_trolley_{floor}_{k}'
 P1_STATIONS = FF.P1_STATIONS
 P1_RACKS_PER_STATION = FF.P1_RACKS_PER_STATION
 P1_CELL_MAP = FF.P1_CELL_MAP

@@ -65,19 +65,16 @@ def visuals(c):
     # the rear is created by dock_flow. It has no process or collision role.
     decorative_rows=(range(int(c.get('truck_decorative_pallet_rows',2))) if c.get('dock_flow_enabled',True)
                      else range(max(0,int((end-3.3)/1.35))))
+    # Loose cartons stacked straight on the trailer floor (no pallets): the dock worker unloads box by box.
     for row in decorative_rows:
         x=(5.25+row*1.45) if c.get('dock_flow_enabled',True) else (3.45+row*1.35)
-        for side in (-1,1):
-            y=side*W*.245
-            for k in range(5): b('pallet_slat',x,y+(k-2)*.18,DECK+.12,1.1,.15,.04,WOOD)
-            for xx in (-.4,.4): b('pallet_foot',x+xx,y,DECK+.05,.14,.8,.10,WOOD)
-            for a in (-1,1):
-                for by in (-1,1):
-                    for layer in range(3):
-                        xx=x+a*.265; yy=y+by*.205; z=DECK+.15+(layer+.5)*.52
-                        b('carton',xx,yy,z,.51,.39,.50,'.74 .55 .30 1')
-                        b('tape',xx,yy,z+.253,.055,.39,.008,'.92 .80 .57 1')
-                        b('label',xx,yy+side*.197,z,.17,.006,.12,'.93 .92 .82 1')
+        for a in (-1,1):
+            for by in range(-2,3):
+                for layer in range(4):
+                    xx=x+a*.265; yy=by*.41; z=DECK+(layer+.5)*.50
+                    b('carton',xx,yy,z,.51,.39,.49,'.74 .55 .30 1')
+                    b('tape',xx,yy,z+.248,.055,.39,.008,'.92 .80 .57 1')
+                    if abs(by)==2: b('label',xx,yy+(.197 if by>0 else -.197),z,.17,.006,.12,'.93 .92 .82 1')
     # Rounded cab shell with actual bevelled silhouette (shared generated mesh).
     # Cab bevel uses a small OBJ mesh, avoiding dependence on build_world import.
     cab_visual=bevel_cab(cab,W)

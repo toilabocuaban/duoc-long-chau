@@ -334,7 +334,8 @@ K06_SLOTS_XY = [
     (-6.20, 14.895), (-4.80, 14.895), (-3.40, 14.895), (-2.00, 14.895),
     (-6.20, 12.695), (-4.80, 12.695), (-3.40, 12.695), (-2.00, 12.695),
 ]
-U1_RACK_Y = 12.691              # CAD x1 rack station directly behind each sorting worker (y=11.981)
+K06_INITIAL_SLOTS = (4, 5, 6, 7)   # Khu 06 slots holding a waiting trolley at start; slots 0-3 start empty
+U1_RACK_Y = 12.691             # CAD x1 rack station directly behind each sorting worker (y=11.981)
 U1_BRANCHES = sorted((c['rect'] for c in L['conveyors'] if c['block'] == '*U632'), key=cx)
 U1_RACKS_PER_BRANCH = 2         # 1 rack at U1 station + 1 replacement rack in Kho 04
 
@@ -426,9 +427,8 @@ def floor_common():
             v += place(person_parts(), w['x'], w['y'], w['yaw'])
     for s in L['pallet_spots']:
         if cy(s) >= 0: v += spot_marks(s)
-    for s_idx, (kx, ky) in enumerate(K06_SLOTS_XY):
+    for s_idx, (kx, ky) in enumerate(K06_SLOTS_XY):   # trolleys here are movable models (k06_trolley_*)
         v += spot_marks([kx - .62, ky - .42, kx + .62, ky + .42])
-        v += place(trolley_parts(with_cartons=(s_idx >= 4)), kx, ky, 0.)
     for z in L['unpack_zones']:
         x0, y0, x1, y1 = z
         for e in ((x0, y0, x1, y0), (x1, y0, x1, y1), (x1, y1, x0, y1), (x0, y1, x0, y0)): v.append(line_box(e, .06, .004, TAPE_Y))
@@ -566,6 +566,10 @@ def models():
                 out.append(model(f'p1_rack_{f}_{st_idx}_{r_idx}', (cell['x'], cell['y'], zf, cell.get('yaw', 0.)), p1_rack_mesh, static=True))
             tx, ty, tyaw = p1_trolley_xy_yaw(st_idx)
             out.append(model(f'p1_trolley_{f}_{st_idx}', (tx, ty, zf, tyaw), trolley_empty_mesh, static=True))
+        # Khu 06 trolley buffer: K06_INITIAL_SLOTS hold waiting trolleys, the other slots start empty.
+        for k, slot in enumerate(K06_INITIAL_SLOTS):
+            kx, ky = K06_SLOTS_XY[slot]
+            out.append(model(f'k06_trolley_{f}_{k}', (kx, ky, zf, 0.), trolley_empty_mesh, static=True))
     for j, sp in enumerate(L['spirals']):
         out.append(model(f'ff_spiral_{sp["from_floor"]}_{sp["to_floor"]}', (0, 0, 0, 0), merge_boxes(f'ff_spiral{j}', spiral(sp))))
     return out

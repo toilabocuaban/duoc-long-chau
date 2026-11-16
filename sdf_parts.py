@@ -5,6 +5,12 @@ from xml.sax.saxutils import escape
 
 ROOT = Path(__file__).resolve().parent
 
+# Pooled objects are "hidden" by the controller at z=-5. Ogre still draws them there (below the floor but inside
+# the view frustum), so in Gazebo they are parked at HIDDEN_Z, beyond the GUI camera far clip, and never rendered.
+HIDDEN_BELOW = -4.0
+HIDDEN_Z = -2000.0
+CAMERA_FAR_CLIP = 900.0
+
 def box(name, x, y, z, sx, sy, sz, color, yaw=0):
     return f'<visual name="{name}"><pose>{x} {y} {z} 0 0 {yaw}</pose><geometry><box><size>{sx} {sy} {sz}</size></box></geometry><material><ambient>{color}</ambient><diffuse>{color}</diffuse></material></visual>'
 

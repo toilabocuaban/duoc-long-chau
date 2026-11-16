@@ -8,6 +8,8 @@ from pathlib import Path
 from gz.transport13 import Node
 from gz.msgs10.pose_v_pb2 import Pose_V
 from gz.msgs10.boolean_pb2 import Boolean
+from gz.msgs10.scene_pb2 import Scene
+from gz.msgs10.empty_pb2 import Empty
 from agv_motion import PARKS, OFFSET, pickup_position, assembly, samples, check_pose, route_to_pickup, route_to_gate, route_home, PICKUP_LEGS_FROM_LANE
 from rail_geometry import deck_name, wheel_name, supported
 from cad_navigation import LAYOUT
@@ -17,6 +19,8 @@ from agv_motion import wrap
 from agv_traffic import Plan,compatible
 import loose_goods as LG
 import truck_scene
+from sdf_parts import HIDDEN_Z, HIDDEN_BELOW
+import agv_network as AN
 from dock_flow import DockFlow
 
 ROOT=Path(__file__).resolve().parent
@@ -166,13 +170,25 @@ def _pose_changed(old,new):
         if abs(old[k]-new[k])>2e-3:return True
     return False
 
+# Gazebo's set_pose_vector resolves a pose given by *name* with a scan over every model; with ~2,300 models and
+# thousands of poses per second that scan saturates the server loop and the scene freezes. Poses are therefore
+# addressed by entity id (looked up once from scene/info); names remain the fallback.
+ENTITY_IDS={}
+def _load_entity_ids():
+    ok,scene=node.request('/world/warehouse/scene/info',Empty(),Empty,Scene,30000)
+    if ok:ENTITY_IDS.update({m.name:m.id for m in scene.model})
+
 def _flush_tx(batch):
     if not batch:return
+    if not ENTITY_IDS:_load_entity_ids()
     req=Pose_V()
     for name,xyz in batch.items():
         if not _pose_changed(last_tx_poses.get(name),xyz):continue
-        p=req.pose.add(); p.name=name
+        p=req.pose.add();eid=ENTITY_IDS.get(name)
+        if eid:p.id=eid
+        else:p.name=name
         p.position.x,p.position.y,p.position.z=xyz[:3]
+        if xyz[2]<HIDDEN_BELOW:p.position.z=HIDDEN_Z   # hidden pool object: park beyond the camera far clip
         if len(xyz)>=6:   # (x, y, z, roll, pitch, yaw): animated operator parts
             r,pi_,yw=xyz[3],xyz[4],xyz[5];cr,sr,cp,sp,cy_,sy_=math.cos(r/2),math.sin(r/2),math.cos(pi_/2),math.sin(pi_/2),math.cos(yw/2),math.sin(yw/2)
             p.orientation.w=cr*cp*cy_+sr*sp*sy_;p.orientation.x=sr*cp*cy_-cr*sp*sy_
@@ -391,31 +407,18 @@ async def arrivals(total):
         if flow=='odd' and LOOSE_SPOTS:
             global odd_pallet_seq
             odd_idx=odd_pallet_seq;odd_pallet_seq+=1
-            spot=LOOSE_SPOTS[odd_idx%len(LOOSE_SPOTS)]
-            spot_lock=ODD_SPOT_LOCKS[odd_idx%len(ODD_SPOT_LOCKS)]
+            s=odd_idx%len(LOOSE_SPOTS);spot=LOOSE_SPOTS[s]
             stack=LG.stack_positions(spot,LOOSE_PER)
             async def receive_odd(dock_i,cartons):
                 names=[await FREE_CARTONS.get() for _ in range(LOOSE_PER)]
                 send({n:poses[n][:2]+(-5,0) for n in cartons},transmit=not args.fast)
                 send({n:p+(spot[2],) for n,p in zip(names,stack)},transmit=not args.fast)
-                deck=f'loose_pallet_{odd_idx%len(LOOSE_SPOTS)}'
-                send({deck:spot[:2]+(0,0)},transmit=not args.fast)
-                async def unpack_cartons():
-                    async with spot_lock:
-                        for n,p in zip(names,stack):
-                            op=op_of_spot=min((w for w in LG.L['workers'] if w['area']=='carton_inbound'),key=lambda w:abs(w['x']-spot[0]))
-                            await operator_cycle(LG.OPERATORS.index(op),op,spot,n,p)
-                            dest=LG.floors()[loose_stats['cartons_on_belt']%len(LG.floors())]
-                            branch=loose_stats['cartons_on_belt']//len(LG.floors())
-                            loose_stats['cartons_on_belt']+=1
-                            loose_event('CARTON_ON_BELT',carton=n,pallet=job,floor=dest)
-                            background_tasks.append(asyncio.create_task(carton_trip(n,dest,branch)))
-                        loose_stats['pallets_unpacked']+=1
-                        loose_event('LOOSE_PALLET_EMPTY',pallet=odd_idx,spot=odd_idx%len(LOOSE_SPOTS))
-                        send({deck:spot[:2]+(-5,0)},transmit=not args.fast)
-                background_tasks.append(asyncio.create_task(unpack_cartons()))
+                send({f'loose_pallet_{s}':spot[:2]+(0,0)},transmit=not args.fast)
+                loose_event('LOOSE_PALLET_ON_SPOT',pallet=odd_idx,spot=s)
+                await LOOSE_POOL.add(s,odd_idx,job,list(zip(names,stack)))
             try:
-                await dock_flow.prepare('odd',job,spot,list(range(LOOSE_PER)),receive_odd,acquire_target=spot_lock)
+                # The spot stays occupied from the pallet's arrival until its last carton is unpacked.
+                await dock_flow.prepare('odd',job,spot,list(range(LOOSE_PER)),receive_odd,acquire_target=SpotHold(LOOSE_SPOT_FREE[s]))
             finally:
                 if pickup_bays:pickup_bays[job%len(pickup_bays)].release()
             return
@@ -533,7 +536,61 @@ LOOSE_SPOTS=[tuple(s) for s in C.get('loose_pallet_spots',[])]
 ODD_SPOT_LOCKS=[asyncio.Lock() for _ in LOOSE_SPOTS] or [asyncio.Lock()]
 LOOSE_PALLETS=int(C.get('loose_pallets',0)) if LOOSE_SPOTS else 0
 LOOSE_PER=int(C.get('loose_cartons_per_pallet',0))
-loose_stats={'pallets_unpacked':0,'cartons_on_belt':0,'cartons_delivered':0,'per_floor':{}}
+loose_stats={'pallets_unpacked':0,'cartons_on_belt':0,'cartons_delivered':0,'per_floor':{},'shared_picks':0}
+LOOSE_SPOT_FREE=[asyncio.Semaphore(1) for _ in LOOSE_SPOTS]
+
+class SpotHold:
+    """Acquired by the pallet-jack transfer before it enters a loose spot; deliberately NOT released when the
+    transfer ends: LOOSE_POOL releases it once the last carton of that pallet has been unpacked."""
+    def __init__(self,sem):self.sem=sem
+    async def __aenter__(self):await self.sem.acquire()
+    async def __aexit__(self,*exc):return False
+
+class LoosePool:
+    """Cartons of the pallets standing on the floor-1 loose spots. Both operators take cartons from it: each
+    prefers the pallet on its own spot, and helps on the other pallet when its own spot is empty."""
+    def __init__(self):self.pallets={};self.cond=None
+    def _c(self):
+        if self.cond is None:self.cond=asyncio.Condition()
+        return self.cond
+    async def add(self,s,odd_idx,job,items):
+        async with self._c():
+            self.pallets[s]={'odd':odd_idx,'job':job,'todo':list(items),'busy':0}
+            self._c().notify_all()
+    async def take(self,prefer):
+        async with self._c():
+            await self._c().wait_for(lambda:any(p['todo'] for p in self.pallets.values()))
+            s=prefer if prefer in self.pallets and self.pallets[prefer]['todo'] else next(k for k,p in self.pallets.items() if p['todo'])
+            p=self.pallets[s];p['busy']+=1
+            return s,p,p['todo'].pop(0)
+    async def done(self,s):
+        async with self._c():
+            p=self.pallets[s];p['busy']-=1
+            if p['todo'] or p['busy']:return
+            del self.pallets[s]
+        loose_stats['pallets_unpacked']+=1
+        loose_event('LOOSE_PALLET_EMPTY',pallet=p['odd'],spot=s)
+        send({f'loose_pallet_{s}':LOOSE_SPOTS[s][:2]+(-5,0)},transmit=not args.fast)
+        LOOSE_SPOT_FREE[s].release()
+LOOSE_POOL=LoosePool()
+
+def loose_home_spot(op):
+    return min(range(len(LOOSE_SPOTS)),key=lambda s:abs(LOOSE_SPOTS[s][0]-op['x']))
+
+async def loose_worker(k):
+    """Operator k at the carton belt: unpack cartons from the loose pallets, one at a time, onto the belt."""
+    op=LG.OPERATORS[k];home=loose_home_spot(op)
+    while True:
+        s,p,(n,pos)=await LOOSE_POOL.take(home)
+        if s!=home:loose_stats['shared_picks']+=1
+        # Two operators at one pallet stand side by side: the spot's own operator nearer the belt.
+        await operator_cycle(k,op,LOOSE_SPOTS[s],n,pos,dy=.25 if s==home else -.25)
+        dest=LG.floors()[loose_stats['cartons_on_belt']%len(LG.floors())]
+        branch=loose_stats['cartons_on_belt']//len(LG.floors())
+        loose_stats['cartons_on_belt']+=1
+        loose_event('CARTON_ON_BELT',carton=n,pallet=p['job'],floor=dest,operator=k)
+        background_tasks.append(asyncio.create_task(carton_trip(n,dest,branch)))
+        await LOOSE_POOL.done(s)
 
 def loose_event(state,**extra):
     record={'job':None,'loose':True,'state':state,'demo_time_s':round(scheduler.time,5),**extra}
@@ -717,94 +774,174 @@ async def u1_operator_cycle(floor,branch,*args,**kwargs):
     try:return await _u1_operator_cycle(floor,branch,*args,**kwargs)
     finally:BUSY_WORKERS.discard(wid)
 
-async def u1_trolley_swap_cycle(floor,branch,cartons_in_trolley):
-    """When U1 trolley reaches 5 empty cartons, U1 AGV transports the full trolley to Khu 06 and brings an empty trolley back."""
-    agv=f'u1_agv_{floor}_{branch}'
-    bx,u1_y,z0,_=LG.u1_rack_pose(floor,branch)
-    tx,ty,_,tyaw=LG.u1_trolley_pose(floor,branch)
-    st=U1_STATE[(floor,branch)]
-    trolley=st['active_trolley']
-    k06_slot=st['k06_slot']
-    kx,ky,_,kyaw=LG.k06_slot_pose(floor,k06_slot)
-    speed=float(C.get('u1_agv_speed',0.45))
-    lift_z=.03
-    # 1. Move AGV from U1 rack to U1 trolley
-    pts_to_t=LG.u1_k06_route((bx,u1_y,z0),(tx,ty,z0))
-    len_to_t=LG.length(pts_to_t)
-    await engine.move({agv:LG.along(pts_to_t,len_to_t)},speed=speed,duration=max(.1,len_to_t/speed),
-                      transform=lambda q:{agv:LG.along(pts_to_t,q*len_to_t)},shape=blend,exact=True)
-    # 2. Carry full trolley (+ 5 empty cartons) to Khu 06
-    pts_k06=LG.u1_k06_route((tx,ty,z0),(kx,ky,z0))
-    len_k06=LG.length(pts_k06)
-    delta_yaw=tyaw-LG.along(pts_k06,0)[3]
-    def at_k06(q):
-        ax,ay,az,ayaw=LG.along(pts_k06,q*len_k06)
-        tp=(ax,ay,z0+lift_z,ayaw+delta_yaw)
-        out={agv:(ax,ay,z0,ayaw),trolley:tp}
-        for idx,c_name in enumerate(cartons_in_trolley):
-            out[c_name]=LG.trolley_carton_pose(tp,idx)
+# ---------------------------------------------------------------- 4-floor AGVs: CAD path network, traffic, drop positions
+def _ff_agv_targets():
+    t=[(c['x'],c['y']) for c in LG.L['rack_cells']]
+    for b in range(len(LG.BRANCHES)):t+=[LG.u1_rack_pose(1,b)[:2],LG.u1_trolley_pose(1,b)[:2]]
+    for u in range(len(LG.U2_WORKERS)):t+=[LG.u2_rack_pose(1,u)[:2],LG.u2_trolley_pose(1,u)[:2]]
+    for s in range(len(LG.P1_STATIONS)):t+=[LG.p1_rack_pose(1,s)[:2],LG.p1_trolley_pose(1,s)[:2]]
+    return t+list(LG.K06_SLOTS_XY)
+AGV_NET=AN.Network(AN.segments(),_ff_agv_targets())
+AGV_TRAFFIC={f:AN.Traffic(AGV_NET) for f in LG.floors()}
+AGV_SPOTS={f:AN.Spots() for f in LG.floors()}
+K06_READY={f:[] for f in LG.floors()}          # (slot key, trolley) waiting in Khu 06, oldest first
+K06_COND={}
+LOAD_LIFT=.03;LOAD_LIFT_S=.5
+agv_traffic_stats={'trips':0,'wait_s':0.,'max_wait_s':0.}
+
+def cell_key(c):return ('cell',round(c['x'],3),round(c['y'],3))
+def k06_key(slot):return ('k06',slot)
+
+class Load:
+    """A rack / trolley carried on top of an AGV. yaw_to: its yaw once set down; contents(pose) -> poses of the
+    items riding on it (medicine boxes, cartons)."""
+    def __init__(self,name,yaw_to,contents=None):
+        self.name=name;self.yaw_to=yaw_to;self.contents=contents
+
+async def agv_trip(floor,agv,end_xy,end_yaw=None,speed=1.,load=None):
+    """Drive a 4-floor AGV along the CAD path network to end_xy: reserve the whole route first (waiting for
+    other AGVs), lift the load, turn in place at every corner, release the route behind it, set the load down."""
+    z0=LG.LEVELS[floor-1];tr=AGV_TRAFFIC[floor]
+    p=poses[agv];sx,sy=p[:2];yaw=p[3] if len(p)>3 else 0.
+    pts,keys=AGV_NET.plan((sx,sy),tuple(end_xy[:2]))
+    held=[k for k in keys if k is not None]
+    lyaw0=poses[load.name][3] if load and len(poses[load.name])>3 else 0.
+    def frame(x,y,ayaw,lz,lyaw):
+        out={agv:(x,y,z0,ayaw)}
+        if load:
+            lp=(x,y,z0+lz,lyaw);out[load.name]=lp
+            if load.contents:out.update(load.contents(lp))
         return out
-    await engine.move(at_k06(1.),speed=speed,duration=max(.1,len_k06/speed),transform=at_k06,shape=blend,exact=True)
-    send({trolley:(kx,ky,z0,kyaw),**{c_name:(kx,ky,-5,0) for c_name in cartons_in_trolley}},transmit=not args.fast)
-    for c_name in cartons_in_trolley:
-        FREE_CARTONS.put_nowait(c_name)
-    loose_event('U1_TROLLEY_DELIVERED_TO_K06',floor=floor,branch=branch,trolley=trolley,k06_slot=k06_slot)
-    # 3. Bring empty replacement trolley from Khu 06 back to U1 station
-    pts_back=LG.u1_k06_route((kx,ky,z0),(tx,ty,z0))
-    len_back=LG.length(pts_back)
-    delta_back_yaw=kyaw-LG.along(pts_back,0)[3]
-    def at_back(q):
-        ax,ay,az,ayaw=LG.along(pts_back,q*len_back)
-        return {agv:(ax,ay,z0,ayaw),trolley:(ax,ay,z0+lift_z,ayaw+delta_back_yaw)}
-    await engine.move(at_back(1.),speed=speed,duration=max(.1,len_back/speed),transform=at_back,shape=blend,exact=True)
-    send({trolley:(tx,ty,z0,tyaw)},transmit=not args.fast)
-    # 4. Return AGV to U1 rack position
-    pts_home=LG.u1_k06_route((tx,ty,z0),(bx,u1_y,z0))
-    len_home=LG.length(pts_home)
-    await engine.move({agv:LG.along(pts_home,len_home)},speed=speed,duration=max(.1,len_home/speed),
-                      transform=lambda q:{agv:LG.along(pts_home,q*len_home)},shape=blend,exact=True)
-    send({agv:(bx,u1_y,z0,math.pi/2)},transmit=not args.fast)
-    st['trolley_cartons']=[]
-    st['trolley_swaps']+=1
-    loose_event('U1_REPLACEMENT_TROLLEY_READY',floor=floor,branch=branch,trolley=trolley)
+    t_req=scheduler.time
+    await tr.acquire(agv,held)
+    waited=scheduler.time-t_req
+    agv_traffic_stats['trips']+=1;agv_traffic_stats['wait_s']+=waited
+    agv_traffic_stats['max_wait_s']=max(agv_traffic_stats['max_wait_s'],waited)
+    cum=[0.]
+    for a,b in zip(pts,pts[1:]):cum.append(cum[-1]+math.dist(a,b))
+    state={'released':0}
+    def release_behind(s):
+        while state['released']<len(pts) and cum[state['released']]<s-AN.CLEAR:
+            k=keys[state['released']]
+            if k is not None:tr.release(agv,[k])
+            state['released']+=1
+    w=float(C.get('ff_agv_angular_speed',C['agv_angular_speed']))
+    lift=LOAD_LIFT if load else 0.
+    try:
+        if load:
+            await engine.move(frame(sx,sy,yaw,lift,lyaw0),duration=LOAD_LIFT_S,transform=lambda q:frame(sx,sy,yaw,lift*q,lyaw0),exact=True)
+        x,y=sx,sy;i=0
+        while i<len(pts)-1:
+            hd=math.atan2(pts[i+1][1]-pts[i][1],pts[i+1][0]-pts[i][0]);j=i+1
+            while j+1<len(pts) and abs(math.remainder(math.atan2(pts[j+1][1]-pts[j][1],pts[j+1][0]-pts[j][0])-hd,2*math.pi))<1e-3:j+=1
+            dyaw=math.remainder(hd-yaw,2*math.pi)
+            if abs(dyaw)>math.pi/2+1e-6:dyaw=math.remainder(hd+math.pi-yaw,2*math.pi)   # latent AGVs drive both ways
+            if abs(dyaw)>1e-3:
+                y0=yaw
+                await engine.move(frame(x,y,y0+dyaw,lift,lyaw0),duration=abs(dyaw)/w,
+                                  transform=lambda q,y0=y0,d=dyaw,x=x,y=y:frame(x,y,y0+d*q,lift,lyaw0),exact=True)
+                yaw=y0+dyaw
+            a,b=pts[i],pts[j];L=cum[j]-cum[i];s0=cum[i]
+            prof=SCurve(L,speed,C['agv_acceleration'],C['agv_jerk'])
+            def at(q,a=a,b=b,L=L,s0=s0,yaw=yaw,moving=True):
+                if moving:release_behind(s0+L*q)   # only while actually driving (not for the target pose)
+                return frame(a[0]+(b[0]-a[0])*q,a[1]+(b[1]-a[1])*q,yaw,lift,lyaw0)
+            await engine.move(at(1.,moving=False),duration=max(.05,prof.duration),transform=at,shape=prof.shape,exact=True)
+            x,y=b;i=j
+        tyaw=yaw if end_yaw is None else yaw+math.remainder(end_yaw-yaw,2*math.pi)
+        lyaw1=lyaw0 if not load or load.yaw_to is None else lyaw0+math.remainder(load.yaw_to-lyaw0,2*math.pi)
+        turn=max(abs(tyaw-yaw),abs(lyaw1-lyaw0))
+        if turn>1e-3:
+            await engine.move(frame(x,y,tyaw,lift,lyaw1),duration=turn/w,
+                              transform=lambda q:frame(x,y,yaw+(tyaw-yaw)*q,lift,lyaw0+(lyaw1-lyaw0)*q),exact=True)
+        if load:
+            await engine.move(frame(x,y,tyaw,0.,lyaw1),duration=LOAD_LIFT_S,transform=lambda q:frame(x,y,tyaw,lift*(1-q),lyaw1),exact=True)
+    finally:
+        tr.release(agv,held)
+
+async def rack_swap(floor,agv,home,full_rack,full_contents,store_cell,next_rack,spare_cell,next_contents=None,speed=1.,on_stored=None):
+    """Station AGV under full_rack at home=(x, y, agv_yaw, rack_yaw): store full_rack in store_cell (claimed
+    empty first), fetch next_rack from spare_cell and bring it back to the station."""
+    spots=AGV_SPOTS[floor]
+    await spots.claim([cell_key(store_cell)],full_rack)
+    await agv_trip(floor,agv,(store_cell['x'],store_cell['y']),None,speed,Load(full_rack,store_cell.get('yaw',0.),full_contents))
+    if on_stored:on_stored()
+    await agv_trip(floor,agv,(spare_cell['x'],spare_cell['y']),None,speed)
+    await agv_trip(floor,agv,home[:2],home[2],speed,Load(next_rack,home[3],next_contents))
+    spots.free(cell_key(spare_cell))
+
+async def _k06_take_ready(floor,exclude):
+    cond=K06_COND.setdefault(floor,asyncio.Condition())
+    async with cond:
+        await cond.wait_for(lambda:any(t!=exclude for _,t in K06_READY[floor]))
+        k=next(i for i,(_,t) in enumerate(K06_READY[floor]) if t!=exclude)
+        return K06_READY[floor].pop(k)
+
+async def _k06_put_ready(floor,slot,trolley):
+    cond=K06_COND.setdefault(floor,asyncio.Condition())
+    async with cond:
+        K06_READY[floor].append((slot,trolley));cond.notify_all()
+
+async def trolley_exchange(floor,agv,home,trolley_pose,trolley,out_contents=None,on_drop=None,in_contents=None,on_pick=None,speed=1.):
+    """Take the station trolley to a free Khu 06 slot, leave it there, collect a waiting trolley from another
+    slot and park it at the station mark. Returns the trolley now at the station."""
+    spots=AGV_SPOTS[floor];tx,ty,_,tyaw=trolley_pose
+    await agv_trip(floor,agv,(tx,ty),None,speed)
+    key=await spots.claim([k06_key(s) for s in range(len(LG.K06_SLOTS_XY))],trolley)
+    kx,ky,_,kyaw=LG.k06_slot_pose(floor,key[1])
+    await agv_trip(floor,agv,(kx,ky),None,speed,Load(trolley,kyaw,out_contents))
+    if on_drop:on_drop()
+    await _k06_put_ready(floor,key,trolley)
+    rkey,rtrolley=await _k06_take_ready(floor,trolley)
+    rx,ry,_,_=LG.k06_slot_pose(floor,rkey[1])
+    await agv_trip(floor,agv,(rx,ry),None,speed)
+    if on_pick:on_pick(rtrolley)
+    await agv_trip(floor,agv,(tx,ty),None,speed,Load(rtrolley,tyaw,in_contents))
+    spots.free(rkey)
+    await agv_trip(floor,agv,home[:2],home[2],speed)
+    return rtrolley
+
+def u1_home(floor,b):
+    bx,u1_y,_,_=LG.u1_rack_pose(floor,b);return (bx,u1_y,math.pi/2,0.)
+def u2_home(floor,u):
+    rx,ry,_,ryaw=LG.u2_rack_pose(floor,u);return (rx,ry,0.,ryaw)
+def p1_home(floor,s):
+    rx,ry,_,ryaw=LG.p1_rack_pose(floor,s);return (rx,ry,-math.pi/2 if s<7 else 0.,ryaw)
+
+def _init_agv_positions():
+    """Initial occupancy: spare racks in their Kho 04 cells; movable trolleys waiting in Khu 06."""
+    for f in LG.floors():
+        sp=AGV_SPOTS[f]
+        for STATE in (U1_STATE,U2_STATE,P1_STATE):
+            for (fl,_),st in STATE.items():
+                if fl!=f:continue
+                for item in st['spares']:sp.occupy(cell_key(item[2]),item[0])
+        for k,slot in enumerate(LG.K06_INITIAL_SLOTS):
+            name=LG.k06_trolley_name(f,k);poses[name]=LG.k06_slot_pose(f,slot)
+            sp.occupy(k06_key(slot),name);K06_READY[f].append((k06_key(slot),name))
+
+async def u1_trolley_swap_cycle(floor,branch,cartons_in_trolley):
+    """When the U1 trolley holds 5 empty cartons, the U1 AGV takes it to Khu 06 and brings a waiting trolley back."""
+    st=U1_STATE[(floor,branch)];trolley=st['active_trolley']
+    def drop():
+        send({c:poses[trolley][:2]+(-5,0) for c in cartons_in_trolley},transmit=not args.fast)
+        for c in cartons_in_trolley:FREE_CARTONS.put_nowait(c)
+        loose_event('U1_TROLLEY_DELIVERED_TO_K06',floor=floor,branch=branch,trolley=trolley)
+    st['active_trolley']=await trolley_exchange(floor,f'u1_agv_{floor}_{branch}',u1_home(floor,branch),LG.u1_trolley_pose(floor,branch),trolley,
+        out_contents=lambda tp:{c:LG.trolley_carton_pose(tp,i) for i,c in enumerate(cartons_in_trolley)},on_drop=drop,
+        speed=float(C.get('u1_agv_speed',.45)))
+    st['trolley_cartons']=[];st['trolley_swaps']+=1
+    loose_event('U1_REPLACEMENT_TROLLEY_READY',floor=floor,branch=branch,trolley=st['active_trolley'])
 
 async def u1_agv_swap_cycle(floor,branch,full_rack,meds_on_rack,store_cell,next_rack,spare_cell,old_spare_meds=()):
-    """AGV slowly carries full_rack (+ yellow medicine boxes in blue tray) along agv_paths to Kho 04, then brings next_rack to U1."""
-    agv=f'u1_agv_{floor}_{branch}'
-    bx,u1_y,z0,_=LG.u1_rack_pose(floor,branch)
-    speed=float(C.get('u1_agv_speed',0.45))
-    lift_z=.03
-    # 1. Carry loaded rack + its yellow medicine boxes from U1 station into Kho 04 empty cell
-    pts_store=LG.u1_agv_route((bx,u1_y,z0),(store_cell['x'],store_cell['y'],z0),branch)
-    len_store=LG.length(pts_store)
-    delta_store_yaw=0.-LG.along(pts_store,0)[3]
-    def at_store(q):
-        ax,ay,az,ayaw=LG.along(pts_store,q*len_store)
-        r_pose=(ax,ay,z0+lift_z,ayaw+delta_store_yaw)
-        out={agv:(ax,ay,z0,ayaw),full_rack:r_pose}
-        for m_name,m_idx,t_slot in meds_on_rack:
-            out[m_name]=LG.u1_med_on_rack(r_pose,m_idx,t_slot)
-        return out
-    await engine.move(at_store(1.),speed=speed,duration=max(.1,len_store/speed),transform=at_store,shape=blend,exact=True)
-    settled=(store_cell['x'],store_cell['y'],z0,0.)
-    send({full_rack:settled,**{m_name:(settled[0],settled[1],-5,0) for m_name,_,_ in meds_on_rack}},transmit=not args.fast)
-    loose_event('AGV_RACK_STORED',floor=floor,branch=branch,rack=full_rack,warehouse='04',cell=[round(store_cell['x'],3),round(store_cell['y'],3)])
-    # 2. Drive empty AGV to the replacement rack cell in Kho 04
-    pts_spare=LG.u1_agv_route((store_cell['x'],store_cell['y'],z0),(spare_cell['x'],spare_cell['y'],z0),branch)
-    len_spare=LG.length(pts_spare)
-    await engine.move({agv:LG.along(pts_spare,len_spare)},speed=speed,duration=max(.1,len_spare/speed),
-                      transform=lambda q:{agv:LG.along(pts_spare,q*len_spare)},shape=blend,exact=True)
-    # 3. Pick up replacement empty rack in Kho 04 and bring it out to U1 station behind the worker
+    """U1 AGV stores the full rack (+ medicine boxes) in an empty Kho 04 cell and brings the spare rack back."""
+    def stored():
+        send({m:poses[full_rack][:2]+(-5,0) for m,_,_ in meds_on_rack},transmit=not args.fast)
+        loose_event('AGV_RACK_STORED',floor=floor,branch=branch,rack=full_rack,warehouse='04',cell=[round(store_cell['x'],3),round(store_cell['y'],3)])
     loose_event('AGV_REPLACEMENT_RACK_PICKUP',floor=floor,branch=branch,rack=next_rack,from_cell=[round(spare_cell['x'],3),round(spare_cell['y'],3)])
-    pts_u1=LG.u1_agv_route((spare_cell['x'],spare_cell['y'],z0),(bx,u1_y,z0),branch)
-    len_u1=LG.length(pts_u1)
-    spare_yaw=spare_cell.get('yaw',0.)
-    delta_u1_yaw=spare_yaw-LG.along(pts_u1,0)[3]
-    def at_u1(q):
-        ax,ay,az,ayaw=LG.along(pts_u1,q*len_u1)
-        return {agv:(ax,ay,z0,ayaw),next_rack:(ax,ay,z0+lift_z,ayaw+delta_u1_yaw)}
-    await engine.move(at_u1(1.),speed=speed,duration=max(.1,len_u1/speed),transform=at_u1,shape=blend,exact=True)
-    send({agv:(bx,u1_y,z0,math.pi/2),next_rack:(bx,u1_y,z0,0.)},transmit=not args.fast)
+    await rack_swap(floor,f'u1_agv_{floor}_{branch}',u1_home(floor,branch),full_rack,
+        lambda rp:{m:LG.u1_med_on_rack(rp,mi,ts) for m,mi,ts in meds_on_rack},store_cell,next_rack,spare_cell,
+        speed=float(C.get('u1_agv_speed',.45)),on_stored=stored)
     loose_event('AGV_REPLACEMENT_RACK_READY',floor=floor,branch=branch,rack=next_rack)
 
 async def carton_trip(name,dest,branch):
@@ -1038,93 +1175,27 @@ async def u2_operator_cycle(floor,u2_idx,*args,**kwargs):
     finally:BUSY_WORKERS.discard(wid)
 
 async def u2_trolley_swap_cycle(floor,u2_idx,cartons_in_trolley):
-    """When U2 trolley reaches 5 empty cartons, U2 AGV transports the full trolley to Khu 06 and brings an empty trolley back."""
-    agv=f'u2_agv_{floor}_{u2_idx}'
-    rx,ry,z0,ryaw=LG.u2_rack_pose(floor,u2_idx)
-    tx,ty,_,tyaw=LG.u2_trolley_pose(floor,u2_idx)
-    st=U2_STATE[(floor,u2_idx)]
-    trolley=st['active_trolley']
-    k06_slot=st['k06_slot']
-    kx,ky,_,kyaw=LG.k06_slot_pose(floor,k06_slot)
-    speed=float(C.get('u2_agv_speed',C.get('u1_agv_speed',0.45)))
-    lift_z=.03
-    # 1. Move AGV from U2 rack to U2 trolley
-    pts_to_t=LG.u2_k06_route((rx,ry,z0),(tx,ty,z0),u2_idx)
-    len_to_t=LG.length(pts_to_t)
-    await engine.move({agv:LG.along(pts_to_t,len_to_t)},speed=speed,duration=max(.1,len_to_t/speed),
-                      transform=lambda q:{agv:LG.along(pts_to_t,q*len_to_t)},shape=blend,exact=True)
-    # 2. Carry full trolley (+ 5 empty cartons) to Khu 06
-    pts_k06=LG.u2_k06_route((tx,ty,z0),(kx,ky,z0),u2_idx)
-    len_k06=LG.length(pts_k06)
-    delta_yaw=tyaw-LG.along(pts_k06,0)[3]
-    def at_k06(q):
-        ax,ay,az,ayaw=LG.along(pts_k06,q*len_k06)
-        tp=(ax,ay,z0+lift_z,ayaw+delta_yaw)
-        out={agv:(ax,ay,z0,ayaw),trolley:tp}
-        for idx,c_name in enumerate(cartons_in_trolley):
-            out[c_name]=LG.trolley_carton_pose(tp,idx)
-        return out
-    await engine.move(at_k06(1.),speed=speed,duration=max(.1,len_k06/speed),transform=at_k06,shape=blend,exact=True)
-    send({trolley:(kx,ky,z0,kyaw),**{c_name:(kx,ky,-5,0) for c_name in cartons_in_trolley}},transmit=not args.fast)
-    for c_name in cartons_in_trolley:
-        FREE_Z05_CARTONS[floor].put_nowait(c_name)
-    loose_event('U2_TROLLEY_DELIVERED_TO_K06',floor=floor,u2_station=u2_idx,trolley=trolley,k06_slot=k06_slot)
-    # 3. Bring empty replacement trolley from Khu 06 back to U2 station
-    pts_back=LG.u2_k06_route((kx,ky,z0),(tx,ty,z0),u2_idx)
-    len_back=LG.length(pts_back)
-    delta_back_yaw=kyaw-LG.along(pts_back,0)[3]
-    def at_back(q):
-        ax,ay,az,ayaw=LG.along(pts_back,q*len_back)
-        return {agv:(ax,ay,z0,ayaw),trolley:(ax,ay,z0+lift_z,ayaw+delta_back_yaw)}
-    await engine.move(at_back(1.),speed=speed,duration=max(.1,len_back/speed),transform=at_back,shape=blend,exact=True)
-    send({trolley:(tx,ty,z0,tyaw)},transmit=not args.fast)
-    # 4. Return AGV to U2 rack position
-    pts_home=LG.u2_k06_route((tx,ty,z0),(rx,ry,z0),u2_idx)
-    len_home=LG.length(pts_home)
-    await engine.move({agv:LG.along(pts_home,len_home)},speed=speed,duration=max(.1,len_home/speed),
-                      transform=lambda q:{agv:LG.along(pts_home,q*len_home)},shape=blend,exact=True)
-    send({agv:(rx,ry,z0,0.)},transmit=not args.fast)
-    st['trolley_cartons']=[]
-    st['trolley_swaps']+=1
-    loose_event('U2_REPLACEMENT_TROLLEY_READY',floor=floor,u2_station=u2_idx,trolley=trolley)
+    """When the U2 trolley holds 5 empty cartons, the U2 AGV takes it to Khu 06 and brings a waiting trolley back."""
+    st=U2_STATE[(floor,u2_idx)];trolley=st['active_trolley']
+    def drop():
+        send({c:poses[trolley][:2]+(-5,0) for c in cartons_in_trolley},transmit=not args.fast)
+        for c in cartons_in_trolley:FREE_Z05_CARTONS[floor].put_nowait(c)
+        loose_event('U2_TROLLEY_DELIVERED_TO_K06',floor=floor,u2_station=u2_idx,trolley=trolley)
+    st['active_trolley']=await trolley_exchange(floor,f'u2_agv_{floor}_{u2_idx}',u2_home(floor,u2_idx),LG.u2_trolley_pose(floor,u2_idx),trolley,
+        out_contents=lambda tp:{c:LG.trolley_carton_pose(tp,i) for i,c in enumerate(cartons_in_trolley)},on_drop=drop,
+        speed=float(C.get('u2_agv_speed',C.get('u1_agv_speed',.45))))
+    st['trolley_cartons']=[];st['trolley_swaps']+=1
+    loose_event('U2_REPLACEMENT_TROLLEY_READY',floor=floor,u2_station=u2_idx,trolley=st['active_trolley'])
 
 async def u2_agv_swap_cycle(floor,u2_idx,full_rack,meds_on_rack,store_cell,next_rack,spare_cell,old_spare_meds=()):
-    """U2 AGV carries full_rack (+ yellow medicine boxes in blue tray) along agv_paths to Kho 04, then brings next_rack to U2."""
-    agv=f'u2_agv_{floor}_{u2_idx}'
-    rx,ry,z0,ryaw=LG.u2_rack_pose(floor,u2_idx)
-    speed=float(C.get('u2_agv_speed',C.get('u1_agv_speed',0.45)))
-    lift_z=.03
-    # 1. Carry loaded rack + its yellow medicine boxes from U2 station into Kho 04 empty cell
-    pts_store=LG.u2_agv_route((rx,ry,z0),(store_cell['x'],store_cell['y'],z0),u2_idx)
-    len_store=LG.length(pts_store)
-    delta_store_yaw=ryaw-LG.along(pts_store,0)[3]
-    def at_store(q):
-        ax,ay,az,ayaw=LG.along(pts_store,q*len_store)
-        r_pose=(ax,ay,z0+lift_z,ayaw+delta_store_yaw)
-        out={agv:(ax,ay,z0,ayaw),full_rack:r_pose}
-        for m_name,m_idx,t_slot in meds_on_rack:
-            out[m_name]=LG.u1_med_on_rack(r_pose,m_idx,t_slot)
-        return out
-    await engine.move(at_store(1.),speed=speed,duration=max(.1,len_store/speed),transform=at_store,shape=blend,exact=True)
-    settled=(store_cell['x'],store_cell['y'],z0,0.)
-    send({full_rack:settled,**{m_name:(settled[0],settled[1],-5,0) for m_name,_,_ in meds_on_rack}},transmit=not args.fast)
-    loose_event('U2_AGV_RACK_STORED',floor=floor,u2_station=u2_idx,rack=full_rack,warehouse='04',cell=[round(store_cell['x'],3),round(store_cell['y'],3)])
-    # 2. Drive empty AGV to the replacement rack cell in Kho 04
-    pts_spare=LG.u2_agv_route((store_cell['x'],store_cell['y'],z0),(spare_cell['x'],spare_cell['y'],z0),u2_idx)
-    len_spare=LG.length(pts_spare)
-    await engine.move({agv:LG.along(pts_spare,len_spare)},speed=speed,duration=max(.1,len_spare/speed),
-                      transform=lambda q:{agv:LG.along(pts_spare,q*len_spare)},shape=blend,exact=True)
-    # 3. Pick up replacement empty rack in Kho 04 and bring it out to U2 station behind the U2 worker
+    """U2 AGV stores the full rack (+ medicine boxes) in an empty Kho 04 cell and brings the spare rack back."""
+    def stored():
+        send({m:poses[full_rack][:2]+(-5,0) for m,_,_ in meds_on_rack},transmit=not args.fast)
+        loose_event('U2_AGV_RACK_STORED',floor=floor,u2_station=u2_idx,rack=full_rack,warehouse='04',cell=[round(store_cell['x'],3),round(store_cell['y'],3)])
     loose_event('U2_AGV_REPLACEMENT_RACK_PICKUP',floor=floor,u2_station=u2_idx,rack=next_rack,from_cell=[round(spare_cell['x'],3),round(spare_cell['y'],3)])
-    pts_u2=LG.u2_agv_route((spare_cell['x'],spare_cell['y'],z0),(rx,ry,z0),u2_idx)
-    len_u2=LG.length(pts_u2)
-    spare_yaw=spare_cell.get('yaw',0.)
-    delta_u2_yaw=spare_yaw-LG.along(pts_u2,0)[3]
-    def at_u2(q):
-        ax,ay,az,ayaw=LG.along(pts_u2,q*len_u2)
-        return {agv:(ax,ay,z0,ayaw),next_rack:(ax,ay,z0+lift_z,ayaw+delta_u2_yaw)}
-    await engine.move(at_u2(1.),speed=speed,duration=max(.1,len_u2/speed),transform=at_u2,shape=blend,exact=True)
-    send({agv:(rx,ry,z0,0.),next_rack:(rx,ry,z0,ryaw)},transmit=not args.fast)
+    await rack_swap(floor,f'u2_agv_{floor}_{u2_idx}',u2_home(floor,u2_idx),full_rack,
+        lambda rp:{m:LG.u1_med_on_rack(rp,mi,ts) for m,mi,ts in meds_on_rack},store_cell,next_rack,spare_cell,
+        speed=float(C.get('u2_agv_speed',C.get('u1_agv_speed',.45))),on_stored=stored)
     loose_event('U2_AGV_REPLACEMENT_RACK_READY',floor=floor,u2_station=u2_idx,rack=next_rack)
 
 async def u2_carton_trip(floor,u2_idx,carton,job):
@@ -1246,101 +1317,36 @@ async def p1_operator_cycle(floor,st_idx,*args,**kwargs):
     finally:BUSY_WORKERS.discard(wid)
 
 async def p1_agv_rack_swap_cycle(floor,st_idx,empty_rack,store_cell,next_rack,next_rack_idx,spare_cell):
-    """After every packed carton (3 yellow medicine box turns), P1 AGV returns the now-empty rack to Kho 04
-    and brings out a new loaded rack (carrying 3 yellow medicine boxes) from Kho 04 to st['rack']."""
-    agv=f'p1_agv_{floor}_{st_idx}'
-    rx,ry,z0,ryaw=LG.p1_rack_pose(floor,st_idx)
-    speed=float(C.get('p1_agv_speed',C.get('u1_agv_speed',0.45)))
-    lift_z=.03
+    """After every packed carton the P1 AGV stores the now-empty rack in an empty Kho 04 cell and brings the
+    loaded spare rack (3 yellow medicine boxes) to the station."""
     med_count=int(C.get('p1_med_boxes_per_carton',LG.U1_MED_PER_CARTON))
     next_meds=[f'p1_med_{floor}_{st_idx}_{m}' for m in range(med_count)]
-    # 1. Carry now-empty rack from P1 station into Kho 04 empty cell
-    pts_store=LG.p1_agv_route((rx,ry,z0),(store_cell['x'],store_cell['y'],z0),st_idx)
-    len_store=LG.length(pts_store)
-    delta_store_yaw=ryaw-LG.along(pts_store,0)[3]
-    def at_store(q):
-        ax,ay,az,ayaw=LG.along(pts_store,q*len_store)
-        return {agv:(ax,ay,z0,ayaw),empty_rack:(ax,ay,z0+lift_z,ayaw+delta_store_yaw)}
-    await engine.move(at_store(1.),speed=speed,duration=max(.1,len_store/speed),transform=at_store,shape=blend,exact=True)
-    settled_empty=(store_cell['x'],store_cell['y'],z0,store_cell.get('yaw',0.))
-    send({empty_rack:settled_empty},transmit=not args.fast)
-    loose_event('P1_AGV_EMPTY_RACK_STORED',floor=floor,p1_station=st_idx,rack=empty_rack,warehouse='04',cell=[round(store_cell['x'],3),round(store_cell['y'],3)])
-    # 2. Drive empty AGV to the loaded rack cell in Kho 04
-    pts_spare=LG.p1_agv_route((store_cell['x'],store_cell['y'],z0),(spare_cell['x'],spare_cell['y'],z0),st_idx)
-    len_spare=LG.length(pts_spare)
-    await engine.move({agv:LG.along(pts_spare,len_spare)},speed=speed,duration=max(.1,len_spare/speed),
-                      transform=lambda q:{agv:LG.along(pts_spare,q*len_spare)},shape=blend,exact=True)
-    # 3. Pick up loaded rack (+ 3 yellow medicine boxes) from Kho 04 and bring it out to P1 station
-    spare_yaw=spare_cell.get('yaw',0.)
-    spare_r_pose=(spare_cell['x'],spare_cell['y'],z0,spare_yaw)
-    send({next_meds[m]:LG.u1_med_on_rack(spare_r_pose,m,0) for m in range(med_count)},transmit=not args.fast)
-    loose_event('P1_AGV_LOADED_RACK_PICKUP',floor=floor,p1_station=st_idx,rack=next_rack,from_cell=[round(spare_cell['x'],3),round(spare_cell['y'],3)])
-    pts_p1=LG.p1_agv_route((spare_cell['x'],spare_cell['y'],z0),(rx,ry,z0),st_idx)
-    len_p1=LG.length(pts_p1)
-    delta_p1_yaw=spare_yaw-LG.along(pts_p1,0)[3]
-    def at_p1(q):
-        ax,ay,az,ayaw=LG.along(pts_p1,q*len_p1)
-        r_pose=(ax,ay,z0+lift_z,ayaw+delta_p1_yaw)
-        out={agv:(ax,ay,z0,ayaw),next_rack:r_pose}
-        for m,m_name in enumerate(next_meds):
-            out[m_name]=LG.u1_med_on_rack(r_pose,m,0)
-        return out
-    await engine.move(at_p1(1.),speed=speed,duration=max(.1,len_p1/speed),transform=at_p1,shape=blend,exact=True)
-    settled_p1=(rx,ry,z0,ryaw)
-    send({agv:(rx,ry,z0,ryaw),next_rack:settled_p1,**{next_meds[m]:LG.u1_med_on_rack(settled_p1,m,0) for m in range(med_count)}},transmit=not args.fast)
+    def stored():
+        loose_event('P1_AGV_EMPTY_RACK_STORED',floor=floor,p1_station=st_idx,rack=empty_rack,warehouse='04',cell=[round(store_cell['x'],3),round(store_cell['y'],3)])
+        # The loaded spare rack in Kho 04 carries the next 3 medicine boxes.
+        sp=(spare_cell['x'],spare_cell['y'],LG.LEVELS[floor-1],poses[next_rack][3] if len(poses[next_rack])>3 else 0.)
+        send({m:LG.u1_med_on_rack(sp,k,0) for k,m in enumerate(next_meds)},transmit=not args.fast)
+        loose_event('P1_AGV_LOADED_RACK_PICKUP',floor=floor,p1_station=st_idx,rack=next_rack,from_cell=[round(spare_cell['x'],3),round(spare_cell['y'],3)])
+    await rack_swap(floor,f'p1_agv_{floor}_{st_idx}',p1_home(floor,st_idx),empty_rack,None,store_cell,next_rack,spare_cell,
+        next_contents=lambda rp:{m:LG.u1_med_on_rack(rp,k,0) for k,m in enumerate(next_meds)},
+        speed=float(C.get('p1_agv_speed',C.get('u1_agv_speed',.45))),on_stored=stored)
     loose_event('P1_AGV_LOADED_RACK_READY',floor=floor,p1_station=st_idx,rack=next_rack)
 
 async def p1_agv_trolley_swap_cycle(floor,st_idx):
-    """When all 5 empty cartons in the P1 Trolley have been used, P1 AGV takes the empty Trolley back to Khu 06
-    and brings out a full Trolley (containing 5 empty cartons) from Khu 06 to st['mark']."""
-    agv=f'p1_agv_{floor}_{st_idx}'
-    rx,ry,z0,ryaw=LG.p1_rack_pose(floor,st_idx)
-    tx,ty,_,tyaw=LG.p1_trolley_pose(floor,st_idx)
-    st=P1_STATE[(floor,st_idx)]
-    trolley=st['active_trolley']
-    k06_slot=st['k06_slot']
-    kx,ky,_,kyaw=LG.k06_slot_pose(floor,k06_slot)
-    speed=float(C.get('p1_agv_speed',C.get('u1_agv_speed',0.45)))
-    lift_z=.03
+    """When all 5 empty cartons of the P1 trolley are used, the P1 AGV takes it to Khu 06 and brings back a
+    waiting trolley loaded with 5 empty cartons."""
+    st=P1_STATE[(floor,st_idx)];trolley=st['active_trolley']
     carton_names=[f'p1_carton_{floor}_{st_idx}_{c}' for c in range(TROLLEY_CAP)]
-    # 1. Move P1 AGV from P1 rack to P1 trolley
-    pts_to_t=LG.p1_k06_route((rx,ry,z0),(tx,ty,z0),st_idx)
-    len_to_t=LG.length(pts_to_t)
-    await engine.move({agv:LG.along(pts_to_t,len_to_t)},speed=speed,duration=max(.1,len_to_t/speed),
-                      transform=lambda q:{agv:LG.along(pts_to_t,q*len_to_t)},shape=blend,exact=True)
-    # 2. Carry empty trolley from P1 station to Khu 06
-    pts_k06=LG.p1_k06_route((tx,ty,z0),(kx,ky,z0),st_idx)
-    len_k06=LG.length(pts_k06)
-    delta_k06_yaw=tyaw-LG.along(pts_k06,0)[3]
-    def at_k06(q):
-        ax,ay,az,ayaw=LG.along(pts_k06,q*len_k06)
-        return {agv:(ax,ay,z0,ayaw),trolley:(ax,ay,z0+lift_z,ayaw+delta_k06_yaw)}
-    await engine.move(at_k06(1.),speed=speed,duration=max(.1,len_k06/speed),transform=at_k06,shape=blend,exact=True)
-    send({trolley:(kx,ky,z0,kyaw)},transmit=not args.fast)
-    loose_event('P1_EMPTY_TROLLEY_RETURNED_TO_K06',floor=floor,p1_station=st_idx,trolley=trolley,k06_slot=k06_slot)
-    # 3. Pick up full trolley (+ 5 empty cartons) from Khu 06 and bring it to P1 station
-    pts_back=LG.p1_k06_route((kx,ky,z0),(tx,ty,z0),st_idx)
-    len_back=LG.length(pts_back)
-    delta_back_yaw=kyaw-LG.along(pts_back,0)[3]
-    def at_back(q):
-        ax,ay,az,ayaw=LG.along(pts_back,q*len_back)
-        tp=(ax,ay,z0+lift_z,ayaw+delta_back_yaw)
-        out={agv:(ax,ay,z0,ayaw),trolley:tp}
-        for idx,c_name in enumerate(carton_names):
-            out[c_name]=LG.trolley_carton_pose(tp,idx)
-        return out
-    await engine.move(at_back(1.),speed=speed,duration=max(.1,len_back/speed),transform=at_back,shape=blend,exact=True)
-    settled_t=(tx,ty,z0,tyaw)
-    send({trolley:settled_t,**{c_name:LG.trolley_carton_pose(settled_t,idx) for idx,c_name in enumerate(carton_names)}},transmit=not args.fast)
-    # 4. Return P1 AGV to P1 rack position
-    pts_home=LG.p1_k06_route((tx,ty,z0),(rx,ry,z0),st_idx)
-    len_home=LG.length(pts_home)
-    await engine.move({agv:LG.along(pts_home,len_home)},speed=speed,duration=max(.1,len_home/speed),
-                      transform=lambda q:{agv:LG.along(pts_home,q*len_home)},shape=blend,exact=True)
-    send({agv:(rx,ry,z0,ryaw)},transmit=not args.fast)
+    def pick(t):   # restocked trolley in Khu 06: the 5 empty cartons appear in it before the AGV lifts it
+        tp=poses[t];send({c:LG.trolley_carton_pose(tp,i) for i,c in enumerate(carton_names)},transmit=not args.fast)
+    def drop():
+        loose_event('P1_EMPTY_TROLLEY_RETURNED_TO_K06',floor=floor,p1_station=st_idx,trolley=trolley)
+    st['active_trolley']=await trolley_exchange(floor,f'p1_agv_{floor}_{st_idx}',p1_home(floor,st_idx),LG.p1_trolley_pose(floor,st_idx),trolley,
+        on_drop=drop,in_contents=lambda tp:{c:LG.trolley_carton_pose(tp,i) for i,c in enumerate(carton_names)},on_pick=pick,
+        speed=float(C.get('p1_agv_speed',C.get('u1_agv_speed',.45))))
     st['trolley_remaining']=list(reversed(carton_names))
     st['trolley_swaps']+=1
-    loose_event('P1_FULL_TROLLEY_READY',floor=floor,p1_station=st_idx,trolley=trolley)
+    loose_event('P1_FULL_TROLLEY_READY',floor=floor,p1_station=st_idx,trolley=st['active_trolley'])
 
 async def p1_station_loop(floor,st_idx):
     """Continuous picking loop for P1 station (floor, st_idx) across both North (0..6) and West (7..13) rows."""
@@ -1419,11 +1425,11 @@ async def z05_unpack_pallet(floor,zone,spot_xy,pallet_model,job):
 OP_PHASES=(.05,.18,.04,.12,.05,.10,.04,.22,.04,.06,.04,.06)
 CARRY=(.1,1.0);PLACE=(.3,1.0);STEP=.6   # (bend, arm raise) when carrying / placing; step length (m)
 
-async def _operator_cycle(i,op,spot,carton,stack_pos):
+async def _operator_cycle(i,op,spot,carton,stack_pos,dy=0.):
     """One carton: the operator walks to the pallet, bends, picks the carton, carries it back and puts it
     on the carton belt in front of the station. Timing scales to loose_unpack_s."""
     T=C['loose_unpack_s'];d=[f*T for f in OP_PHASES]
-    sx,sy,syaw=LG.station(op);px,py,pyaw=LG.pallet_side(op,spot)
+    sx,sy,syaw=LG.station(op);px,py,pyaw=LG.pallet_side(op,spot);py+=dy
     head_out=math.atan2(py-sy,px-sx);head_back=math.atan2(sy-py,sx-px)
     belt=(op['x'],LG.Y758,LG.zc(1),syaw);reach=LG.reach_for(stack_pos[2])
     state={'x':sx,'y':sy,'yaw':syaw,'bend':0.,'arm':0.}
@@ -1590,6 +1596,7 @@ async def main():
                 cell=LG.P1_STATION_CELLS[st_idx][r_idx]
                 c_pose=(cell['x'],cell['y'],z0,cell.get('yaw',0.))
                 poses[f'p1_rack_{f}_{st_idx}_{r_idx}']=c_pose
+    _init_agv_positions()
     for i in range(2):
         for direction in ['in','out']:poses[f'{direction}_lift_{i}']=tuple(LAYOUT.data['ports'][direction][i]['lift'])+(.3,)
     use_barcode=C.get('inbound_classification')=='barcode' and bool(LOOSE_SPOTS)
@@ -1645,6 +1652,7 @@ async def main():
     dock_flow.initialize()
     p1_running=True
     p1_tasks=[asyncio.create_task(p1_station_loop(f,st_idx)) for f in LG.floors() for st_idx in range(len(LG.P1_STATIONS))]
+    if LOOSE_SPOTS:background_tasks.extend(asyncio.create_task(loose_worker(k)) for k in range(len(LG.OPERATORS)))
     if not args.fast:
         background_tasks.append(asyncio.create_task(station_workers_ambient_loop()))
         background_tasks.append(asyncio.create_task(pallet_pick_supervisor_loop()))

@@ -14,7 +14,7 @@ COLORS = {'rack': '.65 .69 .72 1', 'beam': '.18 .34 .57 1', 'floor': '.48 .51 .5
 STEEL='.45 .49 .52 1'; DARK='.10 .13 .15 1'; WHITE='.80 .83 .82 1'; TEAL='.08 .32 .35 1'
 ORANGE='.95 .28 .025 1'; BLUE='.035 .24 .68 1'; CARTON='.82 .70 .43 1'
 
-from sdf_parts import box, cylinder, strut, merge_boxes
+from sdf_parts import box, cylinder, strut, merge_boxes, HIDDEN_Z, HIDDEN_BELOW, CAMERA_FAR_CLIP
 
 EQ.BATCH_BOXES=merge_boxes
 
@@ -37,7 +37,8 @@ def chamfer(name,x,y,z,sx,sy,sz,color):
 
 def model(name, xyz, visuals):
     yaw=xyz[3] if len(xyz)>3 else 0
-    parts.append(f'<model name="{name}"><static>true</static><pose>{xyz[0]} {xyz[1]} {xyz[2]} 0 0 {yaw}</pose><link name="body">' + ''.join(visuals) + '</link></model>')
+    z=HIDDEN_Z if xyz[2]<HIDDEN_BELOW else xyz[2]   # pooled objects "hidden" at z=-5: park them beyond the camera far clip
+    parts.append(f'<model name="{name}"><static>true</static><pose>{xyz[0]} {xyz[1]} {z} 0 0 {yaw}</pose><link name="body">' + ''.join(visuals) + '</link></model>')
 
 def roller_deck(prefix,sx=1.8,sy=1.8):
     v=[]
@@ -230,8 +231,9 @@ header='''<?xml version="1.0"?><sdf version="1.9"><world name="warehouse">
 <plugin filename="gz-sim-scene-broadcaster-system" name="gz::sim::systems::SceneBroadcaster"/>
 <scene><ambient>.5 .5 .5 1</ambient><background>.72 .76 .80 1</background><shadows>false</shadows></scene>
 <light name="sun" type="directional"><pose>0 0 30 0 0 0</pose><diffuse>.9 .9 .9 1</diffuse><direction>-.3 .2 -1</direction><cast_shadows>false</cast_shadows></light>
-<gui fullscreen="false"><plugin filename="MinimalScene" name="3D View"><gz-gui><title>Warehouse V1</title><property type="bool" key="showTitleBar">false</property><property type="string" key="state">docked</property></gz-gui><engine>ogre</engine><scene>scene</scene><ambient_light>.5 .5 .5</ambient_light><background_color>.72 .76 .80</background_color><camera_pose>8 -50 45 0 .53 1.76</camera_pose></plugin><plugin filename="GzSceneManager" name="Scene Manager"/><plugin filename="CameraTracking" name="Camera Tracking"/><plugin filename="InteractiveViewControl" name="View control"/><plugin filename="EntityContextMenuPlugin" name="Entity menu"/><plugin filename="WorldControl" name="World control"/><plugin filename="WorldStats" name="World stats"/><plugin filename="Screenshot" name="Screenshot"/></gui>
+<gui fullscreen="false"><plugin filename="MinimalScene" name="3D View"><gz-gui><title>Warehouse V1</title><property type="bool" key="showTitleBar">false</property><property type="string" key="state">docked</property></gz-gui><engine>ogre</engine><scene>scene</scene><ambient_light>.5 .5 .5</ambient_light><background_color>.72 .76 .80</background_color><camera_pose>8 -50 45 0 .53 1.76</camera_pose><camera_clip><near>0.1</near><far>__FAR_CLIP__</far></camera_clip></plugin><plugin filename="GzSceneManager" name="Scene Manager"/><plugin filename="CameraTracking" name="Camera Tracking"/><plugin filename="InteractiveViewControl" name="View control"/><plugin filename="EntityContextMenuPlugin" name="Entity menu"/><plugin filename="WorldControl" name="World control"/><plugin filename="WorldStats" name="World stats"/><plugin filename="Screenshot" name="Screenshot"/></gui>
 '''
+header=header.replace('__FAR_CLIP__',str(CAMERA_FAR_CLIP))
 (ROOT/'warehouse.sdf').write_text(header+''.join(parts)+'</world></sdf>')
 print(f'Generated warehouse.sdf: {len(parts)} models')
 
