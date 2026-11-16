@@ -11,6 +11,15 @@ try {
     & wsl.exe -d $distro -u gazebo -- test -d $linuxRoot
     if ($LASTEXITCODE -ne 0) { throw 'Run 01-Setup-Windows.cmd first.' }
 
+    if ($Mode -ne 'Test') {
+        & wsl.exe -d $distro -u gazebo -- bash -c "test -f /mnt/wslg/weston.log && grep -q 'rdp_allocate_shared_memory: Failed to open' /mnt/wslg/weston.log"
+        if ($LASTEXITCODE -eq 0) {
+            Write-Host 'Resetting WSLg graphics bridge...' -ForegroundColor Yellow
+            & wsl.exe --shutdown
+            Start-Sleep -Seconds 3
+        }
+    }
+
     $focusJob = if ($Mode -ne 'Test') {
         Start-Job -ScriptBlock {
             Add-Type -TypeDefinition @"

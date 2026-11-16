@@ -144,7 +144,7 @@ def bevel_cab(cx,w):
             a,b,c=[verts[i] for i in face]; u=[b[i]-a[i] for i in range(3)];v=[c[i]-a[i] for i in range(3)]
             n=[u[1]*v[2]-u[2]*v[1],u[2]*v[0]-u[0]*v[2],u[0]*v[1]-u[1]*v[0]];l=math.sqrt(sum(q*q for q in n))
             f.write(struct.pack('<12fH',*[q/l for q in n],*a,*b,*c,0))
-    return f'<visual name="cab_shell"><geometry><mesh><uri>{path.as_posix()}</uri></mesh></geometry><material><ambient>{RED}</ambient><diffuse>{RED}</diffuse><specular>.5 .5 .5 1</specular></material></visual>'
+    return f'<visual name="cab_shell"><geometry><mesh><uri>{path.as_posix()}</uri></mesh></geometry><material><ambient>{RED}</ambient><diffuse>{RED}</diffuse><specular>0 0 0 1</specular></material><cast_shadows>false</cast_shadows></visual>'
 
 def add_scene(c,model):
     selected=selected_docks(c); truck=visuals(c)

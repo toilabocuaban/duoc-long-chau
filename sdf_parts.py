@@ -6,10 +6,10 @@ from xml.sax.saxutils import escape
 ROOT = Path(__file__).resolve().parent
 
 def box(name, x, y, z, sx, sy, sz, color, yaw=0):
-    return f'<visual name="{name}"><pose>{x} {y} {z} 0 0 {yaw}</pose><geometry><box><size>{sx} {sy} {sz}</size></box></geometry><material><ambient>{color}</ambient><diffuse>{color}</diffuse></material></visual>'
+    return f'<visual name="{name}"><pose>{x} {y} {z} 0 0 {yaw}</pose><geometry><box><size>{sx} {sy} {sz}</size></box></geometry><material><ambient>{color}</ambient><diffuse>{color}</diffuse><specular>0 0 0 1</specular></material><cast_shadows>false</cast_shadows></visual>'
 
 def cylinder(name,x,y,z,r,length,color,roll=0,pitch=0):
-    return f'<visual name="{name}"><pose>{x} {y} {z} {roll} {pitch} 0</pose><geometry><cylinder><radius>{r}</radius><length>{length}</length></cylinder></geometry><material><ambient>{color}</ambient><diffuse>{color}</diffuse><specular>.25 .25 .25 1</specular></material></visual>'
+    return f'<visual name="{name}"><pose>{x} {y} {z} {roll} {pitch} 0</pose><geometry><cylinder><radius>{r}</radius><length>{length}</length></cylinder></geometry><material><ambient>{color}</ambient><diffuse>{color}</diffuse><specular>0 0 0 1</specular></material><cast_shadows>false</cast_shadows></visual>'
 
 def strut(name,a,b,width,color):
     dx,dy,dz=[b[i]-a[i] for i in range(3)]
@@ -71,5 +71,5 @@ def merge_boxes(name,visuals):
                 n=[u[1]*v[2]-u[2]*v[1],u[2]*v[0]-u[0]*v[2],u[0]*v[1]-u[1]*v[0]]
                 norm=math.sqrt(sum(x*x for x in n)) or 1.0;n=[x/norm for x in n]
                 f.write(struct.pack('<12fH',*n,*a,*b,*c,0))
-        result.append(f'<visual name="{name}_{i}"><geometry><mesh><uri>{escape(str(path))}</uri></mesh></geometry><material><ambient>{color}</ambient><diffuse>{color}</diffuse><specular>.35 .35 .35 1</specular></material></visual>')
+        result.append(f'<visual name="{name}_{i}"><geometry><mesh><uri>{escape(str(path))}</uri></mesh></geometry><material><ambient>{color}</ambient><diffuse>{color}</diffuse><specular>0 0 0 1</specular></material><cast_shadows>false</cast_shadows></visual>')
     return result

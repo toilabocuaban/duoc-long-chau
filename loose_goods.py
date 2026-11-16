@@ -135,6 +135,15 @@ def operator_pose(i, x, y, yaw, bend=0., arm=0., swing=0., z0=0., upper_only=Fal
         out[n['legr']] = (x - lx, y - ly, hip_z, 0., -swing, yaw)
     return out
 
+def station_worker_leg_boxes(wx, wy, wyaw, z0=0.):
+    """Return box tuples (x, y, z, sx, sy, sz, color, yaw) for the two stationary legs of a table worker."""
+    lx, ly = _rot(wyaw, (0, LEG_Y))
+    hip_z = z0 + HIP
+    return [
+        (wx + lx, wy + ly, hip_z - .43, .13, .14, .86, FF.PANTS, wyaw),
+        (wx - lx, wy - ly, hip_z - .43, .13, .14, .86, FF.PANTS, wyaw),
+    ]
+
 def held_carton(x, y, yaw, bend, arm, z0=0.):
     """Carton centre carried between the hands."""
     sx = SHOULDER[0] * math.cos(bend) + SHOULDER[1] * math.sin(bend)

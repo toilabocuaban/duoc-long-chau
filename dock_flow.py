@@ -136,7 +136,7 @@ class DockFlow:
         ]
         TRANS_DUR = 1.00
         CYCLE_DUR = 5.00
-        LOOP_INTERVAL = 0.20
+        LOOP_INTERVAL = 0.40
         while True:
             try:
                 await asyncio.sleep(LOOP_INTERVAL)

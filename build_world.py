@@ -33,7 +33,7 @@ def chamfer(name,x,y,z,sx,sy,sz,color):
     for f in faces:
         lines+=['facet normal 0 0 0','outer loop']+['vertex '+' '.join(map(str,verts[k])) for k in f]+['endloop','endfacet']
     lines+=['endsolid body'];mesh.write_text('\n'.join(lines))
-    return f'<visual name="{name}"><pose>{x} {y} {z} 0 0 0</pose><geometry><mesh><uri>{escape(str(mesh))}</uri></mesh></geometry><material><ambient>{color}</ambient><diffuse>{color}</diffuse><specular>.3 .3 .3 1</specular></material></visual>'
+    return f'<visual name="{name}"><pose>{x} {y} {z} 0 0 0</pose><geometry><mesh><uri>{escape(str(mesh))}</uri></mesh></geometry><material><ambient>{color}</ambient><diffuse>{color}</diffuse><specular>0 0 0 1</specular></material><cast_shadows>false</cast_shadows></visual>'
 
 def model(name, xyz, visuals):
     yaw=xyz[3] if len(xyz)>3 else 0
@@ -120,23 +120,25 @@ if _spots:
     for i,op in enumerate(loose_goods.OPERATORS):
         for name,pose in loose_goods.operator_pose(i,*loose_goods.station(op)).items():
             model(name,(pose[0],pose[1],pose[2],pose[5]),_part_mesh[name.split('_',1)[1]])
+    _static_leg_boxes=[]
+    def _add_table_worker(wid,wx,wy,wyaw,wz):
+        for name,pose in loose_goods.operator_pose(wid,wx,wy,wyaw,z0=wz,upper_only=True).items():
+            model(name,(pose[0],pose[1],pose[2],pose[5]),_part_mesh[name.split('_',1)[1]])
+        for k,b in enumerate(loose_goods.station_worker_leg_boxes(wx,wy,wyaw,wz)):
+            _static_leg_boxes.append(box(f'sleg_{wid}_{k}',*b))
     for f in loose_goods.floors():
         for b in range(len(loose_goods.BRANCHES)):
-            wx,wy,wyaw,wz=loose_goods.u1_station(f,b)
-            for name,pose in loose_goods.operator_pose(loose_goods.u1_worker_id(f,b),wx,wy,wyaw,z0=wz).items():
-                model(name,(pose[0],pose[1],pose[2],pose[5]),_part_mesh[name.split('_',1)[1]])
+            _add_table_worker(loose_goods.u1_worker_id(f,b),*loose_goods.u1_station(f,b))
         for z_idx in range(len(loose_goods.Z05_WORKERS)):
             wx,wy,wyaw,wz=loose_goods.z05_station(f,z_idx)
             for name,pose in loose_goods.operator_pose(loose_goods.z05_worker_id(f,z_idx),wx,wy,wyaw,z0=wz).items():
                 model(name,(pose[0],pose[1],pose[2],pose[5]),_part_mesh[name.split('_',1)[1]])
         for u2_idx in range(len(loose_goods.U2_WORKERS)):
-            wx,wy,wyaw,wz=loose_goods.u2_station(f,u2_idx)
-            for name,pose in loose_goods.operator_pose(loose_goods.u2_worker_id(f,u2_idx),wx,wy,wyaw,z0=wz).items():
-                model(name,(pose[0],pose[1],pose[2],pose[5]),_part_mesh[name.split('_',1)[1]])
+            _add_table_worker(loose_goods.u2_worker_id(f,u2_idx),*loose_goods.u2_station(f,u2_idx))
         for st_idx in range(len(loose_goods.P1_STATIONS)):
-            wx,wy,wyaw,wz=loose_goods.p1_station(f,st_idx)
-            for name,pose in loose_goods.operator_pose(loose_goods.p1_worker_id(f,st_idx),wx,wy,wyaw,z0=wz).items():
-                model(name,(pose[0],pose[1],pose[2],pose[5]),_part_mesh[name.split('_',1)[1]])
+            _add_table_worker(loose_goods.p1_worker_id(f,st_idx),*loose_goods.p1_station(f,st_idx))
+    if _static_leg_boxes:
+        model('station_worker_legs',(0,0,0),merge_boxes('station_worker_legs',_static_leg_boxes))
     wx, wy, wyaw = -31.91375, -1.26, -math.pi / 2
     for name, pose in loose_goods.operator_pose(500, wx, wy, wyaw, z0=0.).items():
         model(name, (pose[0], pose[1], pose[2], pose[5]), _part_mesh[name.split('_', 1)[1]])
@@ -145,10 +147,10 @@ if _spots:
     cl,cw,ch=loose_goods.CARTON
     _carton=merge_boxes('loose_carton',[box('c',0,0,0,cl,cw,ch-.004,CARTON),box('t',0,0,ch/2-.003,.06,cw+.002,.006,'.9 .8 .57 1')])
     _med_box=merge_boxes('med_box',[box(f'mb{k}',*b) for k,b in enumerate(loose_goods.med_box_parts())])
-    _loose_pool=max(180,int(C.get('loose_pallets',0))*int(C.get('loose_cartons_per_pallet',0)))
+    _loose_pool=144
     for i in range(_loose_pool):
         model(f'carton_{i}',(_spots[0][0],_spots[0][1],-5),_carton)
-    _z05_pool=max(80,len(loose_goods.Z05_WORKERS)*int(C.get('z05_cartons_per_pallet',loose_goods.Z05_CARTONS_PER_PALLET))*2)
+    _z05_pool=48
     for f in loose_goods.floors():
         z0=loose_goods.LEVELS[f-1]
         for b in range(len(loose_goods.BRANCHES)):
@@ -228,9 +230,9 @@ header='''<?xml version="1.0"?><sdf version="1.9"><world name="warehouse">
 <plugin filename="gz-sim-physics-system" name="gz::sim::systems::Physics"/>
 <plugin filename="gz-sim-user-commands-system" name="gz::sim::systems::UserCommands"/>
 <plugin filename="gz-sim-scene-broadcaster-system" name="gz::sim::systems::SceneBroadcaster"/>
-<scene><ambient>.5 .5 .5 1</ambient><background>.72 .76 .80 1</background><shadows>false</shadows></scene>
+<scene><ambient>.55 .55 .55 1</ambient><background>.72 .76 .80 1</background><shadows>false</shadows><grid>false</grid></scene>
 <light name="sun" type="directional"><pose>0 0 30 0 0 0</pose><diffuse>.9 .9 .9 1</diffuse><direction>-.3 .2 -1</direction><cast_shadows>false</cast_shadows></light>
-<gui fullscreen="false"><plugin filename="MinimalScene" name="3D View"><gz-gui><title>Warehouse V1</title><property type="bool" key="showTitleBar">false</property><property type="string" key="state">docked</property></gz-gui><engine>ogre</engine><scene>scene</scene><ambient_light>.5 .5 .5</ambient_light><background_color>.72 .76 .80</background_color><camera_pose>8 -50 45 0 .53 1.76</camera_pose></plugin><plugin filename="GzSceneManager" name="Scene Manager"/><plugin filename="CameraTracking" name="Camera Tracking"/><plugin filename="InteractiveViewControl" name="View control"/><plugin filename="EntityContextMenuPlugin" name="Entity menu"/><plugin filename="WorldControl" name="World control"/><plugin filename="WorldStats" name="World stats"/><plugin filename="Screenshot" name="Screenshot"/></gui>
+<gui fullscreen="false"><plugin filename="MinimalScene" name="3D View"><gz-gui><title>Warehouse V1</title><property type="bool" key="showTitleBar">false</property><property type="string" key="state">docked</property></gz-gui><engine>ogre</engine><scene>scene</scene><ambient_light>.55 .55 .55</ambient_light><background_color>.72 .76 .80</background_color><camera_pose>8 -50 45 0 .53 1.76</camera_pose><camera_clip><near>0.1</near><far>150.0</far></camera_clip></plugin><plugin filename="GzSceneManager" name="Scene Manager"/><plugin filename="CameraTracking" name="Camera Tracking"/><plugin filename="InteractiveViewControl" name="View control"/><plugin filename="EntityContextMenuPlugin" name="Entity menu"/><plugin filename="WorldControl" name="World control"/><plugin filename="WorldStats" name="World stats"/><plugin filename="Screenshot" name="Screenshot"/></gui>
 '''
 (ROOT/'warehouse.sdf').write_text(header+''.join(parts)+'</world></sdf>')
 print(f'Generated warehouse.sdf: {len(parts)} models')

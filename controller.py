@@ -45,8 +45,8 @@ U2_LOCKS={(f,u2_idx):asyncio.Lock() for f in LG.floors() for u2_idx in range(len
 U2_DELIVERY_LOCKS={(f,u2_idx):asyncio.Lock() for f in LG.floors() for u2_idx in range(len(LG.U2_WORKERS))}
 P1_LOCKS={(f,st_idx):asyncio.Lock() for f in LG.floors() for st_idx in range(len(LG.P1_STATIONS))}
 P1_ROW_SEMAPHORES={(f,row):asyncio.Semaphore(4) for f in LG.floors() for row in (0,1)}
-LOOSE_CARTON_POOL=max(180,int(C.get('loose_pallets',0))*int(C.get('loose_cartons_per_pallet',0)))
-Z05_CARTON_POOL=max(80,len(LG.Z05_WORKERS)*int(C.get('z05_cartons_per_pallet',LG.Z05_CARTONS_PER_PALLET))*2)
+LOOSE_CARTON_POOL=144
+Z05_CARTON_POOL=48
 FREE_CARTONS=asyncio.Queue()
 FREE_Z05_CARTONS={f:asyncio.Queue() for f in LG.floors()}
 p1_running=False
@@ -161,9 +161,9 @@ args=parser.parse_args()
 def _pose_changed(old,new):
     if old is None or len(old)!=len(new):return True
     for k in range(min(3,len(old))):
-        if abs(old[k]-new[k])>1e-3:return True
-    for k in range(3,len(old)):
         if abs(old[k]-new[k])>2e-3:return True
+    for k in range(3,len(old)):
+        if abs(old[k]-new[k])>4e-3:return True
     return False
 
 def _flush_tx(batch):
@@ -220,16 +220,22 @@ def send(changes,transmit=True,immediate=False):
     else:
         last_tx_poses.update({n:tuple(v) for n,v in changes.items()})
 
+_LAST_STATUS_WRITE=0.
+
 def _write_event(record):
     global _EVENTS_FP
     if _EVENTS_FP is None or _EVENTS_FP.closed:
-        _EVENTS_FP=(ROOT/'events.jsonl').open('a',buffering=1)
+        _EVENTS_FP=(ROOT/'events.jsonl').open('a',buffering=65536)
     _EVENTS_FP.write(json.dumps(record)+'\n')
 
 def event(job,state,**extra):
+    global _LAST_STATUS_WRITE
     record={'job':job,'state':state,'demo_time_s':round(scheduler.time,5),**extra}
     events.append(record)
-    (ROOT/'status.json').write_text(json.dumps(record,indent=2))
+    now=time.perf_counter()
+    if state in ('COMPLETE','ERROR') or now-_LAST_STATUS_WRITE>=1.0:
+        (ROOT/'status.json').write_text(json.dumps(record,indent=2))
+        _LAST_STATUS_WRITE=now
     _write_event(record)
     print(f'Pallet {job+1:02d}: {state}',flush=True)
 
@@ -279,11 +285,12 @@ class Engine:
                     a,b=[changes[f'agv_{i}'] for i in range(2)]
                     da=[changes[f'agv_{i}'][0]-poses[f'agv_{i}'][0] for i in range(2)]
                     if abs(a[1]-b[1])<.1 and da[0]*da[1]>1e-10:self.following_ticks+=1
-                prospective={**poses,**changes}
-                for i in range(2):
-                    if f'agv_{i}' in changes:
-                        global route_checks
-                        payload=agv_load[i];check_pose(i,changes[f'agv_{i}'],prospective,payload,pickups[i]);route_checks+=1
+                if 'agv_0' in changes or 'agv_1' in changes:
+                    prospective={**poses,**changes}
+                    for i in range(2):
+                        if f'agv_{i}' in changes:
+                            global route_checks
+                            payload=agv_load[i];check_pose(i,changes[f'agv_{i}'],prospective,payload,pickups[i]);route_checks+=1
                 if all(f'agv_{i}' in changes for i in range(2)):self.dual_agv_ticks+=1
                 if sum(n.startswith('shuttle_') and n[8:].isdigit() for n in changes)>1:self.multi_shuttle_ticks+=1
                 if changes:send(changes,transmit=not args.fast)
@@ -305,7 +312,7 @@ class Engine:
         finally:
             in_engine_loop=False
     async def until(self,when):
-        while scheduler.time+1e-6<when:await asyncio.sleep(0 if args.fast else .005)
+        while scheduler.time+1e-6<when:await asyncio.sleep(0 if args.fast else .02)
 
 background_tasks=[]
 engine=Engine();agv_load=[None,None];pickups=[None,None]
@@ -571,7 +578,7 @@ async def station_workers_ambient_loop():
     ]
     TRANS_DUR = 1.00
     CYCLE_DUR = 5.00
-    LOOP_INTERVAL = 0.20
+    LOOP_INTERVAL = 0.40
     try:
         while engine.running:
             t = scheduler.time
@@ -654,18 +661,16 @@ async def _u1_operator_cycle(floor,branch,carton,rack_pose,rack_idx,trolley_slot
     c_pose=poses[carton]
     state={'x':sx,'y':sy,'yaw':syaw,'bend':0.,'arm':0.}
     async def phase(dur,x=None,y=None,yaw=None,bend=None,arm=None,carry_item=None,item_to=None,walk=False):
-        a=dict(state);b={'x':a['x'] if x is None else x,'y':a['y'] if y is None else y,
+        a=dict(state);b={'x':sx,'y':sy,
              'yaw':a['yaw'] if yaw is None else a['yaw']+math.atan2(math.sin(yaw-a['yaw']),math.cos(yaw-a['yaw'])),
              'bend':a['bend'] if bend is None else bend,'arm':a['arm'] if arm is None else arm}
-        steps=max(1,round(math.hypot(b['x']-a['x'],b['y']-a['y'])/STEP)) if walk else 0
-        upper_only=not walk
         item_name=carry_item or (item_to[0] if item_to else None)
         i0=poses[item_name] if item_name else None
         def at(q):
             k={key:a[key]+(b[key]-a[key])*q for key in a}
-            out=LG.operator_pose(wid,k['x'],k['y'],k['yaw'],k['bend'],k['arm'],.30*math.sin(math.pi*steps*q) if walk else 0.,z0=z0,upper_only=upper_only)
+            out=LG.operator_pose(wid,sx,sy,k['yaw'],k['bend'],k['arm'],0.,z0=z0,upper_only=True)
             if carry_item:
-                out[carry_item]=LG.held_carton(k['x'],k['y'],k['yaw'],k['bend'],k['arm'],z0=z0)
+                out[carry_item]=LG.held_carton(sx,sy,k['yaw'],k['bend'],k['arm'],z0=z0)
             elif item_to is not None:
                 t_name,t_pose=item_to
                 arc_z=0.06*math.sin(math.pi*q) if ('med' in t_name or 'carton' in t_name) else 0.
@@ -673,7 +678,7 @@ async def _u1_operator_cycle(floor,branch,carton,rack_pose,rack_idx,trolley_slot
                 out[t_name]=(i0[0]+(t_pose[0]-i0[0])*q,i0[1]+(t_pose[1]-i0[1])*q,cz,i0[3]+(t_pose[3]-i0[3])*q)
             return out
         end=at(1.)
-        await engine.move(end,duration=max(.04,dur),transform=at,shape=(lambda t:t) if walk else blend,exact=True)
+        await engine.move(end,duration=max(.04,dur),transform=at,shape=blend,exact=True)
         state.update(b)
     # 1. Step to conveyor end and open the carton, revealing the yellow medicine boxes inside
     await phase(open_s*.45,y=pick_y,bend=pick_bend,arm=pick_arm,walk=True)
@@ -685,7 +690,7 @@ async def _u1_operator_cycle(floor,branch,carton,rack_pose,rack_idx,trolley_slot
         target_on_rack=LG.u1_med_on_rack(rack_pose,m,tray_slot)
         place_yaw=math.atan2(target_on_rack[1]-sy,target_on_rack[0]-sx)
         await phase(d[0],y=pick_y,yaw=syaw,bend=pick_bend,arm=pick_arm,walk=True)
-        grab=LG.held_carton(sx,pick_y,syaw,pick_bend,pick_arm,z0=z0)
+        grab=LG.held_carton(sx,sy,syaw,pick_bend,pick_arm,z0=z0)
         await phase(d[1],item_to=(m_name,grab))
         await phase(d[2],y=sy,bend=CARRY[0],arm=CARRY[1],carry_item=m_name,walk=True)
         await phase(d[3],yaw=place_yaw,carry_item=m_name)
@@ -700,7 +705,7 @@ async def _u1_operator_cycle(floor,branch,carton,rack_pose,rack_idx,trolley_slot
     target_in_trolley=LG.trolley_carton_pose(t_pose,trolley_slot)
     t_yaw=math.atan2(target_in_trolley[1]-sy,target_in_trolley[0]-sx)
     await phase(d[0],y=pick_y,yaw=syaw,bend=pick_bend,arm=pick_arm,walk=True)
-    grab_c=LG.held_carton(sx,pick_y,syaw,pick_bend,pick_arm,z0=z0)
+    grab_c=LG.held_carton(sx,sy,syaw,pick_bend,pick_arm,z0=z0)
     await phase(d[1],item_to=(carton,grab_c))
     await phase(d[2],y=sy,bend=CARRY[0],arm=CARRY[1],carry_item=carton,walk=True)
     await phase(d[3],yaw=t_yaw,carry_item=carton)
@@ -974,18 +979,16 @@ async def _u2_operator_cycle(floor,u2_idx,carton,rack_pose,rack_idx,trolley_slot
     c_pose=poses[carton]
     state={'x':sx,'y':sy,'yaw':syaw,'bend':0.,'arm':0.}
     async def phase(dur,x=None,y=None,yaw=None,bend=None,arm=None,carry_item=None,item_to=None,walk=False):
-        a=dict(state);b={'x':a['x'] if x is None else x,'y':a['y'] if y is None else y,
+        a=dict(state);b={'x':sx,'y':sy,
              'yaw':a['yaw'] if yaw is None else a['yaw']+math.atan2(math.sin(yaw-a['yaw']),math.cos(yaw-a['yaw'])),
              'bend':a['bend'] if bend is None else bend,'arm':a['arm'] if arm is None else arm}
-        steps=max(1,round(math.hypot(b['x']-a['x'],b['y']-a['y'])/STEP)) if walk else 0
-        upper_only=not walk
         item_name=carry_item or (item_to[0] if item_to else None)
         i0=poses[item_name] if item_name else None
         def at(q):
             k={key:a[key]+(b[key]-a[key])*q for key in a}
-            out=LG.operator_pose(wid,k['x'],k['y'],k['yaw'],k['bend'],k['arm'],.30*math.sin(math.pi*steps*q) if walk else 0.,z0=z0,upper_only=upper_only)
+            out=LG.operator_pose(wid,sx,sy,k['yaw'],k['bend'],k['arm'],0.,z0=z0,upper_only=True)
             if carry_item:
-                out[carry_item]=LG.held_carton(k['x'],k['y'],k['yaw'],k['bend'],k['arm'],z0=z0)
+                out[carry_item]=LG.held_carton(sx,sy,k['yaw'],k['bend'],k['arm'],z0=z0)
             elif item_to is not None:
                 t_name,t_pose=item_to
                 arc_z=0.06*math.sin(math.pi*q) if ('med' in t_name or 'carton' in t_name) else 0.
@@ -993,7 +996,7 @@ async def _u2_operator_cycle(floor,u2_idx,carton,rack_pose,rack_idx,trolley_slot
                 out[t_name]=(i0[0]+(t_pose[0]-i0[0])*q,i0[1]+(t_pose[1]-i0[1])*q,cz,i0[3]+(t_pose[3]-i0[3])*q)
             return out
         end=at(1.)
-        await engine.move(end,duration=max(.04,dur),transform=at,shape=(lambda t:t) if walk else blend,exact=True)
+        await engine.move(end,duration=max(.04,dur),transform=at,shape=blend,exact=True)
         state.update(b)
     # 1. Step to carton on the ground and bend down to open it, revealing 3 yellow medicine boxes inside
     await phase(open_s*.45,x=pick_x,bend=pick_bend,arm=pick_arm,walk=True)
@@ -1005,7 +1008,7 @@ async def _u2_operator_cycle(floor,u2_idx,carton,rack_pose,rack_idx,trolley_slot
         target_on_rack=LG.u1_med_on_rack(rack_pose,m,tray_slot)
         place_yaw=math.atan2(target_on_rack[1]-sy,target_on_rack[0]-sx)
         await phase(d[0],x=pick_x,y=sy,yaw=syaw,bend=pick_bend,arm=pick_arm,walk=True)
-        grab=LG.held_carton(pick_x,sy,syaw,pick_bend,pick_arm,z0=z0)
+        grab=LG.held_carton(sx,sy,syaw,pick_bend,pick_arm,z0=z0)
         await phase(d[1],item_to=(m_name,grab))
         await phase(d[2],x=sx,y=sy,bend=CARRY[0],arm=CARRY[1],carry_item=m_name,walk=True)
         await phase(d[3],yaw=place_yaw,carry_item=m_name)
@@ -1020,7 +1023,7 @@ async def _u2_operator_cycle(floor,u2_idx,carton,rack_pose,rack_idx,trolley_slot
     target_in_trolley=LG.trolley_carton_pose(t_pose,trolley_slot)
     t_yaw=math.atan2(target_in_trolley[1]-sy,target_in_trolley[0]-sx)
     await phase(d[0],x=pick_x,y=sy,yaw=syaw,bend=pick_bend,arm=pick_arm,walk=True)
-    grab_c=LG.held_carton(pick_x,sy,syaw,pick_bend,pick_arm,z0=z0)
+    grab_c=LG.held_carton(sx,sy,syaw,pick_bend,pick_arm,z0=z0)
     await phase(d[1],item_to=(carton,grab_c))
     await phase(d[2],x=sx,y=sy,bend=CARRY[0],arm=CARRY[1],carry_item=carton,walk=True)
     await phase(d[3],yaw=t_yaw,carry_item=carton)
@@ -1178,18 +1181,16 @@ async def _p1_operator_cycle(floor,st_idx,carton,rack_idx):
     med_names=[f'p1_med_{floor}_{st_idx}_{m}' for m in range(med_count)]
     state={'x':sx,'y':sy,'yaw':syaw,'bend':0.,'arm':0.}
     async def phase(dur,x=None,y=None,yaw=None,bend=None,arm=None,carry_item=None,item_to=None,walk=False):
-        a=dict(state);b={'x':a['x'] if x is None else x,'y':a['y'] if y is None else y,
+        a=dict(state);b={'x':sx,'y':sy,
              'yaw':a['yaw'] if yaw is None else a['yaw']+math.atan2(math.sin(yaw-a['yaw']),math.cos(yaw-a['yaw'])),
              'bend':a['bend'] if bend is None else bend,'arm':a['arm'] if arm is None else arm}
-        steps=max(1,round(math.hypot(b['x']-a['x'],b['y']-a['y'])/STEP)) if walk else 0
-        upper_only=not walk
         item_name=carry_item or (item_to[0] if item_to else None)
         i0=poses[item_name] if item_name else None
         def at(q):
             k={key:a[key]+(b[key]-a[key])*q for key in a}
-            out=LG.operator_pose(wid,k['x'],k['y'],k['yaw'],k['bend'],k['arm'],.30*math.sin(math.pi*steps*q) if walk else 0.,z0=z0,upper_only=upper_only)
+            out=LG.operator_pose(wid,sx,sy,k['yaw'],k['bend'],k['arm'],0.,z0=z0,upper_only=True)
             if carry_item:
-                out[carry_item]=LG.held_carton(k['x'],k['y'],k['yaw'],k['bend'],k['arm'],z0=z0)
+                out[carry_item]=LG.held_carton(sx,sy,k['yaw'],k['bend'],k['arm'],z0=z0)
                 if carry_item==carton:
                     for m,m_name in enumerate(med_names):
                         out[m_name]=LG.p1_med_in_carton(out[carton],m)
@@ -1203,7 +1204,7 @@ async def _p1_operator_cycle(floor,st_idx,carton,rack_idx):
                         out[m_name]=LG.p1_med_in_carton(out[carton],m)
             return out
         end=at(1.)
-        await engine.move(end,duration=max(.04,dur),transform=at,shape=(lambda t:t) if walk else blend,exact=True)
+        await engine.move(end,duration=max(.04,dur),transform=at,shape=blend,exact=True)
         state.update(b)
     # 1. Pick 1 empty carton from the P1 Trolley and place it on the working edge of the desk
     trolley_yaw=math.atan2(ty-sy,tx-sx)
@@ -1231,12 +1232,10 @@ async def _p1_operator_cycle(floor,st_idx,carton,rack_idx):
     await phase(d[0],yaw=desk_yaw,bend=.25,arm=.85)
     grab_packed=LG.held_carton(sx,sy,desk_yaw,.25,.85,z0=z0)
     await phase(d[1],item_to=(carton,grab_packed))
-    lean_x=sx-.25 if st_idx<7 else sx
-    lean_y=sy if st_idx<7 else sy+.25
-    await phase(d[2],x=lean_x,y=lean_y,yaw=aside_yaw,bend=.36,arm=1.10,carry_item=carton,walk=True)
+    await phase(d[2],yaw=aside_yaw,bend=.48,arm=1.22,carry_item=carton)
     await phase(d[3],item_to=(carton,aside_c_pose))
     loose_event('P1_PACKED_CARTON_COMPLETED',floor=floor,p1_station=st_idx,carton=carton)
-    await phase(d[4],x=sx,y=sy,yaw=syaw,bend=0.,arm=0.,walk=True)
+    await phase(d[4],yaw=syaw,bend=0.,arm=0.)
     st['aside_carton']=(carton,list(med_names))
 
 async def p1_operator_cycle(floor,st_idx,*args,**kwargs):
@@ -1626,16 +1625,16 @@ async def main():
         for f in LG.floors():
             for b in range(len(LG.BRANCHES)):
                 wx,wy,wyaw,wz=LG.u1_station(f,b)
-                anim_ops.update(LG.operator_pose(LG.u1_worker_id(f,b),wx,wy,wyaw,z0=wz))
+                anim_ops.update(LG.operator_pose(LG.u1_worker_id(f,b),wx,wy,wyaw,z0=wz,upper_only=True))
             for z_idx in range(len(LG.Z05_WORKERS)):
                 wx,wy,wyaw,wz=LG.z05_station(f,z_idx)
                 anim_ops.update(LG.operator_pose(LG.z05_worker_id(f,z_idx),wx,wy,wyaw,z0=wz))
             for u2_idx in range(len(LG.U2_WORKERS)):
                 wx,wy,wyaw,wz=LG.u2_station(f,u2_idx)
-                anim_ops.update(LG.operator_pose(LG.u2_worker_id(f,u2_idx),wx,wy,wyaw,z0=wz))
+                anim_ops.update(LG.operator_pose(LG.u2_worker_id(f,u2_idx),wx,wy,wyaw,z0=wz,upper_only=True))
             for st_idx in range(len(LG.P1_STATIONS)):
                 wx,wy,wyaw,wz=LG.p1_station(f,st_idx)
-                anim_ops.update(LG.operator_pose(LG.p1_worker_id(f,st_idx),wx,wy,wyaw,z0=wz))
+                anim_ops.update(LG.operator_pose(LG.p1_worker_id(f,st_idx),wx,wy,wyaw,z0=wz,upper_only=True))
         anim_ops.update(LG.operator_pose(500,-31.91375,-1.26,-math.pi/2,z0=0.))
         send(anim_ops,transmit=False)
     for i in range(C.get('initial_outbound_pallets',0)):
@@ -1677,6 +1676,8 @@ async def main():
             'mode':'Concurrent CAD constrained kinematic','demo_duration_s':scheduler.time}
     (ROOT/'validation.json').write_text(json.dumps(report,indent=2))
     (ROOT/'cad-route-log.json').write_text(json.dumps(shuttle_route_log))
+    if _EVENTS_FP is not None and not _EVENTS_FP.closed:
+        _EVENTS_FP.flush();_EVENTS_FP.close()
     print(json.dumps(report),flush=True)
 
 if __name__=='__main__':
