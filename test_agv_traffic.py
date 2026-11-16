@@ -24,3 +24,12 @@ class TrafficChecks(unittest.TestCase):
         turning=Plan((-33,-7,0,math.pi),(-33,-7,0,math.pi/2),0,7)
         parked=Plan((-38,-5,0,0),(-38,-5,0,0),0,.05)
         self.assertTrue(compatible(turning,parked,0))
+
+    def test_departing_agv_does_not_graze_returning_agv_between_ticks(self):
+        import math
+        from motion_profile import SCurve
+        p1=SCurve(44.30108,1.8,0.5,1.0)
+        p2=SCurve(1.9,1.8,0.5,1.0)
+        returning=Plan((20.30108,-6.4,0,math.pi),(-24,-6.4,0,math.pi),603.433333,p1.duration,False,p1.shape)
+        departing=Plan((-19.0,-4.5,0,math.pi/2),(-19,-6.4,0,math.pi/2),627.2,p2.duration,False,p2.shape)
+        self.assertFalse(compatible(departing,returning,627.2,1.0))

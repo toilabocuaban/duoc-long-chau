@@ -16,16 +16,17 @@ fi
 gz sim -r --render-engine ogre warehouse.sdf > gazebo.log 2>&1 &
 sim_pid=$!
 ctl_pid=''
-trap 'kill "$sim_pid" ${ctl_pid:+"$ctl_pid"} 2>/dev/null || true; pkill -9 -f "gz sim" 2>/dev/null || true' EXIT
+trap 'if [[ -n "$ctl_pid" ]] && kill -0 "$ctl_pid" 2>/dev/null; then kill -TERM "$ctl_pid" 2>/dev/null || true; for _ in 1 2 3 4 5; do kill -0 "$ctl_pid" 2>/dev/null || break; sleep 0.5; done; fi; kill "$sim_pid" ${ctl_pid:+"$ctl_pid"} 2>/dev/null || true; pkill -9 -f "gz sim" 2>/dev/null || true' EXIT
 python3 wait_gui.py
 python3 controller.py > >(tee controller.log) 2>&1 &
 ctl_pid=$!
 # Closing the Gazebo window must also end this session's controller; otherwise it keeps running and
 # attaches to the next window opened on the same partition (two controllers driving one world).
 while kill -0 "$sim_pid" 2>/dev/null && kill -0 "$ctl_pid" 2>/dev/null; do sleep 1; done
-if ! kill -0 "$sim_pid" 2>/dev/null; then
-    kill "$ctl_pid" 2>/dev/null || true
-    echo 'Gazebo window closed: controller stopped.'
+if ! kill -0 "$sim_pid" 2>/dev/null && kill -0 "$ctl_pid" 2>/dev/null; then
+    echo 'Gazebo window closed: stopping controller and saving Excel report...'
+    kill -TERM "$ctl_pid" 2>/dev/null || true
 fi
 wait "$ctl_pid" 2>/dev/null || true
 wait "$sim_pid" 2>/dev/null || true
+echo 'Excel report saved in reports/Bao_Cao_Moi_Nhat.xlsx'

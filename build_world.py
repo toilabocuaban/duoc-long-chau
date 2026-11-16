@@ -146,15 +146,17 @@ if _spots:
     cl,cw,ch=loose_goods.CARTON
     _carton=merge_boxes('loose_carton',[box('c',0,0,0,cl,cw,ch-.004,CARTON),box('t',0,0,ch/2-.003,.06,cw+.002,.006,'.9 .8 .57 1')])
     _med_box=merge_boxes('med_box',[box(f'mb{k}',*b) for k,b in enumerate(loose_goods.med_box_parts())])
-    _loose_pool=max(180,int(C.get('loose_pallets',0))*int(C.get('loose_cartons_per_pallet',0)))
+    _loose_pool=max(180,int(C.get('loose_carton_pool',0)),int(C.get('loose_pallets',0))*int(C.get('loose_cartons_per_pallet',0)))
     for i in range(_loose_pool):
         model(f'carton_{i}',(_spots[0][0],_spots[0][1],-5),_carton)
-    _z05_pool=max(80,len(loose_goods.Z05_WORKERS)*int(C.get('z05_cartons_per_pallet',loose_goods.Z05_CARTONS_PER_PALLET))*2)
+    _z05_pool=max(80,int(C.get('z05_carton_pool',0)),len(loose_goods.Z05_WORKERS)*int(C.get('z05_cartons_per_pallet',loose_goods.Z05_CARTONS_PER_PALLET))*2)
+    _u1_med_total=max(1,int(C.get('u1_cartons_per_rack',1)))*int(C.get('u1_med_boxes_per_carton',loose_goods.U1_MED_PER_CARTON))
+    _u2_med_total=max(1,int(C.get('u2_cartons_per_rack',1)))*int(C.get('u2_med_boxes_per_carton',loose_goods.U1_MED_PER_CARTON))
     for f in loose_goods.floors():
         z0=loose_goods.LEVELS[f-1]
         for b in range(len(loose_goods.BRANCHES)):
             rx,ry,_,_=loose_goods.u1_rack_pose(f,b)
-            for m in range(loose_goods.U1_MED_PER_CARTON):
+            for m in range(_u1_med_total):
                 model(f'u1_med_{f}_{b}_{m}',(rx,ry,-5,0),_med_box)
         for z_idx in range(len(loose_goods.Z05_WORKERS)):
             wx,wy,_,_=loose_goods.z05_station(f,z_idx)
@@ -164,7 +166,7 @@ if _spots:
             model(f'z05_carton_{f}_{c_idx}',(w0x,w0y,-5,0),_carton)
         for u2_idx in range(len(loose_goods.U2_WORKERS)):
             rx,ry,_,_=loose_goods.u2_rack_pose(f,u2_idx)
-            for m in range(loose_goods.U1_MED_PER_CARTON):
+            for m in range(_u2_med_total):
                 model(f'u2_med_{f}_{u2_idx}_{m}',(rx,ry,-5,0),_med_box)
         for st_idx in range(len(loose_goods.P1_STATIONS)):
             r0_pose=loose_goods.p1_rack_pose(f,st_idx)
@@ -223,6 +225,8 @@ for i in range(C['jobs']):
 for i in range(C.get('initial_outbound_pallets',0)):
     xy=LAYOUT.slot_point(LAYOUT.job_slots[i%len(LAYOUT.job_slots)])
     pallet(f'pallet_out_{i}',xy+(C['storage_levels'][(i+4)%9],0))
+for i in range(max(0,int(C.get('continuous_extra_pallets',0)))):
+    pallet(f'pallet_pool_{i}',(pickup_position(i)[0],-17,-5,pickup_position(i)[3]))
 
 header='''<?xml version="1.0"?><sdf version="1.9"><world name="warehouse">
 <physics name="physics" type="ignored"><max_step_size>0.05</max_step_size><real_time_factor>1</real_time_factor></physics>

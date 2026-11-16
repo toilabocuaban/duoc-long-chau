@@ -110,6 +110,20 @@ class Network:
             k = min(self.pos, key=lambda m: math.dist(self.pos[m], (x, y)))
         return k
 
+    @staticmethod
+    def _trunk_penalty(xu, yu, xv, yv):
+        """Gentle right-hand bias on paired 1.52 m vertical trunks (> CLEAR) so North/South flows don't clash."""
+        dy = yv - yu
+        if abs(dx := abs(xv - xu)) > 0.02 or abs(dy) < 1e-4:
+            return 0.0
+        # East track of pair prefers Northbound (dy > 0); West track prefers Southbound (dy < 0)
+        for xe, xw in ((-10.067, -11.585), (-26.627, -28.145), (-44.188, -45.706)):
+            if abs(xu - xe) < 0.02 and dy < 0:
+                return 1.2 * abs(dy)
+            if abs(xu - xw) < 0.02 and dy > 0:
+                return 1.2 * abs(dy)
+        return 0.0
+
     def route(self, a, b):
         """Node keys from a to b, shortest length with a penalty per change of direction."""
         if (a, b) in self._cache: return self._cache[(a, b)]
@@ -121,9 +135,16 @@ class Network:
             if d > dist.get(state, 1e18): continue
             u, h = state
             if u == b: end = state; break
+            xu, yu = self.pos[u]
             for v in self.adj[u]:
                 hv = heading(u, v)
-                nd = d + math.dist(self.pos[u], self.pos[v]) + (TURN_COST if h is not None and abs(math.remainder(hv - h, 2 * math.pi)) > .05 else 0.)
+                xv, yv = self.pos[v]
+                nd = (
+                    d
+                    + math.dist((xu, yu), (xv, yv))
+                    + self._trunk_penalty(xu, yu, xv, yv)
+                    + (TURN_COST if h is not None and abs(math.remainder(hv - h, 2 * math.pi)) > .05 else 0.)
+                )
                 ns = (v, hv)
                 if nd < dist.get(ns, 1e18):
                     dist[ns] = nd; prev[ns] = state; n += 1; heapq.heappush(pq, (nd, n, ns))
@@ -159,9 +180,10 @@ class Network:
         return out_p, out_k
 
 class Traffic:
-    """Atomic node reservation with progressive release; FIFO among conflicting requests."""
+    """Atomic node reservation & time-space windowed scheduling; FIFO among conflicting requests."""
     def __init__(self, net):
         self.net = net; self.held = {}; self.waiting = []; self.cond = None
+        self.timed = {}; self.timed_owners = {}; self._sched_lock = None
         self.max_wait = 0.0; self.grants = 0
 
     def _blocked(self, nodes, owner):
@@ -201,6 +223,71 @@ class Traffic:
                 del self.held[n]; changed = True
         if changed and self.cond is not None:
             asyncio.get_running_loop().create_task(self._notify())
+
+    def release_timed(self, owner):
+        nodes = self.timed_owners.pop(owner, None)
+        if not nodes:
+            return
+        for n in nodes:
+            entries = self.timed.get(n)
+            if not entries:
+                continue
+            kept = [item for item in entries if item[0] != owner]
+            if kept:
+                self.timed[n] = kept
+            else:
+                del self.timed[n]
+
+    async def acquire_timed(self, owner, windows, clock_fn, wait_until_fn, stop_fn=None):
+        """Schedule & reserve non-overlapping (node, [t_dep+rs, t_dep+re]) windows for `owner`."""
+        valid = [(n, max(0.0, float(rs)), max(float(rs), float(re))) for n, rs, re in windows if n is not None]
+        if not valid:
+            return clock_fn()
+        if self._sched_lock is None:
+            self._sched_lock = asyncio.Lock()
+        async with self._sched_lock:
+            now = float(clock_fn())
+            # Prune stale intervals on touched conflict neighbourhoods
+            cutoff = now - 0.1
+            touched = set()
+            for n, _, _ in valid:
+                touched.update(self.net.conflict[n])
+            for m in touched:
+                entries = self.timed.get(m)
+                if entries:
+                    kept = [it for it in entries if it[2] > cutoff and it[0] != owner]
+                    if kept:
+                        self.timed[m] = kept
+                    else:
+                        del self.timed[m]
+            self.release_timed(owner)
+            t_dep = now
+            for _ in range(1000):
+                next_t = None
+                for n, rs, re in valid:
+                    s_req = t_dep + rs
+                    e_req = t_dep + re
+                    for m in self.net.conflict[n]:
+                        for other, os_t, oe_t in self.timed.get(m, ()):
+                            if other != owner and s_req < oe_t and os_t < e_req:
+                                cand = oe_t - rs + 0.01
+                                if next_t is None or cand > next_t:
+                                    next_t = cand
+                if next_t is None:
+                    break
+                t_dep = next_t
+            booked = set()
+            for n, rs, re in valid:
+                self.timed.setdefault(n, []).append((owner, t_dep + rs, t_dep + re))
+                booked.add(n)
+            self.timed_owners[owner] = booked
+            self.grants += 1
+        if t_dep > now:
+            await wait_until_fn(t_dep)
+            if stop_fn is not None and stop_fn():
+                self.release_timed(owner)
+                return float(clock_fn())
+        return float(clock_fn())
 
     async def _notify(self):
         async with self.cond: self.cond.notify_all()

@@ -9,18 +9,24 @@ from sdf_parts import box, merge_boxes
 
 class FloorGate:
     """AGVs may run together; manual pallet crossings exclude moving AGVs.
-    Multiple dock workers can transfer concurrently in the manual corridor."""
-    def __init__(self):
+    Up to two manual dock transfers with non-overlapping corridors can cross when no AGV is waiting."""
+    def __init__(self,max_manual=2):
         self.condition=asyncio.Condition()
         self.agvs=0
         self.agv_waiting=0
         self.crossings=0
         self.waiting=0
         self.last_turn='agv'
+        self.max_manual=max_manual
+        self.active_spans=[]
 
     @property
     def crossing(self):
         return self.crossings > 0
+
+    def _span_clear(self,span):
+        if span is None:return True
+        return all(span[1]<a[0] or span[0]>a[1] for a in self.active_spans)
 
     @asynccontextmanager
     async def agv(self):
@@ -41,23 +47,26 @@ class FloorGate:
                 self.condition.notify_all()
 
     @asynccontextmanager
-    async def manual(self):
+    async def manual(self,span=None):
         async with self.condition:
             self.waiting+=1
             try:
-                # If workers are already crossing (crossings > 0), additional workers can join immediately as long as no AGV is moving.
-                # If no workers are crossing, wait until AGVs finish and fair turn allows.
                 await self.condition.wait_for(
-                    lambda: self.agvs==0 and (self.crossings > 0 or not self.agv_waiting or self.last_turn=='agv')
+                    lambda: self.agvs==0
+                    and (self.crossings==0 or (self.crossings<self.max_manual and not self.agv_waiting))
+                    and self._span_clear(span)
                 )
                 self.crossings+=1
                 self.last_turn='manual'
+                if span is not None:self.active_spans.append(span)
             finally:
                 self.waiting-=1
         try:yield
         finally:
             async with self.condition:
                 self.crossings-=1
+                if span is not None and span in self.active_spans:
+                    self.active_spans.remove(span)
                 self.condition.notify_all()
 
 def dock_list(c):return TS.selected_docks({**c,'truck_count_visible':c.get('dock_active_count',4)})
@@ -416,93 +425,120 @@ class DockFlow:
         finally:
             if own_traffic:
                 await traffic.__aexit__(None,None,None)
+    async def _unload_at_dock(self,i,d,kind,k,count,emit_classified=True):
+        local=[f'dock_carton_{i}_{j}' for j in range(count)]
+        src=source_stack(d,count);dst=list(reversed(even_stack_positions(stage(d),count))) if kind!='odd' else list(reversed(LG.stack_positions(stage(d),count)))
+        self.send({n:(d['x'],d['rear_y'],-5,0) for n in local})
+        self.emit('TRUCK_BATCH_READY',dock=d['id'],classification=kind,batch=k,cartons=count)
+        for j,(n,p,out) in enumerate(zip(local,src,dst)):
+            self.send({n:p+(0,)})
+            await self.worker(i,(d['x']-.45,d['rear_y']+.25,-math.pi/2))
+            self.emit('WORKER_PICK_FROM_TRUCK',dock=d['id'],carton=j,batch=k)
+            wx,wy,wyaw=self.states[i]
+            p_carton=p+(0,)
+            pick_dur=self.c.get('dock_pick_s',1.0)
+            def pick_anim(q,wx=wx,wy=wy,wyaw=wyaw,p_carton=p_carton,n=n):
+                if q<0.40:
+                    u=q/0.40;w=3*u*u-2*u*u*u
+                    bend=0.22*w;arm=0.95*w
+                    c_pose=p_carton
+                else:
+                    u=(q-0.40)/0.60;w=3*u*u-2*u*u*u
+                    bend=0.22-0.07*w;arm=0.95
+                    c_tgt=LG.held_carton(wx,wy,wyaw,bend,arm)
+                    c_pose=tuple(p_carton[m]+(c_tgt[m]-p_carton[m])*w for m in range(4))
+                out_p=LG.operator_pose(worker_id(i),wx,wy,wyaw,bend,arm)
+                out_p[n]=c_pose
+                return out_p
+            await self.e.move(pick_anim(1),duration=pick_dur,transform=pick_anim,exact=True)
+            await self.worker(i,(d['x']+.70,d['rear_y']+.65,-math.pi/2),n)
+            await self.idle(i,self.c.get('inbound_scan_s',2),n)
+            if emit_classified:
+                self.stats['scanned_'+kind]+=1
+                self.emit('BARCODE_CLASSIFIED',barcode=f'{kind.upper()}-{k:04d}-{j:03d}',classification=kind,dock=d['id'])
+            if out[0] < d['x'] - 0.15:
+                place_x = out[0] - 0.46
+                place_y = out[1]
+                place_yaw = 0.0
+            elif out[0] > d['x'] + 0.15:
+                place_x = out[0] + 0.46
+                place_y = out[1]
+                place_yaw = math.pi
+            else:
+                place_x = d['x'] + 0.52
+                place_y = out[1]
+                place_yaw = math.pi
+            await self.worker(i, (place_x, place_y, place_yaw), n)
+            bend, arm = LG.reach_for(out[2])
+            place_dur=self.c.get('dock_place_s',1.0)
+            c_start=LG.held_carton(*self.states[i],.15,.95)
+            c_target=out+(0,)
+            def place_anim(q,bend=bend,arm=arm,c_start=c_start,c_target=c_target,n=n):
+                u=3*q*q-2*q*q*q
+                b=.15+(bend-.15)*u
+                a=.95+(arm-.95)*u
+                cz=c_start[2]+(c_target[2]-c_start[2])*u
+                cx=c_start[0]+(c_target[0]-c_start[0])*u
+                cy=c_start[1]+(c_target[1]-c_start[1])*u
+                out_p=LG.operator_pose(worker_id(i),*self.states[i],b,a)
+                out_p[n]=(cx,cy,cz,0)
+                return out_p
+            await self.e.move(place_anim(1),duration=place_dur,transform=place_anim,exact=True)
+            def straighten(q,bend=bend,arm=arm):
+                u=3*q*q-2*q*q*q
+                b=bend*(1-u);a=arm*(1-u)
+                return LG.operator_pose(worker_id(i),*self.states[i],b,a)
+            await self.e.move(straighten(1),duration=0.35,transform=straighten,exact=True)
+        return local
+
+    async def _deliver_staged_pallet(self,i,d,kind,k,target,local,consume,acquire_target=None,staged_cartons=0):
+        extra={'cartons':staged_cartons} if staged_cartons else {}
+        self.emit('DOCK_PALLET_READY',dock=d['id'],classification=kind,batch=k,**extra)
+        span=(min(d['x'],target[0])-1.5,max(d['x'],target[0])+1.5)
+        t_gw0=self.e_time()
+        traffic=self.gate.manual(span);permission=asyncio.create_task(traffic.__aenter__())
+        while not permission.done():
+            await self.idle(i,.5)
+        await permission
+        gw_s=max(0.0,self.e_time()-t_gw0)
+        if gw_s>1e-4:
+            self.emit('DOCK_GATE_WAIT',dock=d['id'],classification=kind,batch=k,wait_s=round(gw_s,4))
+        try:
+            if acquire_target is not None:
+                async with acquire_target:
+                    await self.transfer(i,local,target,traffic=traffic)
+                    self.stats['pallets_to_w2']+=1
+                    await self.transfer(i,[],stage(d),True,without_deck=True,traffic=traffic)
+                    self.stats['empty_pallet_returns']+=1
+                    self.emit('EMPTY_PALLET_RETURNED',dock=d['id'],batch=k,classification=kind)
+            else:
+                await self.transfer(i,local,target,traffic=traffic)
+                self.stats['pallets_to_w1']+=1
+                await self.transfer(i,[],stage(d),True,without_deck=True,traffic=traffic)
+                self.emit('EMPTY_PALLET_FROM_POOL',dock=d['id'],batch=k)
+        finally:
+            await traffic.__aexit__(None,None,None)
+        self.send({f'dock_deck_{i}':stage(d)[:2]+(0,0)})
+        await self.worker(i,(d['x']+.85,d['rear_y']+.75,math.pi))
+        await consume(i,local)
+
     async def prepare(self,kind,k,target,names,consume,acquire_target=None):
         i=k%len(self.docks);d=self.docks[i]
         async with self.locks[i]:
-            count=len(names);local=[f'dock_carton_{i}_{j}' for j in range(count)]
-            src=source_stack(d,count);dst=list(reversed(even_stack_positions(stage(d),count))) if kind=='even' else list(reversed(LG.stack_positions(stage(d),count)))
-            self.send({n:(d['x'],d['rear_y'],-5,0) for n in local})
-            self.emit('TRUCK_BATCH_READY',dock=d['id'],classification=kind,batch=k,cartons=count)
-            for j,(n,p,out) in enumerate(zip(local,src,dst)):
-                self.send({n:p+(0,)})
-                await self.worker(i,(d['x']-.45,d['rear_y']+.25,-math.pi/2))
-                self.emit('WORKER_PICK_FROM_TRUCK',dock=d['id'],carton=j,batch=k)
-                wx,wy,wyaw=self.states[i]
-                p_carton=p+(0,)
-                pick_dur=self.c.get('dock_pick_s',1.0)
-                def pick_anim(q):
-                    if q<0.40:
-                        u=q/0.40;w=3*u*u-2*u*u*u
-                        bend=0.22*w;arm=0.95*w
-                        c_pose=p_carton
-                    else:
-                        u=(q-0.40)/0.60;w=3*u*u-2*u*u*u
-                        bend=0.22-0.07*w;arm=0.95
-                        c_tgt=LG.held_carton(wx,wy,wyaw,bend,arm)
-                        c_pose=tuple(p_carton[m]+(c_tgt[m]-p_carton[m])*w for m in range(4))
-                    out_p=LG.operator_pose(worker_id(i),wx,wy,wyaw,bend,arm)
-                    out_p[n]=c_pose
-                    return out_p
-                await self.e.move(pick_anim(1),duration=pick_dur,transform=pick_anim,exact=True)
-                await self.worker(i,(d['x']+.70,d['rear_y']+.65,-math.pi/2),n)
-                await self.idle(i,self.c.get('inbound_scan_s',2),n)
-                self.stats['scanned_'+kind]+=1
-                self.emit('BARCODE_CLASSIFIED',barcode=f'{kind.upper()}-{k:04d}-{j:03d}',classification=kind,dock=d['id'])
-                if out[0] < d['x'] - 0.15:
-                    place_x = out[0] - 0.46
-                    place_y = out[1]
-                    place_yaw = 0.0
-                elif out[0] > d['x'] + 0.15:
-                    place_x = out[0] + 0.46
-                    place_y = out[1]
-                    place_yaw = math.pi
-                else:
-                    place_x = d['x'] + 0.52
-                    place_y = out[1]
-                    place_yaw = math.pi
-                await self.worker(i, (place_x, place_y, place_yaw), n)
-                bend, arm = LG.reach_for(out[2])
-                place_dur=self.c.get('dock_place_s',1.0)
-                c_start=LG.held_carton(*self.states[i],.15,.95)
-                c_target=out+(0,)
-                def place_anim(q):
-                    u=3*q*q-2*q*q*q
-                    b=.15+(bend-.15)*u
-                    a=.95+(arm-.95)*u
-                    cz=c_start[2]+(c_target[2]-c_start[2])*u
-                    cx=c_start[0]+(c_target[0]-c_start[0])*u
-                    cy=c_start[1]+(c_target[1]-c_start[1])*u
-                    out_p=LG.operator_pose(worker_id(i),*self.states[i],b,a)
-                    out_p[n]=(cx,cy,cz,0)
-                    return out_p
-                await self.e.move(place_anim(1),duration=place_dur,transform=place_anim,exact=True)
-                def straighten(q):
-                    u=3*q*q-2*q*q*q
-                    b=bend*(1-u);a=arm*(1-u)
-                    return LG.operator_pose(worker_id(i),*self.states[i],b,a)
-                await self.e.move(straighten(1),duration=0.35,transform=straighten,exact=True)
-            self.emit('DOCK_PALLET_READY',dock=d['id'],classification=kind,batch=k)
-            traffic=self.gate.manual();permission=asyncio.create_task(traffic.__aenter__())
-            while not permission.done():
-                await self.idle(i,.5)
-            await permission
-            try:
-                if acquire_target is not None:
-                    async with acquire_target:
-                        await self.transfer(i,local,target,traffic=traffic)
-                        self.stats['pallets_to_w2']+=1
-                        await self.transfer(i,[],stage(d),True,without_deck=True,traffic=traffic)
-                        self.stats['empty_pallet_returns']+=1
-                        self.emit('EMPTY_PALLET_RETURNED',dock=d['id'],batch=k,classification=kind)
-                else:
-                    await self.transfer(i,local,target,traffic=traffic)
-                    self.stats['pallets_to_w1']+=1
-                    await self.transfer(i,[],stage(d),True,without_deck=True,traffic=traffic)
-                    self.emit('EMPTY_PALLET_FROM_POOL',dock=d['id'],batch=k)
-            finally:
-                await traffic.__aexit__(None,None,None)
-            self.send({f'dock_deck_{i}':stage(d)[:2]+(0,0)})
-            await self.worker(i,(d['x']+.85,d['rear_y']+.75,math.pi))
-            await consume(i,local)
+            local=await self._unload_at_dock(i,d,kind,k,len(names),emit_classified=True)
+            await self._deliver_staged_pallet(i,d,kind,k,target,local,consume,acquire_target=acquire_target)
+
+    async def prestage_and_deliver(self,i,k,count,claim_slot_fn):
+        """Worker at dock i pre-stages a full pallet immediately, then delivers to whichever slot frees first."""
+        d=self.docks[i]
+        async with self.locks[i]:
+            local=await self._unload_at_dock(i,d,'staged',k,count,emit_classified=False)
+            claimed=await claim_slot_fn(i,d['id'],k,count)
+            if claimed is None:
+                self.send({n:(d['x'],d['rear_y'],-5,0) for n in local})
+                return
+            kind,target,acquire_target,consume=claimed
+            self.stats['scanned_'+kind]+=count
+            await self._deliver_staged_pallet(i,d,kind,k,target,local,consume,acquire_target=acquire_target,staged_cartons=count)
     def e_time(self):
         return self.clock()
