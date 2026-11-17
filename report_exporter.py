@@ -4,10 +4,13 @@ from __future__ import annotations
 import copy
 import os
 from datetime import datetime
+import math
 from pathlib import Path
 from typing import Any
 
 from openpyxl import Workbook
+from openpyxl.chart import BarChart, LineChart, PieChart, Reference
+from openpyxl.chart.label import DataLabelList
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
 
@@ -149,6 +152,56 @@ class SimulationTracker:
         self.warehouse_tasks: list[dict[str, Any]] = []
         self._active_wh_tasks: dict[str, dict[str, Any]] = {}
         self.job_dock_map: dict[int, int] = {}
+
+        self.lifts: dict[str, dict[str, Any]] = {}
+        for lid, code, direction, station, order in (
+            ("in_lift_0", "Thang Nhập 1", "Nhập kho", "Cửa Nhập Kho 01 - Cổng 1", 1),
+            ("in_lift_1", "Thang Nhập 2", "Nhập kho", "Cửa Nhập Kho 01 - Cổng 2", 2),
+            ("out_lift_0", "Thang Xuất 1", "Xuất kho", "Cửa Xuất Kho 01 - Cổng 1", 3),
+            ("out_lift_1", "Thang Xuất 2", "Xuất kho", "Cửa Xuất Kho 01 - Cổng 2", 4),
+        ):
+            self.lifts[lid] = {
+                "id": lid,
+                "code": code,
+                "direction": direction,
+                "station": station,
+                "order": order,
+                "inbound_count": 0,
+                "outbound_count": 0,
+                "distance_m": 0.0,
+                "busy_s": 0.0,
+                "wait_s": 0.0,
+                "wait_count": 0,
+                "max_wait_s": 0.0,
+                "idle_s": 0.0,
+                "active_pct": 0.0,
+                "idle_pct": 0.0,
+                "fault_count": 0,
+                "fault_notes": [],
+                "active_task": None,
+                "last_task": "",
+                "task_codes": [],
+                "status": "Chờ lệnh",
+            }
+
+        self.stage_waits: dict[str, dict[str, Any]] = {}
+        for idx, (sk, lbl, desc) in enumerate((
+            ("pickup_to_agv", "1. Hàng chờ Ô Pickup -> AGV nhận hàng (Nhập)", "Pallet chẵn nằm tại Ô Pickup chờ AGV tầng 1 tới nhận"),
+            ("agv_to_in_lift", "2. Hàng chờ Thang nâng Nhập (Cổng 1 & 2)", "AGV mang pallet chờ cổng & thang nâng nhập trống để lên tầng"),
+            ("buffer_to_in_shuttle", "3. Hàng chờ Shuttle chiều Nhập kho", "Pallet trên bàn đệm nhập tầng chờ Shuttle tầng đó rảnh"),
+            ("out_req_to_lift", "4. Hàng chờ Thang nâng Xuất (Cổng 1 & 2)", "Yêu cầu xuất kho chờ Z05 trống, hàng sẵn sàng & thang xuất rảnh"),
+            ("out_port_to_shuttle", "5. Hàng chờ Shuttle chiều Xuất kho", "Thang Xuất sẵn sàng nhưng chờ Shuttle tầng lấy hàng từ kệ rảnh"),
+        ), start=1):
+            self.stage_waits[sk] = {
+                "id": sk,
+                "order": idx,
+                "label": lbl,
+                "desc": desc,
+                "total_events": 0,
+                "waited_events": 0,
+                "total_wait_s": 0.0,
+                "max_wait_s": 0.0,
+            }
 
         self.agvs: dict[str, dict[str, Any]] = {}
         for i in range(2):
@@ -390,6 +443,67 @@ class SimulationTracker:
             rec["distance_m"] = round(rec["distance_m"], 3)
             rec["status"] = "Lỗi" if rec["fault_count"] > 0 else "Hoàn thành"
         sh["active_task"] = None
+
+    def start_lift_task(
+        self,
+        lift_id: str,
+        direction: str,
+        task_code: str,
+        pallet_id: str = "",
+    ) -> None:
+        if lift_id not in self.lifts:
+            return
+        lf = self.lifts[lift_id]
+        lf["active_task"] = task_code or pallet_id
+        lf["last_task"] = task_code or pallet_id
+        if task_code:
+            lf["task_codes"].append(task_code)
+        if direction == "Nhập kho":
+            lf["inbound_count"] += 1
+        else:
+            lf["outbound_count"] += 1
+
+    def record_lift_leg(self, lift_id: str, height_m: float, duration_s: float) -> None:
+        if lift_id not in self.lifts:
+            return
+        lf = self.lifts[lift_id]
+        lf["distance_m"] += max(0.0, float(height_m))
+        lf["busy_s"] += max(0.0, float(duration_s))
+
+    def finish_lift_task(self, lift_id: str) -> None:
+        if lift_id not in self.lifts:
+            return
+        self.lifts[lift_id]["active_task"] = None
+
+    def record_lift_fault(self, lift_id: str, note: str = "") -> None:
+        if lift_id not in self.lifts:
+            return
+        lf = self.lifts[lift_id]
+        lf["fault_count"] += 1
+        if note:
+            lf["fault_notes"].append(note)
+
+    def record_lift_wait(self, lift_id: str, wait_s: float) -> None:
+        if lift_id not in self.lifts:
+            return
+        lf = self.lifts[lift_id]
+        w = max(0.0, float(wait_s))
+        lf["wait_s"] += w
+        lf["wait_count"] += 1
+        if w > lf["max_wait_s"]:
+            lf["max_wait_s"] = w
+
+    def record_stage_wait(self, stage_id: str, wait_s: float) -> None:
+        st = self.stage_waits.get(stage_id)
+        if st is None:
+            return
+        w = max(0.0, float(wait_s))
+        st["total_events"] += 1
+        st["total_wait_s"] += w
+        if w > 1e-6:
+            st["waited_events"] += 1
+        if w > st["max_wait_s"]:
+            st["max_wait_s"] = w
 
     def next_agv_code(self, prefix: str) -> str:
         seq = self._agv_seq.get(prefix, 0) + 1
@@ -686,6 +800,23 @@ class SimulationTracker:
             else:
                 sh["status"] = "Chờ lệnh"
 
+        for lf in self.lifts.values():
+            lf["distance_m"] = round(lf["distance_m"], 2)
+            lf["busy_s"] = round(min(lf["busy_s"], self.sim_duration_s) if self.sim_duration_s > 0 else lf["busy_s"], 3)
+            lf["wait_s"] = round(lf["wait_s"], 3)
+            lf["max_wait_s"] = round(lf["max_wait_s"], 3)
+            lf["idle_s"] = round(max(0.0, self.sim_duration_s - lf["busy_s"]), 3)
+            lf["active_pct"] = _pct(lf["busy_s"], self.sim_duration_s)
+            lf["idle_pct"] = _pct(lf["idle_s"], self.sim_duration_s)
+            if lf["fault_count"] > 0:
+                lf["status"] = "Lỗi"
+            elif lf["active_task"] is not None:
+                lf["status"] = "Đang chạy khi dừng"
+            elif lf["inbound_count"] + lf["outbound_count"] > 0:
+                lf["status"] = "Hoạt động bình thường"
+            else:
+                lf["status"] = "Chờ lệnh"
+
         for agv in self.agvs.values():
             loaded_m = agv["loaded_distance_m"]
             empty_m = agv["empty_distance_m"]
@@ -764,6 +895,9 @@ class SimulationTracker:
         active_shuttles = [s for s in self.shuttles.values() if s["index"] <= 9]
         avg_sh_active = sum(s["active_pct"] for s in active_shuttles) / max(1, len(active_shuttles))
         avg_sh_idle = sum(s["idle_pct"] for s in active_shuttles) / max(1, len(active_shuttles))
+        lifts_list = list(self.lifts.values())
+        avg_lf_active = sum(lf["active_pct"] for lf in lifts_list) / max(1, len(lifts_list))
+        avg_lf_idle = sum(lf["idle_pct"] for lf in lifts_list) / max(1, len(lifts_list))
         return {
             "sim_duration_s": round(self.sim_duration_s, 3),
             "wall_duration_s": round(self.wall_duration_s, 3),
@@ -779,6 +913,13 @@ class SimulationTracker:
             "shuttle_fault_count": sum(s["fault_count"] for s in self.shuttles.values()),
             "shuttle_avg_active_pct": round(avg_sh_active, 2),
             "shuttle_avg_idle_pct": round(avg_sh_idle, 2),
+            "lift_inbound_tasks": sum(lf["inbound_count"] for lf in self.lifts.values()),
+            "lift_outbound_tasks": sum(lf["outbound_count"] for lf in self.lifts.values()),
+            "lift_total_busy_s": round(sum(lf["busy_s"] for lf in self.lifts.values()), 3),
+            "lift_total_wait_s": round(sum(lf["wait_s"] for lf in self.lifts.values()), 3),
+            "lift_fault_count": sum(lf["fault_count"] for lf in self.lifts.values()),
+            "lift_avg_active_pct": round(avg_lf_active, 2),
+            "lift_avg_idle_pct": round(avg_lf_idle, 2),
             "agv_total_tasks": len(self.agv_tasks),
             "agv_unpack_tasks": len(unpack_agv_tasks),
             "agv_dock_tasks": len(dock_agv_tasks),
@@ -990,7 +1131,8 @@ def export_excel(
         ["Chế độ vận hành & Lý do dừng", mode_desc, "-", summary["stop_reason"]],
         ["Số pallet cấu hình (khi tắt chế độ liên tục)", tracker.total_jobs if not tracker.continuous_mode else "Không giới hạn (Liên tục)", "pallet", "Tự động tái chế pallet model khi bật continuous_mode"],
         ["Giới hạn thời lượng chu trình (cycle_duration_s)", _fmt_vi_hms(tracker.cycle_duration_s) if tracker.cycle_duration_s > 0 else "0 (Không giới hạn)", "giờ:phút:giây", "0 = chạy liên tục; > 0 = tự động dừng đúng mốc thời gian chuẩn 1x"],
-        ["Chu kỳ nhập / xuất (inbound / outbound interval)", f"{cfg.get('inbound_interval_s')}s / {cfg.get('outbound_interval_s')}s", "giây (1x)", f"Số cửa Dock mở: {cfg.get('dock_active_count')} | Phân loại: {cfg.get('inbound_classification', 'barcode')}"],
+        ["Chu kỳ nhập / xuất (inbound / outbound interval)", f"{cfg.get('inbound_interval_s')}s / {cfg.get('outbound_interval_s')}s", "giây (1x)", f"Mục tiêu ca: {cfg.get('warehouse_inbound_target', '-')} nhập / {cfg.get('warehouse_outbound_target', '-')} xuất | Tồn đầu: {cfg.get('initial_outbound_pallets', 0)} | Dock mở: {cfg.get('dock_active_count')}"],
+        ["Thông số Shuttle cài đặt (tốc độ / gia tốc / jerk)", f"{cfg.get('shuttle_speed', 1.0):.2f} m/s | {cfg.get('shuttle_acceleration', 0.3):.2f} m/s² | {cfg.get('shuttle_jerk', 0.6):.2f} m/s³", "9 tầng + 1 dự phòng", f"Đổi bánh: {cfg.get('shuttle_turn_s', 5.0):.1f}s | Định vị: {cfg.get('shuttle_positioning_s', 5.0):.1f}s | Nâng/hạ: {cfg.get('shuttle_lift_s', 2.5):.1f}s | Avail/Util: {float(cfg.get('shuttle_availability', 0.7))*100:.0f}%/{float(cfg.get('shuttle_utilization', 0.7))*100:.0f}%"],
         ["Pin AGV (Ban đầu / Có tải / Không tải / Chờ)", f"{tracker.init_battery_pct:.0f}% / {tracker.drain_loaded_per_m}%/m", f"{tracker.drain_empty_per_m}%/m", f"Đứng chờ: {tracker.drain_idle_per_s}%/s"],
     ]
     row = _write_table(
@@ -1004,7 +1146,8 @@ def export_excel(
     row = _style_section(ws1, row, 4, "2. BẢNG CHỈ SỐ KPI TỪNG KHU VỰC")
     kpi_rows = [
         ["Kho AS/RS - Nhập kho / Xuất kho", f"{summary['warehouse_inbound_tasks']} nhập / {summary['warehouse_outbound_tasks']} xuất", "nhiệm vụ", f"Quãng đường 10 Shuttle: {summary['shuttle_total_distance_m']:,.2f} m | Lỗi: {summary['shuttle_fault_count']}"],
-        ["Kho AS/RS - Hiệu suất & Thời gian 9 Shuttle chính", f"{summary['shuttle_avg_active_pct']:.2f}% chạy / {summary['shuttle_avg_idle_pct']:.2f}% đứng chơi", _fmt_vi_hms(summary['shuttle_total_busy_s']), f"Tổng TG chờ Traffic: {_fmt_vi_hms(summary['shuttle_total_wait_s'])} | Đổi bánh X/Y: {summary['shuttle_total_turns']} lượt"],
+        ["Kho AS/RS - Hiệu suất & Hàng chờ 9 Shuttle chính", f"{summary['shuttle_avg_active_pct']:.2f}% chạy / {summary['shuttle_avg_idle_pct']:.2f}% đứng chơi", _fmt_vi_hms(summary['shuttle_total_busy_s']), f"Tổng hàng chờ Shuttle: {_fmt_vi_hms(summary['shuttle_total_wait_s'])} | Đổi bánh X/Y: {summary['shuttle_total_turns']} lượt"],
+        ["Kho AS/RS - 4 Thang nâng (Nhập / Xuất / Hàng chờ)", f"{summary['lift_inbound_tasks']} nhập / {summary['lift_outbound_tasks']} xuất", f"{summary['lift_avg_active_pct']:.2f}% chạy", f"Tổng hàng chờ 4 thang: {_fmt_vi_hms(summary['lift_total_wait_s'])} | Lỗi: {summary['lift_fault_count']}"],
         ["Khu Unpack - Nhiệm vụ AGV (U1 & U2)", summary["agv_unpack_tasks"], "nhiệm vụ", "Đổi rack kho 04 & đổi trolley khu 06 tại bàn Unpack U1/U2"],
         ["Khu Đóng Gói P1 - Nhiệm vụ AGV", summary["agv_p1_tasks"], "nhiệm vụ", "Cấp rack hàng & đổi trolley đóng gói tại 56 trạm P1"],
         ["Khu Dock -> Kho 01 - Nhiệm vụ AGV", summary["agv_dock_tasks"], "nhiệm vụ", "AGV tầng 1 chở pallet chẵn từ 4 Ô Pickup vào cửa nhập Kho 01"],
@@ -1025,93 +1168,344 @@ def export_excel(
     # ---------------------------------------------------------------- Sheet 2: Kho_ASRS_Shuttle
     ws2 = wb.create_sheet("Kho_ASRS_Shuttle")
     row = _style_banner(
-        ws2, 1, 18,
-        "KHU VỰC KHO AS/RS (9 TẦNG) - HIỆU SUẤT, TRAFFIC, PICK/DROP & TRẠNG THÁI 10 SHUTTLE",
+        ws2, 1, 15,
+        "KHU VỰC KHO AS/RS (9 TẦNG) - THÔNG SỐ CÀI ĐẶT, SHUTTLE, THANG NÂNG, HÀNG CHỜ & BIỂU ĐỒ",
         f"Mọi thời gian tính theo thời gian vận hành thực tế chuẩn 1x ({summary['sim_duration_hms']}), định dạng Giờ:Phút:Giây.",
     )
-    row = _style_section(ws2, row, 18, "1. TỔNG HỢP HOẠT ĐỘNG, TỈ LỆ & TRAFFIC KHO AS/RS")
-    multi_sh_ticks = int(tf.get("multiple_shuttle_motion_ticks", 0) or 0)
-    overlap_ticks = int(tf.get("inbound_outbound_overlap_ticks", 0) or 0)
-    rail_chk = int(tf.get("rail_contact_checks", 0) or 0)
+    row = _style_section(ws2, row, 15, "1. TỔNG HỢP HOẠT ĐỘNG & TỈ LỆ KHO AS/RS")
     sh_kpi_rows = [
         [
             "Tổng thời gian vận hành kho (1x chuẩn)", summary["sim_duration_hms"],
             "Tỉ lệ TB Shuttle hoạt động (Shuttle 1..9)", f"{summary['shuttle_avg_active_pct']:.2f}%",
-            "Tổng thời gian chờ Traffic / Lock tầng", _fmt_vi_hms(summary["shuttle_total_wait_s"]),
         ],
         [
-            "Tổng nhiệm vụ Nhập / Xuất kho", f"{summary['warehouse_inbound_tasks']} nhập / {summary['warehouse_outbound_tasks']} xuất",
+            "Tổng nhiệm vụ Shuttle (Nhập / Xuất)", f"{summary['warehouse_inbound_tasks']} nhập / {summary['warehouse_outbound_tasks']} xuất",
             "Tỉ lệ TB Shuttle đứng chơi (Shuttle 1..9)", f"{summary['shuttle_avg_idle_pct']:.2f}%",
-            "Đa Shuttle chạy song song / Nhập-Xuất chồng lấn", f"{_pct(multi_sh_ticks, engine_ticks):.2f}% ({multi_sh_ticks} ticks) / {_pct(overlap_ticks, engine_ticks):.2f}% ({overlap_ticks} ticks)",
         ],
         [
             "Tổng quãng đường 10 Shuttle", f"{summary['shuttle_total_distance_m']:,.2f} m",
-            "Tổng lượt lỗi Shuttle", summary["shuttle_fault_count"],
-            "Tổng chuyển hướng X/Y & Kiểm tra an toàn ray", f"{summary['shuttle_total_turns']} lần chuyển bánh | {rail_chk:,} lần kiểm tra ray",
+            "Tổng TG hàng chờ 10 Shuttle / Lỗi", f"{_fmt_vi_hms(summary['shuttle_total_wait_s'])} | Lỗi: {summary['shuttle_fault_count']}",
+        ],
+        [
+            "Tổng hàng qua 4 Thang nâng (Nhập / Xuất)", f"{summary['lift_inbound_tasks']} nhập / {summary['lift_outbound_tasks']} xuất",
+            "Tỉ lệ TB 4 Thang nâng & Hàng chờ", f"{summary['lift_avg_active_pct']:.2f}% chạy / {summary['lift_avg_idle_pct']:.2f}% nghỉ | Chờ: {_fmt_vi_hms(summary['lift_total_wait_s'])} | Lỗi: {summary['lift_fault_count']}",
         ],
     ]
     row = _write_table(
         ws2, row,
-        ["Chỉ tiêu Kho AS/RS", "Giá trị", "Chỉ tiêu Trạng thái / Lỗi", "Giá trị", "Chỉ tiêu Traffic Kho", "Giá trị"],
+        ["Chỉ tiêu Kho AS/RS", "Giá trị", "Chỉ tiêu Trạng thái / Hàng chờ / Lỗi", "Giá trị"],
         sh_kpi_rows,
         center_cols={2, 4},
         auto_filter=False,
     )
 
-    row = _style_section(ws2, row, 18, "2. BẢNG TỔNG HỢP TRẠNG THÁI 10 SHUTTLE (TỪ SHUTTLE 1 ĐẾN SHUTTLE 10)")
+    row = _style_section(ws2, row, 15, "2. THÔNG SỐ SHUTTLE CÀI ĐẶT & CẤU HÌNH VẬN HÀNH KHO AS/RS")
+    sh_cfg_rows = [
+        ["Vận tốc di chuyển Shuttle (shuttle_speed)", f"{float(cfg.get('shuttle_speed', 1.0)):.2f}", "m/s", "Tốc độ chạy dọc/ngang tối đa trên hệ ray 9 tầng"],
+        ["Gia tốc / Độ giật Shuttle (shuttle_acceleration / shuttle_jerk)", f"{float(cfg.get('shuttle_acceleration', 0.3)):.2f} / {float(cfg.get('shuttle_jerk', 0.6)):.2f}", "m/s² | m/s³", "Đồ thị chuyển động S-curve 7 pha tăng/giảm tốc mượt"],
+        ["Thời gian chuyển hướng bánh X/Y (shuttle_turn_s)", f"{float(cfg.get('shuttle_turn_s', 5.0)):.2f}", "giây/lần", "Thời gian nâng-hạ bộ bánh xe khi rẽ góc 90° trên ray"],
+        ["Thời gian định vị tinh tại ô kệ (shuttle_positioning_s)", f"{float(cfg.get('shuttle_positioning_s', 5.0)):.2f}", "giây/lần", "Thời gian căn chỉnh vị trí trước khi nâng/hạ pallet"],
+        ["Thời gian nâng / hạ bàn nâng Shuttle (shuttle_lift_s)", f"{float(cfg.get('shuttle_lift_s', 2.5)):.2f}", "giây/lần", "Thời gian kích thủy lực nâng/hạ pallet trên thân Shuttle"],
+        ["Hệ số sẵn sàng & Sử dụng (availability / utilization)", f"{float(cfg.get('shuttle_availability', 0.7))*100:.1f}% / {float(cfg.get('shuttle_utilization', 0.7))*100:.1f}%", "%", "Hệ số khả dụng & hiệu suất thiết kế theo bảng tính 4-way Shuttle"],
+        ["Quy mô đội Shuttle & Cao độ 9 tầng kệ", "10 Shuttle (9 chạy chính + 1 dự phòng T1)", "9 tầng (0.3m..16.3m)", f"Mục tiêu ca { _fmt_vi_hms(tracker.cycle_duration_s) if tracker.cycle_duration_s > 0 else 'Liên tục' }: {cfg.get('warehouse_inbound_target', '-')} nhập / {cfg.get('warehouse_outbound_target', '-')} xuất (Tồn đầu: {cfg.get('initial_outbound_pallets', 0)} pallet)"],
+        ["Thông số Thang nâng & Băng tải đi kèm", f"Thang {float(cfg.get('lift_speed', 0.6)):.2f} m/s | Ổn định {float(cfg.get('lift_settle_s', 2.0)):.1f}s | Băng tải {float(cfg.get('conveyor_speed', 0.6)):.2f} m/s", "m/s | giây", f"Gia tốc thang {float(cfg.get('lift_acceleration', 0.3)):.2f} m/s² | Độ giật {float(cfg.get('lift_jerk', 0.8)):.2f} m/s³ | Nhịp nhập/xuất {cfg.get('inbound_even_interval_s', cfg.get('inbound_interval_s'))}s / {cfg.get('outbound_interval_s')}s"],
+    ]
+    row = _write_table(
+        ws2, row,
+        ["Thông số cài đặt Shuttle & AS/RS", "Giá trị cấu hình", "Đơn vị", "Diễn giải / Tham số vận hành"],
+        sh_cfg_rows,
+        center_cols={2, 3},
+        auto_filter=False,
+    )
+
+    row = _style_section(ws2, row, 15, "3. BẢNG TỔNG HỢP TRẠNG THÁI & HÀNG CHỜ 10 SHUTTLE (TỪ SHUTTLE 1 ĐẾN SHUTTLE 10)")
     shuttle_rows = []
-    tot_in = tot_out = tot_turns = tot_faults = 0
-    tot_dist = tot_busy = tot_idle = tot_wait = 0.0
+    tot_in = tot_out = tot_faults = 0
+    tot_busy = tot_idle = tot_wait = 0.0
     for sid in [f"shuttle_{i}" for i in range(10)]:
         sh = tracker.shuttles[sid]
         cnt = sh["inbound_count"] + sh["outbound_count"]
         tot_in += sh["inbound_count"]
         tot_out += sh["outbound_count"]
-        tot_turns += sh["turn_count"]
         tot_faults += sh["fault_count"]
-        tot_dist += sh["distance_m"]
         tot_busy += sh["busy_s"]
         tot_idle += sh["idle_s"]
         tot_wait += sh["wait_s"]
+        avg_wait = round(sh["wait_s"] / cnt, 2) if cnt > 0 else 0.0
         shuttle_rows.append([
-            sh["code"], sh["id"], f"Tầng {sh['level']}", sh["role"],
-            sh["inbound_count"], sh["outbound_count"], cnt, sh["turn_count"],
-            round(sh["distance_m"], 2),
-            _excel_days(sh["busy_s"]), _excel_days(sh["idle_s"]), _excel_days(sh["wait_s"]),
+            sh["code"], sh["role"],
+            sh["inbound_count"], sh["outbound_count"], cnt,
+            _excel_days(sh["busy_s"]), _excel_days(sh["idle_s"]), _excel_days(sh["wait_s"]), avg_wait,
             sh["active_pct"], sh["idle_pct"], sh["fault_count"],
-            sh["last_task"] or "-", sh["status"], _fmt_codes(sh["task_codes"], 10),
+            sh["status"], _fmt_codes(sh["task_codes"], 10),
         ])
+    tot_sh_cnt = tot_in + tot_out
     row = _write_table(
         ws2, row,
         [
-            "Mã Shuttle", "ID kỹ thuật", "Tầng kho", "Vai trò vận hành",
-            "Lượt nhập", "Lượt xuất", "Tổng NV", "Đổi trục X/Y",
-            "Quãng đường (m)", "TG hoạt động", "TG đứng chơi", "TG chờ Traffic",
+            "Mã Shuttle", "Vai trò vận hành",
+            "Lượt nhập", "Lượt xuất", "Tổng NV",
+            "TG hoạt động", "TG đứng chơi", "TG hàng chờ Shuttle", "Chờ TB / NV (s)",
             "Tỉ lệ chạy (%)", "Tỉ lệ đứng chơi (%)", "Số lỗi",
-            "NV gần nhất", "Trạng thái", "Danh sách mã nhiệm vụ",
+            "Trạng thái", "Danh sách mã nhiệm vụ",
         ],
         shuttle_rows,
         col_formats={
-            5: "#,##0", 6: "#,##0", 7: "#,##0", 8: "#,##0", 9: "#,##0.00",
-            10: FMT_HMS_TENTH, 11: FMT_HMS_TENTH, 12: FMT_HMS_TENTH,
-            13: "0.00", 14: "0.00", 15: "#,##0",
+            3: "#,##0", 4: "#,##0", 5: "#,##0",
+            6: FMT_HMS_TENTH, 7: FMT_HMS_TENTH, 8: FMT_HMS_TENTH, 9: "#,##0.00",
+            10: "0.00", 11: "0.00", 12: "#,##0",
         },
-        right_cols={5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15},
-        center_cols={1, 2, 3, 16, 17},
-        status_col=17,
+        right_cols={3, 4, 5, 6, 7, 8, 9, 10, 11, 12},
+        center_cols={1, 13},
+        status_col=13,
         total_row=[
-            "TỔNG / TB 10 SHUTTLE", "", "", "",
-            tot_in, tot_out, tot_in + tot_out, tot_turns,
-            round(tot_dist, 2),
+            "TỔNG / TB 10 SHUTTLE", "",
+            tot_in, tot_out, tot_sh_cnt,
             _excel_days(tot_busy), _excel_days(tot_idle), _excel_days(tot_wait),
-            round(sum(r[12] for r in shuttle_rows[:9]) / 9.0, 2),
-            round(sum(r[13] for r in shuttle_rows[:9]) / 9.0, 2),
-            tot_faults, "", "(*) TB hàng % tính trên 9 Shuttle hoạt động chính", "",
+            round(tot_wait / tot_sh_cnt, 2) if tot_sh_cnt > 0 else 0.0,
+            round(sum(r[9] for r in shuttle_rows[:9]) / 9.0, 2),
+            round(sum(r[10] for r in shuttle_rows[:9]) / 9.0, 2),
+            tot_faults, "(*) TB hàng % tính trên 9 Shuttle hoạt động chính", "",
         ],
         auto_filter=False,
     )
 
-    row = _style_section(ws2, row, 16, "3. NHẬT KÝ NHIỆM VỤ NHẬP / XUẤT KHO AS/RS (VỊ TRÍ PICK, DROP & TỔNG THỜI GIAN)")
+    row = _style_section(ws2, row, 15, "4. BÁO CÁO CHI TIẾT HOẠT ĐỘNG & HÀNG CHỜ 4 THANG NÂNG (NHẬP & XUẤT KHO AS/RS)")
+    lift_rows = []
+    lf_tot_in = lf_tot_out = lf_tot_faults = lf_tot_wait_cnt = 0
+    lf_tot_dist = lf_tot_busy = lf_tot_idle = lf_tot_wait = 0.0
+    ordered_lifts = sorted(tracker.lifts.values(), key=lambda item: item["order"])
+    for lf in ordered_lifts:
+        cnt = lf["inbound_count"] + lf["outbound_count"]
+        lf_tot_in += lf["inbound_count"]
+        lf_tot_out += lf["outbound_count"]
+        lf_tot_faults += lf["fault_count"]
+        lf_tot_dist += lf["distance_m"]
+        lf_tot_busy += lf["busy_s"]
+        lf_tot_idle += lf["idle_s"]
+        lf_tot_wait += lf["wait_s"]
+        denom = lf["wait_count"] if lf["wait_count"] > 0 else cnt
+        lf_tot_wait_cnt += denom
+        avg_lf_wait = round(lf["wait_s"] / denom, 2) if denom > 0 else 0.0
+        lift_rows.append([
+            lf["code"], f"{lf['direction']} ({lf['station']})",
+            lf["inbound_count"], lf["outbound_count"], cnt,
+            round(lf["distance_m"], 2),
+            _excel_days(lf["busy_s"]), _excel_days(lf["idle_s"]),
+            _excel_days(lf["wait_s"]), avg_lf_wait,
+            lf["active_pct"], lf["idle_pct"], lf["fault_count"],
+            lf["status"], _fmt_codes(lf["task_codes"], 10),
+        ])
+    lf_cnt = max(1, len(lift_rows))
+    row = _write_table(
+        ws2, row,
+        [
+            "Mã Thang nâng", "Cổng / Chức năng",
+            "Số hàng nhập", "Số hàng xuất", "Tổng hàng qua thang",
+            "Quãng đường nâng-hạ (m)", "TG hoạt động", "TG nghỉ",
+            "TG hàng chờ Thang", "Chờ TB / lượt (s)",
+            "Tỉ lệ chạy (%)", "Tỉ lệ nghỉ (%)", "Số lỗi",
+            "Trạng thái", "Danh sách mã nhiệm vụ",
+        ],
+        lift_rows,
+        col_formats={
+            3: "#,##0", 4: "#,##0", 5: "#,##0",
+            6: "#,##0.00", 7: FMT_HMS_TENTH, 8: FMT_HMS_TENTH,
+            9: FMT_HMS_TENTH, 10: "#,##0.00",
+            11: "0.00", 12: "0.00", 13: "#,##0",
+        },
+        right_cols={3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13},
+        center_cols={1, 14},
+        status_col=14,
+        total_row=[
+            "TỔNG / TB 4 THANG NÂNG", "",
+            lf_tot_in, lf_tot_out, lf_tot_in + lf_tot_out,
+            round(lf_tot_dist, 2), _excel_days(lf_tot_busy), _excel_days(lf_tot_idle),
+            _excel_days(lf_tot_wait),
+            round(lf_tot_wait / lf_tot_wait_cnt, 2) if lf_tot_wait_cnt > 0 else 0.0,
+            round(sum(r[10] for r in lift_rows) / lf_cnt, 2),
+            round(sum(r[11] for r in lift_rows) / lf_cnt, 2),
+            lf_tot_faults, "", "",
+        ],
+        auto_filter=False,
+    )
+
+    row = _style_section(ws2, row, 15, "5. THỜI GIAN CHỜ TỪNG CÔNG ĐOẠN (HÀNG CHỜ THANG NÂNG & HÀNG CHỜ SHUTTLE)")
+    stage_rows = []
+    tot_stg_events = tot_stg_waited = 0
+    tot_stg_wait_s = max_stg_wait_s = 0.0
+    for st in sorted(tracker.stage_waits.values(), key=lambda item: item["order"]):
+        evs = st["total_events"]
+        wevs = st["waited_events"]
+        ws_val = round(st["total_wait_s"], 3)
+        tot_stg_events += evs
+        tot_stg_waited += wevs
+        tot_stg_wait_s += ws_val
+        max_stg_wait_s = max(max_stg_wait_s, st["max_wait_s"])
+        avg_s = round(ws_val / evs, 2) if evs > 0 else 0.0
+        stage_rows.append([
+            st["label"],
+            evs,
+            f"{wevs} ({_pct(wevs, evs):.1f}%)" if evs > 0 else "0 (0.0%)",
+            _excel_days(ws_val),
+            avg_s,
+            round(st["max_wait_s"], 2),
+            st["desc"],
+        ])
+    row = _write_table(
+        ws2, row,
+        [
+            "Công đoạn / Hàng chờ Kho AS/RS", "Số lượt qua trạm", "Số lượt phải chờ (>0s)",
+            "Tổng TG hàng chờ", "Chờ TB / lượt (s)", "Chờ tối đa (s)", "Diễn giải chi tiết",
+        ],
+        stage_rows,
+        col_formats={2: "#,##0", 4: FMT_HMS_TENTH, 5: "#,##0.00", 6: "#,##0.00"},
+        right_cols={2, 4, 5, 6},
+        center_cols={3},
+        total_row=[
+            "TỔNG CỘNG CÁC CÔNG ĐOẠN CHỜ AS/RS",
+            tot_stg_events, tot_stg_waited, _excel_days(tot_stg_wait_s),
+            round(tot_stg_wait_s / tot_stg_events, 2) if tot_stg_events > 0 else 0.0,
+            round(max_stg_wait_s, 2), "",
+        ],
+        auto_filter=False,
+    )
+
+    row = _style_section(ws2, row, 15, "6. BIỂU ĐỒ TẦN SUẤT THEO GIỜ & TRẠNG THÁI 10 SHUTTLE")
+    m4_data_start = row
+
+    max_task_s = max((float(t.get("start_s") or 0.0) for t in tracker.warehouse_tasks), default=0.0)
+    hour_span_s = max(float(tracker.sim_duration_s or 0.0), max_task_s)
+    num_hours = max(1, int(math.ceil(hour_span_s / 3600.0))) if hour_span_s > 0 else 1
+    hour_buckets = [{"in": 0, "out": 0} for _ in range(num_hours)]
+    for t in tracker.warehouse_tasks:
+        h_idx = min(num_hours - 1, max(0, int(float(t.get("start_s") or 0.0) // 3600.0)))
+        if t.get("direction") == "Nhập kho":
+            hour_buckets[h_idx]["in"] += 1
+        else:
+            hour_buckets[h_idx]["out"] += 1
+
+    total_hour_tasks = sum(b["in"] + b["out"] for b in hour_buckets)
+    hour_totals = [b["in"] + b["out"] for b in hour_buckets]
+    max_hr_cnt = max(hour_totals) if hour_totals else 0
+    min_hr_cnt = min(hour_totals) if hour_totals else 0
+    hourly_rows = []
+    for h_idx, b in enumerate(hour_buckets):
+        cnt = b["in"] + b["out"]
+        share = round((cnt * 100.0 / total_hour_tasks), 2) if total_hour_tasks > 0 else 0.0
+        if max_hr_cnt == 0:
+            note = "Chưa có nhiệm vụ"
+        elif len(hour_buckets) > 1 and max_hr_cnt > min_hr_cnt:
+            if cnt == max_hr_cnt:
+                note = "Bận rộn nhất (Cao điểm)"
+            elif cnt == min_hr_cnt:
+                note = "Rảnh nhất (Thấp điểm)"
+            else:
+                note = "Bình thường"
+        else:
+            note = "Phân bổ đều"
+        hourly_rows.append([
+            f"Giờ {h_idx + 1} ({h_idx:02d}:00-{h_idx + 1:02d}:00)",
+            b["in"], b["out"], cnt, share, note,
+        ])
+
+    h_hdr_row = row
+    h_last_data_row = h_hdr_row + len(hourly_rows)
+    row = _write_table(
+        ws2, row,
+        ["Khung giờ (1x)", "Lượt nhập", "Lượt xuất", "Tổng nhiệm vụ", "Tỉ trọng (%)", "Đánh giá cao/thấp điểm"],
+        hourly_rows,
+        col_formats={2: "#,##0", 3: "#,##0", 4: "#,##0", 5: "0.00"},
+        right_cols={2, 3, 4, 5},
+        center_cols={1, 6},
+        total_row=[
+            "TỔNG CỘNG THEO GIỜ",
+            sum(b["in"] for b in hour_buckets),
+            sum(b["out"] for b in hour_buckets),
+            total_hour_tasks,
+            100.0 if total_hour_tasks > 0 else 0.0,
+            f"Cao nhất: {max_hr_cnt} | Thấp nhất: {min_hr_cnt} NV/giờ",
+        ],
+        auto_filter=False,
+    )
+
+    tot_sh_wait_capped = min(tot_wait, tot_idle)
+    tot_sh_pure_idle = max(0.0, tot_idle - tot_sh_wait_capped)
+    tot_sh_cap = tot_busy + tot_idle
+    active_sh_count = sum(1 for i in range(10) if tracker.shuttles[f"shuttle_{i}"]["inbound_count"] + tracker.shuttles[f"shuttle_{i}"]["outbound_count"] > 0)
+    sh_state_rows = [
+        [
+            "Đang hoạt động (Chạy nhiệm vụ)",
+            round(tot_busy / 60.0, 2),
+            _pct(tot_busy, tot_sh_cap),
+            f"{active_sh_count}/10 Shuttle tham gia | {tot_in} nhập, {tot_out} xuất",
+        ],
+        [
+            "Chờ Traffic / Khóa tầng",
+            round(tot_sh_wait_capped / 60.0, 2),
+            _pct(tot_sh_wait_capped, tot_sh_cap),
+            f"Tổng TG chờ tầng/lượt: {_fmt_vi_hms(tot_wait)}",
+        ],
+        [
+            "Nghỉ / Chờ lệnh & Dự phòng",
+            round(tot_sh_pure_idle / 60.0, 2),
+            round(max(0.0, 100.0 - _pct(tot_busy, tot_sh_cap) - _pct(tot_sh_wait_capped, tot_sh_cap)), 2) if tot_sh_cap > 0 else 0.0,
+            f"Bao gồm Shuttle 10 dự phòng | Số lỗi toàn đội: {tot_faults}",
+        ],
+    ]
+    s_hdr_row = row
+    s_last_data_row = s_hdr_row + len(sh_state_rows)
+    left_end_row = _write_table(
+        ws2, row,
+        ["Trạng thái 10 Shuttle", "Thời gian (phút)", "Tỉ trọng (%)", "Ghi chú vận hành & Lỗi"],
+        sh_state_rows,
+        col_formats={2: "#,##0.00", 3: "0.00"},
+        right_cols={2, 3},
+        center_cols={1},
+        total_row=[
+            "TỔNG THỜI LƯỢNG 10 SHUTTLE",
+            round(tot_sh_cap / 60.0, 2),
+            100.0 if tot_sh_cap > 0 else 0.0,
+            f"Số lỗi ghi nhận: {tot_faults}",
+        ],
+        auto_filter=False,
+    )
+
+    hour_bar = BarChart()
+    hour_bar.type = "col"
+    hour_bar.grouping = "clustered"
+    hour_bar.style = 10
+    hour_bar.title = "Tần suất nhiệm vụ Nhập / Xuất theo giờ (Kho AS/RS)"
+    hour_bar.x_axis.title = "Khung giờ (1x)"
+    hour_bar.y_axis.title = "Số nhiệm vụ"
+    hour_bar.width = 19.0
+    hour_bar.height = 10.5
+    hr_data = Reference(ws2, min_col=2, max_col=4, min_row=h_hdr_row, max_row=h_last_data_row)
+    hr_cats = Reference(ws2, min_col=1, min_row=h_hdr_row + 1, max_row=h_last_data_row)
+    hour_bar.add_data(hr_data, titles_from_data=True)
+    hour_bar.set_categories(hr_cats)
+    hour_bar.legend.position = "b"
+    ws2.add_chart(hour_bar, f"H{m4_data_start}")
+
+    sh_pie = PieChart()
+    sh_pie.title = f"Trạng thái hoạt động 10 Shuttle (Số lỗi: {tot_faults})"
+    sh_pie.style = 10
+    sh_pie.width = 19.0
+    sh_pie.height = 10.5
+    sh_pie_data = Reference(ws2, min_col=2, min_row=s_hdr_row, max_row=s_last_data_row)
+    sh_pie_cats = Reference(ws2, min_col=1, min_row=s_hdr_row + 1, max_row=s_last_data_row)
+    sh_pie.add_data(sh_pie_data, titles_from_data=True)
+    sh_pie.set_categories(sh_pie_cats)
+    sh_pie.dataLabels = DataLabelList()
+    sh_pie.dataLabels.showPercent = True
+    sh_pie.dataLabels.showVal = True
+    sh_pie.dataLabels.showCatName = False
+    sh_pie.legend.position = "r"
+    ws2.add_chart(sh_pie, f"H{m4_data_start + 19}")
+
+    row = max(left_end_row, m4_data_start + 39)
+
+    row = _style_section(ws2, row, 15, "7. NHẬT KÝ NHIỆM VỤ NHẬP / XUẤT KHO AS/RS (VỊ TRÍ PICK, DROP & TỔNG THỜI GIAN)")
     wh_rows = []
     sum_wh_dur = sum_wh_wait = sum_wh_dist = 0.0
     sum_wh_faults = 0
@@ -1124,9 +1518,6 @@ def export_excel(
         sum_wh_faults += t.get("fault_count", 0)
         wh_rows.append([
             t["task_code"], t["direction"], t["pallet_id"],
-            f"REQ-{t['request_id'] + 1:04d}" if t["request_id"] is not None else (f"JOB-{t['job_id'] + 1:04d}" if t["job_id"] is not None else "-"),
-            f"Dock {t['dock_id']:02d}" if t["dock_id"] is not None else "Có sẵn đầu ca",
-            f"Tầng {t['level']}",
             t.get("pick_location") or "-",
             t.get("drop_location") or t["slot_id"],
             t["shuttle_code"],
@@ -1141,26 +1532,31 @@ def export_excel(
     _write_table(
         ws2, row,
         [
-            "Mã nhiệm vụ", "Loại giao dịch", "Mã Pallet", "Mã Job / Yêu cầu",
-            "Dock nguồn", "Tầng kho", "Vị trí Pick hàng", "Vị trí Drop hàng",
+            "Mã nhiệm vụ", "Loại giao dịch", "Mã Pallet",
+            "Vị trí Pick hàng", "Vị trí Drop hàng",
             "Mã Shuttle", "Bắt đầu", "Kết thúc", "Tổng TG thực hiện",
-            "TG chờ Traffic", "Quãng đường (m)", "Lỗi", "Trạng thái",
+            "TG hàng chờ Shuttle", "Quãng đường (m)", "Lỗi", "Trạng thái",
         ],
         wh_rows,
         col_formats={
-            10: FMT_HMS_TENTH, 11: FMT_HMS_TENTH, 12: FMT_HMS_TENTH,
-            13: FMT_HMS_TENTH, 14: "#,##0.00", 15: "#,##0",
+            7: FMT_HMS_TENTH, 8: FMT_HMS_TENTH, 9: FMT_HMS_TENTH,
+            10: FMT_HMS_TENTH, 11: "#,##0.00", 12: "#,##0",
         },
-        right_cols={10, 11, 12, 13, 14, 15},
-        center_cols={1, 2, 4, 5, 6, 9, 16},
-        status_col=16,
+        right_cols={7, 8, 9, 10, 11, 12},
+        center_cols={1, 2, 6, 13},
+        status_col=13,
         total_row=[
-            "TỔNG CỘNG", f"{len(wh_rows)} nhiệm vụ", "", "", "", "", "", "", "", "", "",
+            "TỔNG CỘNG", f"{len(wh_rows)} nhiệm vụ", "", "", "", "", "", "",
             _excel_days(sum_wh_dur), _excel_days(sum_wh_wait), round(sum_wh_dist, 2), sum_wh_faults, "",
         ],
     )
     ws2.freeze_panes = "A4"
     _fit_columns(ws2)
+    for col_idx in range(8, 16):
+        col_letter = get_column_letter(col_idx)
+        cur_w = ws2.column_dimensions[col_letter].width or 11
+        if cur_w < 14:
+            ws2.column_dimensions[col_letter].width = 14
 
     # ---------------------------------------------------------------- Sheet 3: Khu_Unpack_AGV
     ws3 = wb.create_sheet("Khu_Unpack_AGV")

@@ -35,7 +35,8 @@
     "note":  "CAD constrained prototype. Slots, frames, shared grating, columns and port axes from DWG; process demo uses front-access slots. Not a throughput or contact-dynamics validation.",
     "layout_source":  "design_layout.json",
     "inbound_interval_s":  8.0,
-    "outbound_interval_s":  12.0,
+    "inbound_even_interval_s":  180.0,
+    "outbound_interval_s":  90.0,
     "inbound_pickup_slots":  [
                                  [
                                      -33.485,
@@ -62,7 +63,7 @@
                                      1.5707963268
                                  ]
                              ],
-    "initial_outbound_pallets":  8,
+    "initial_outbound_pallets":  160,
     "agv_acceleration":  0.5,
     "agv_jerk":  1,
     "agv_angular_speed":  0.45,
@@ -141,8 +142,10 @@
     "odd_flow": "w2_spiral",
     "cycle_duration_s": 28800,
     "continuous_mode": true,
+    "warehouse_inbound_target": 150,
+    "warehouse_outbound_target": 300,
     "continuous_extra_pallets": 50,
-    "max_stored_inflight": 65,
+    "max_stored_inflight": 220,
     "agv_initial_battery_pct": 100.0,
     "agv_drain_loaded_pct_per_m": 0.04,
     "agv_drain_empty_pct_per_m": 0.02,

@@ -222,9 +222,10 @@ for i in range(C['jobs']):
     if _use_barcode and str(_seq[i%len(_seq)]).lower()!='even':
         continue
     pallet(f'pallet_{i}',(pickup_position(i)[0],-17,-5,pickup_position(i)[3]))
+_n_js=max(1,len(LAYOUT.job_slots))
 for i in range(C.get('initial_outbound_pallets',0)):
-    xy=LAYOUT.slot_point(LAYOUT.job_slots[i%len(LAYOUT.job_slots)])
-    pallet(f'pallet_out_{i}',xy+(C['storage_levels'][(i+4)%9],0))
+    xy=LAYOUT.slot_point(LAYOUT.job_slots[i%_n_js])
+    pallet(f'pallet_out_{i}',xy+(C['storage_levels'][(i//_n_js+4)%9],0))
 for i in range(max(0,int(C.get('continuous_extra_pallets',0)))):
     pallet(f'pallet_pool_{i}',(pickup_position(i)[0],-17,-5,pickup_position(i)[3]))
 

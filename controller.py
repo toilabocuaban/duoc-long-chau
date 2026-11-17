@@ -224,7 +224,12 @@ FREE_EVEN_PALLETS=asyncio.Queue()
 JOB_PALLET_MODEL={}
 JOB_BAY_IDX={}
 JOB_EVEN_SEQ={}
+JOB_IN_QUEUE_T={}
+REQ_QUEUE_T={}
 MAX_STORED_INFLIGHT=int(C.get('max_stored_inflight',65))
+INBOUND_TARGET=max(0,int(C.get('warehouse_inbound_target',0)))
+OUTBOUND_TARGET=max(0,int(C.get('warehouse_outbound_target',0)))
+INBOUND_EVEN_INTERVAL_S=max(0.0,float(C.get('inbound_even_interval_s',0.0)))
 tracker=SimulationTracker(C,total_jobs=(0 if CONTINUOUS_MODE else (args.jobs if args.jobs is not None else C['jobs'])),cycle_duration_s=CYCLE_DURATION_S,continuous_mode=CONTINUOUS_MODE)
 
 def _pose_changed(old,new):
@@ -535,6 +540,30 @@ async def arrivals(total):
         cont_lock=asyncio.Lock()
         cont_job_seq=0
         cont_even_seq=0
+        even_limit=INBOUND_TARGET if INBOUND_TARGET>0 else None
+        even_released=0 if INBOUND_EVEN_INTERVAL_S>0 else even_limit
+        even_claimed=0
+        def _reserve_even():
+            nonlocal even_claimed
+            even_claimed+=1
+        def _can_even():
+            if FREE_EVEN_PALLETS.empty() or stored.qsize()>=MAX_STORED_INFLIGHT:
+                return False
+            if even_released is not None and even_claimed>=even_released:
+                return False
+            if even_limit is not None and even_claimed>=even_limit:
+                return False
+            return True
+        async def _pace_even_inbound():
+            nonlocal even_released
+            k=0
+            while not STOP_REQUESTED and (even_limit is None or k<even_limit):
+                await engine.until(k*INBOUND_EVEN_INTERVAL_S)
+                if STOP_REQUESTED:break
+                even_released=k+1
+                k+=1
+                await SLOT_COORD.notify()
+        even_pacer=asyncio.create_task(_pace_even_inbound()) if INBOUND_EVEN_INTERVAL_S>0 else None
         async def dock_worker_loop(dock_i):
             nonlocal cont_job_seq,cont_even_seq
             global odd_pallet_seq,max_pending
@@ -545,8 +574,9 @@ async def arrivals(total):
                     nonlocal cont_job_seq,cont_even_seq
                     global odd_pallet_seq,max_pending
                     res=await SLOT_COORD.claim_next(
-                        lambda:(not FREE_EVEN_PALLETS.empty()) and stored.qsize()<MAX_STORED_INFLIGHT,
+                        _can_even,
                         lambda:FREE_CARTONS.qsize()>=LOOSE_PER,
+                        on_even_claim=_reserve_even,
                     )
                     if res is None or STOP_REQUESTED:
                         return None
@@ -571,6 +601,7 @@ async def arrivals(total):
                             send({p_model:bay_pos},transmit=not args.fast)
                             claimed_meta['handed']=True
                             event(job_id,'PICKUP_BAY_LOADED')
+                            JOB_IN_QUEUE_T[job_id]=scheduler.time
                             await in_queue.put(job_id)
                             max_pending=max(max_pending,in_queue.qsize())
                         return ('even',bay_pos,None,receive_even)
@@ -604,10 +635,14 @@ async def arrivals(total):
                     raise
                 batch_k+=1
         n_docks=len(dock_flow.docks) if getattr(dock_flow,'docks',None) else 0
-        if n_docks>0:
-            await asyncio.gather(*(dock_worker_loop(i) for i in range(n_docks)))
-        else:
-            while not STOP_REQUESTED:await asyncio.sleep(0.1)
+        try:
+            if n_docks>0:
+                await asyncio.gather(*(dock_worker_loop(i) for i in range(n_docks)))
+            else:
+                while not STOP_REQUESTED:await asyncio.sleep(0.1)
+        finally:
+            if even_pacer is not None and not even_pacer.done():
+                even_pacer.cancel()
         return
     # Finite runs keep their configured cadence; a pallet is only placed once its pickup bay is empty.
     async def place(job):
@@ -640,7 +675,7 @@ async def arrivals(total):
             nonlocal handed
             send({n:poses[n][:2]+(-5,0) for n in cartons},transmit=not args.fast)
             send({p_model:inbound_pickup_position(job)},transmit=not args.fast)
-            event(job,'PICKUP_BAY_LOADED');handed=True;await in_queue.put(job)
+            event(job,'PICKUP_BAY_LOADED');handed=True;JOB_IN_QUEUE_T[job]=scheduler.time;await in_queue.put(job)
         try:
             if pickup_bays:
                 await pickup_bays[job%len(pickup_bays)].acquire()
@@ -684,6 +719,9 @@ async def agv_worker(lane):
     global stored_count
     job=await in_queue.get();parked=True
     while job is not None:
+        t_in_q=JOB_IN_QUEUE_T.pop(job,None)
+        if t_in_q is not None:
+            tracker.record_stage_wait('pickup_to_agv',max(0.0,scheduler.time-t_in_q))
         t_tw0=scheduler.time
         traffic=dock_flow.gate.agv();await traffic.__aenter__()
         tracker.record_agv_leg(f'agv_{lane}',0.0,False,0.0,wait_s=max(0.0,scheduler.time-t_tw0))
@@ -704,16 +742,29 @@ async def agv_worker(lane):
             # Reserve the inbound port (chain + lift + level buffer) only once the load is on the forks.
             t_pw0=scheduler.time
             await in_ports[lane].acquire()
-            tracker.record_agv_leg(f'agv_{lane}',0.0,True,0.0,wait_s=max(0.0,scheduler.time-t_pw0))
+            in_lift_wait=max(0.0,scheduler.time-t_pw0)
+            tracker.record_agv_leg(f'agv_{lane}',0.0,True,0.0,wait_s=in_lift_wait)
+            tracker.record_lift_wait(il,in_lift_wait)
+            tracker.record_stage_wait('agv_to_in_lift',in_lift_wait)
+            prep_wait_box=[0.0]
             async def prepare(s=s,z=z,level=level,ix=ix):
                 t_sw0=scheduler.time
                 async with shuttles[level]:
-                    tracker.record_shuttle_wait(s,max(0.0,scheduler.time-t_sw0))
+                    prep_wait=max(0.0,scheduler.time-t_sw0)
+                    prep_wait_box[0]=prep_wait
+                    tracker.record_shuttle_wait(s,prep_wait)
                     await shuttle_async(s,(ix,LAYOUT.data['road_y'][0]),z)
             ready=asyncio.create_task(prepare())
             async def lift_down(job=job,il=il,ix=ix,iy=iy):
+                z_dn0=(poses.get(il) or (ix,iy,.3))[2]
+                t_dn0=scheduler.time
                 await engine.move({il:(ix,iy,.3)},C['lift_speed'])
-                await settled(job,il,.3)
+                try:
+                    await settled(job,il,.3)
+                except Exception as exc:
+                    tracker.record_lift_fault(il,str(exc))
+                    raise
+                tracker.record_lift_leg(il,abs(z_dn0-.3),max(0.0,scheduler.time-t_dn0))
             lift_ready=asyncio.create_task(lift_down())
             gate=route_to_gate(lane,ix)
             await follow_async(job,lane,gate[:-1],.2,p)
@@ -749,18 +800,28 @@ async def agv_worker(lane):
                     yaw=start_p[3]+(0.-start_p[3])*u
                     return {p:(start_p[0],start_p[1],start_p[2],yaw)}
                 await engine.move({p:start_p[:3]+(0,)},kind='conveyor',duration=TURNTABLE_S,transform=rotate_turntable,exact=True)
+                tracker.start_lift_task(il,'Nhập kho',f'LF-IN-{job+1:04d}',p)
+                t_lc0=scheduler.time
+                z_up0=(poses.get(il) or (ix,iy,.3))[2]
                 event(job,'CHAIN_TO_INPUT_LIFT')
                 await engine.move({p:(ix,iy,.3,0)},1)
                 event(job,'INPUT_LIFT_ASCEND')
                 await engine.move({il:(ix,iy,z),p:(ix,iy,z,0)},C['lift_speed'])
-                await settled(job,il,z)
+                try:
+                    await settled(job,il,z)
+                except Exception as exc:
+                    tracker.record_lift_fault(il,str(exc))
+                    raise
                 event(job,'INPUT_BUFFER_TRANSFER')
                 await engine.move({p:(bx,by,z,0)},C['conveyor_speed'])
+                tracker.record_lift_leg(il,abs(z-z_up0),max(0.0,scheduler.time-t_lc0))
+                tracker.finish_lift_task(il)
                 event(job,'INPUT_BUFFER_RECEIVE')
                 await ready
                 t_shw=scheduler.time
                 async with shuttles[level]:
                     sh_wait=max(0.0,scheduler.time-t_shw)
+                    tracker.record_stage_wait('buffer_to_in_shuttle',prep_wait_box[0]+sh_wait)
                     slot_seq=even_seq if even_seq is not None else ((job//2) if CONTINUOUS_MODE else job)
                     sid=LAYOUT.job_slots[slot_seq%len(LAYOUT.job_slots)]
                     slot=LAYOUT.slot_point(sid)
@@ -814,7 +875,7 @@ class SlotCoordinator:
         for idx,busy in enumerate(self.loose_busy):
             if not busy:return idx
         return None
-    async def claim_next(self,can_even_fn,can_odd_fn=None):
+    async def claim_next(self,can_even_fn,can_odd_fn=None,on_even_claim=None):
         async with self._c():
             while not STOP_REQUESTED:
                 bay=self._free_bay() if can_even_fn() else None
@@ -832,6 +893,8 @@ class SlotCoordinator:
                 if pick=='even':
                     self.pickup_busy[bay]=True
                     self.last_flow='even'
+                    if on_even_claim is not None:
+                        on_even_claim()
                     return 'even',bay
                 self.loose_busy[spot]=True
                 self.last_flow='odd'
@@ -1935,16 +1998,18 @@ async def loose_goods():
 
 async def requests(total):
     request=0
-    while not STOP_REQUESTED and (total is None or request<total):
+    req_limit=total if total is not None else (OUTBOUND_TARGET if OUTBOUND_TARGET>0 else None)
+    while not STOP_REQUESTED and (req_limit is None or request<req_limit):
         await engine.until(request*C['outbound_interval_s'])
         if total is None:
             while not STOP_REQUESTED and out_queue.qsize()>=8:
                 await engine.until(scheduler.time+0.5)
         if STOP_REQUESTED:break
         event(request,'OUTBOUND_REQUEST_QUEUED')
+        REQ_QUEUE_T[request]=scheduler.time
         await out_queue.put(request)
         request+=1
-    if total is not None:
+    if req_limit is not None:
         for _ in range(2):await out_queue.put(None)
 
 async def outbound_worker(worker):
@@ -1966,9 +2031,14 @@ async def outbound_worker(worker):
             oz=C['output_levels'][floor]+.3
             async with out_ports[worker]:
                 outbound_active+=1
+                t_req_q=REQ_QUEUE_T.pop(request,None)
+                out_lift_wait=max(0.0,scheduler.time-t_req_q) if t_req_q is not None else 0.0
+                tracker.record_lift_wait(ol,out_lift_wait)
+                tracker.record_stage_wait('out_req_to_lift',out_lift_wait)
                 t_shw=scheduler.time
                 async with shuttles[level]:
                     sh_wait=max(0.0,scheduler.time-t_shw)
+                    tracker.record_stage_wait('out_port_to_shuttle',sh_wait)
                     slot_pt=LAYOUT.slot_point(sid)
                     bx,by=out['buffer']
                     wh_pick=f"Ô kệ {sid} ({slot_pt[0]:.2f}, {slot_pt[1]:.2f}, T{level+1})"
@@ -1981,15 +2051,28 @@ async def outbound_worker(worker):
                     await deck_async(s,p,-.06)
                     await shuttle_async(s,(bx,min(LAYOUT.data['road_y'],key=lambda yy:abs(yy-by))),z)
                     tracker.finish_shuttle_task(s,scheduler.time)
+                tracker.start_lift_task(ol,'Xuất kho',f'LF-OUT-{request+1:04d}',p)
+                t_ol0=scheduler.time
+                z_ol0=(poses.get(ol) or (ox,oy,oz))[2]
                 await engine.move({ol:(ox,oy,z)},C['lift_speed'])
-                await settled(job,ol,z)
+                try:
+                    await settled(job,ol,z)
+                except Exception as exc:
+                    tracker.record_lift_fault(ol,str(exc))
+                    raise
                 event(job,'OUTPUT_CABIN_TRANSFER')
                 await engine.move({p:(ox,oy,z,0)},1)
                 event(job,'OUTPUT_LIFT_TO_FLOOR',floor=floor+1)
                 await engine.move({ol:(ox,oy,oz),p:(ox,oy,oz,0)},C['lift_speed'])
-                await settled(job,ol,oz)
+                try:
+                    await settled(job,ol,oz)
+                except Exception as exc:
+                    tracker.record_lift_fault(ol,str(exc))
+                    raise
                 event(job,'OUTPUT_GATE_TRANSFER')
                 await engine.move({p:tuple(out['corner'])+(oz,0)},1)
+                tracker.record_lift_leg(ol,abs(z-z_ol0)+abs(oz-z),max(0.0,scheduler.time-t_ol0))
+                tracker.finish_lift_task(ol)
                 await engine.move({p:tuple(out['gate'])+(oz,0)},1)
                 event(job,'PALLET_EXIT_GATE')
                 spots=UNPACK_SPOTS[worker]
@@ -2119,8 +2202,9 @@ async def main():
                 anim_ops.update(LG.operator_pose(LG.p1_worker_id(f,st_idx),wx,wy,wyaw,z0=wz))
         anim_ops.update(LG.operator_pose(500,-31.91375,-1.26,-math.pi/2,z0=0.))
         send(anim_ops,transmit=False)
+    _n_js=max(1,len(LAYOUT.job_slots))
     for i in range(C.get('initial_outbound_pallets',0)):
-        level=(i+4)%9;sid=LAYOUT.job_slots[i%len(LAYOUT.job_slots)];p=f'pallet_out_{i}'
+        level=(i//_n_js+4)%9;sid=LAYOUT.job_slots[i%_n_js];p=f'pallet_out_{i}'
         poses[p]=LAYOUT.slot_point(sid)+(C['storage_levels'][level],0)
         await stored.put((C['jobs']+i,level,sid,i%2,p))
     dock_flow.initialize()
