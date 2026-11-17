@@ -13,3 +13,7 @@ assets/*.stl
 four-floor.sdf
 four-floor.log
 verified-result.json
+previews/truck-review/review.sdf
+previews/truck-review/detail/
+previews/truck-review/layout/
+reports/

@@ -46,9 +46,13 @@ def shuttle_body(i,box,cylinder,chamfer):
     v.extend([box('id_plate',0,-.563,-.075,.30,.012,.115,WHITE),*digits(box,'id',f'{i+1:02}',0,-.573,-.075,.043)])
     for x in [-.58,.58]:
         for y in [-.40,.40]: v.append(cylinder(f'case_bolt{x}{y}',x,y,-.028,.014,.012,STEEL))
-    return fit_cad_lane(v)
+    v=fit_cad_lane(v)
+    return BATCH_BOXES(f'shuttle_body_{i}',v) if BATCH_BOXES is not None else v
 
+_DECK_CACHE=None
 def shuttle_deck(box,cylinder):
+    global _DECK_CACHE
+    if BATCH_BOXES is not None and _DECK_CACHE is not None: return list(_DECK_CACHE)
     v=[box('black_deck',0,0,-.025,1.13,.88,.04,DARK)]
     for y in [-.30,.30]:
         v.append(box(f'panel_seam{y}',0,y,-.003,1.08,.007,.003,'.16 .18 .19 1'))
@@ -56,7 +60,11 @@ def shuttle_deck(box,cylinder):
     for x in [-.40,.40]:
         v.append(box(f'lift_crossmember{x}',x,0,-.075,.08,.73,.05,STEEL))
         for y in [-.28,.28]: v.append(cylinder(f'lift_plunger{x}{y}',x,y,-.105,.025,.08,STEEL))
-    return fit_cad_lane(v)
+    v=fit_cad_lane(v)
+    if BATCH_BOXES is not None:
+        _DECK_CACHE=tuple(BATCH_BOXES('shuttle_deck',v))
+        return list(_DECK_CACHE)
+    return v
 
 def chain_conveyor(box,cylinder,length=2,width=1.35,axis='y',height=.3,legs=True):
     """Two-strand chain conveyor. Local z=0 is the pallet support surface."""
@@ -101,13 +109,13 @@ def chain_conveyor(box,cylinder,length=2,width=1.35,axis='y',height=.3,legs=True
         v=rotated
     if BATCH_BOXES is not None:
         import hashlib
-        cubes=[item for item in v if ET.fromstring(item).find('geometry/box') is not None]
-        other=[item for item in v if ET.fromstring(item).find('geometry/box') is None]
-        v=other+BATCH_BOXES('chain_'+hashlib.sha1(repr(key).encode()).hexdigest()[:12],cubes)
+        v=BATCH_BOXES('chain_'+hashlib.sha1(repr(key).encode()).hexdigest()[:12],v)
     _CHAIN_CACHE[key]=tuple(v)
     return list(v)
 
+_WHEEL_CACHE={}
 def shuttle_wheels(axis,box,cylinder):
+    if BATCH_BOXES is not None and axis in _WHEEL_CACHE: return list(_WHEEL_CACHE[axis])
     v=[]
     for x in [-.48,.48]:
         for y in [-.49,.49]:
@@ -115,6 +123,9 @@ def shuttle_wheels(axis,box,cylinder):
             v.extend([cylinder(f'tyre{x}{y}',x,y,-.16,.105,.08,DARK,roll,pitch),
                       cylinder(f'flange{x}{y}',x,y,-.16,.105,.025,STEEL,roll,pitch),
                       cylinder(f'hub{x}{y}',x+(math.copysign(.05,x) if axis=='y' else 0),y+(math.copysign(.05,y) if axis=='x' else 0),-.16,.052,.018,STEEL,roll,pitch)])
+    if BATCH_BOXES is not None:
+        _WHEEL_CACHE[axis]=tuple(BATCH_BOXES(f'shuttle_wheels_{axis}',v))
+        return list(_WHEEL_CACHE[axis])
     return v
 
 def tower(prefix,box,cylinder,strut):
@@ -143,9 +154,12 @@ def tower(prefix,box,cylinder,strut):
     for i,color in enumerate(['.16 .7 .3 1','.95 .2 .08 1']):v.append(box(f'button{i}',1.55+i*.14,-.80,.93,.045,.015,.045,color))
     ident=int(prefix[-1])+1+(2 if prefix.startswith('out') else 0)
     v.extend([box('lift_id_plate',0,-1.21,17.3,.86,.035,.50,BLUE),box('lift_id_background',0,-1.235,17.3,.70,.01,.39,WHITE),*digits(box,'lift_id',f'{ident:02}',0,-1.245,17.3,.14)])
-    return v
+    return BATCH_BOXES(f'tower_{prefix}',v) if BATCH_BOXES is not None else v
 
+_CABIN_CACHE=None
 def cabin(box,cylinder,roller_deck):
+    global _CABIN_CACHE
+    if BATCH_BOXES is not None and _CABIN_CACHE is not None: return list(_CABIN_CACHE)
     v=roller_deck('cabin')
     for x in [-.94,.94]:
         for y in [-.91,.91]:v.append(box(f'cabin_post{x}{y}',x,y,.91,.085,.085,2.02,STEEL))
@@ -160,7 +174,17 @@ def cabin(box,cylinder,roller_deck):
         v.append(box(f'side_guard{x}',x,0,.14,.045,1.5,.22,STEEL))
         for y in [-.62,.62]:v.append(box(f'photoeye{x}{y}',x,y,.24,.08,.08,.08,DARK))
     v.append(box('cabin_base',0,0,-.48,1.8,1.8,.12,BLUE))
+    if BATCH_BOXES is not None:
+        _CABIN_CACHE=tuple(BATCH_BOXES('lift_cabin',v))
+        return list(_CABIN_CACHE)
     return v
 
+_CW_CACHE=None
 def counterweight(box):
-    return [box('weight_stack',0,0,0,.18,.64,1.05,'.28 .31 .34 1')]+[box(f'weight_seam{k}',.098,0,-.45+k*.15,.01,.60,.012,DARK) for k in range(7)]
+    global _CW_CACHE
+    if BATCH_BOXES is not None and _CW_CACHE is not None: return list(_CW_CACHE)
+    v=[box('weight_stack',0,0,0,.18,.64,1.05,'.28 .31 .34 1')]+[box(f'weight_seam{k}',.098,0,-.45+k*.15,.01,.60,.012,DARK) for k in range(7)]
+    if BATCH_BOXES is not None:
+        _CW_CACHE=tuple(BATCH_BOXES('lift_cw',v))
+        return list(_CW_CACHE)
+    return v
