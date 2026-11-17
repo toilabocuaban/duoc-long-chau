@@ -133,7 +133,7 @@ class ReportExporterTests(unittest.TestCase):
                 ["Tong_Quan", "Kho_ASRS_Shuttle", "Khu_Unpack_AGV", "Khu_Vuc_Dock", "Cong_Nhan_Unpack", "Chi_Tiet_Nhiem_Vu_AGV_Kho"],
             )
             ws_sh = wb["Kho_ASRS_Shuttle"]
-            self.assertEqual(len(ws_sh._charts), 2)
+            self.assertEqual(len(ws_sh._charts), 3)
             sh_text = "\n".join(str(c.value) for row in ws_sh.iter_rows(values_only=False) for c in row if c.value is not None)
             self.assertIn("WH-IN-0001", sh_text)
             self.assertIn("WH-OUT-0001", sh_text)
@@ -227,16 +227,25 @@ class ReportExporterTests(unittest.TestCase):
         tracker = SimulationTracker(self.config, total_jobs=10, cycle_duration_s=10800.0)
         # Hour 1 (0..3600s): 3 tasks -> Peak hour
         for idx, (sid, start_s) in enumerate([("shuttle_0", 120.0), ("shuttle_1", 900.0), ("shuttle_2", 2400.0)]):
-            tracker.start_shuttle_task(sid, "Nhập kho", f"WH-IN-{idx + 1:04d}", f"pallet_{idx}", idx, f"S10{idx + 1}", start_s)
+            tracker.start_shuttle_task(
+                sid, "Nhập kho", f"WH-IN-{idx + 1:04d}", f"pallet_{idx}", idx, f"S10{idx + 1}", start_s,
+                lift_id=f"in_lift_{idx % 2}", lift_wait_s=4.5, process_start_s=start_s - 4.5,
+            )
             tracker.record_shuttle_leg(sid, 20.0, 60.0)
             if sid == "shuttle_2":
                 tracker.record_shuttle_fault(sid, "Test sensor glitch")
             tracker.finish_shuttle_task(sid, start_s + 60.0)
         # Hour 2 (3600..7200s): 0 tasks -> Quietest hour
-        # Hour 3 (7200..10800s): 1 task
-        tracker.start_shuttle_task("shuttle_0", "Xuất kho", "WH-OUT-0001", "pallet_0", 0, "S101", 7500.0)
+        # Hour 3 (7200..10800s): 1 task (end-to-end outbound process test)
+        out_rec = tracker.start_shuttle_task(
+            "shuttle_0", "Xuất kho", "WH-OUT-0001", "pallet_0", 0, "S101", 7520.0,
+            lift_id="out_lift_0", lift_wait_s=20.0, process_start_s=7500.0, keep_process_open=True,
+        )
         tracker.record_shuttle_leg("shuttle_0", 18.0, 120.0)
-        tracker.finish_shuttle_task("shuttle_0", 7620.0)
+        tracker.finish_shuttle_task("shuttle_0", 7640.0)
+        tracker.finish_warehouse_process(out_rec, 7690.0, extra_lift_wait_s=5.0)
+        self.assertAlmostEqual(out_rec["lift_wait_s"], 25.0, places=2)
+        self.assertAlmostEqual(out_rec["duration_s"], 190.0, places=2)
 
         # Exercise all 4 lifts + 1 fault on out_lift_1
         tracker.start_lift_task("in_lift_0", "Nhập kho", "LF-IN-0001", "pallet_0")
@@ -277,17 +286,72 @@ class ReportExporterTests(unittest.TestCase):
             wb = load_workbook(paths["latest"])
             ws1_text = "\n".join(str(c.value) for row in wb["Tong_Quan"].iter_rows(values_only=False) for c in row if c.value is not None)
             self.assertIn("Thông số Shuttle cài đặt", ws1_text)
+            self.assertIn("Thông số Thang nâng cài đặt", ws1_text)
             ws = wb["Kho_ASRS_Shuttle"]
-            self.assertEqual(len(ws._charts), 2)
-            chart_map = {type(c).__name__: c for c in ws._charts}
-            self.assertEqual(sorted(chart_map.keys()), ["BarChart", "PieChart"])
-            self.assertIn("theo giờ", str(chart_map["BarChart"].title.tx.rich.p[0].r[0].t))
-            self.assertIn("Shuttle", str(chart_map["PieChart"].title.tx.rich.p[0].r[0].t))
+            self.assertEqual(len(ws._charts), 3)
+            chart_types = sorted(type(c).__name__ for c in ws._charts)
+            self.assertEqual(chart_types, ["BarChart", "BarChart", "PieChart"])
+            bar_charts = [c for c in ws._charts if type(c).__name__ == "BarChart"]
+            pie_chart = next(c for c in ws._charts if type(c).__name__ == "PieChart")
+            self.assertIn("theo giờ", str(bar_charts[0].title.tx.rich.p[0].r[0].t))
+            self.assertEqual(bar_charts[1].y_axis.scaling.min, 0)
+            self.assertEqual(bar_charts[1].y_axis.scaling.max, 100)
+            self.assertIn("9 Shuttle", str(pie_chart.title.tx.rich.p[0].r[0].t))
+            self.assertEqual(pie_chart.legend.position, "b")
+
+            # Verify 3 charts are placed at the top beside Table 1 / Table 2 (E5, H5, E21)
+            self.assertEqual((bar_charts[0].anchor._from.col, bar_charts[0].anchor._from.row), (4, 4))
+            self.assertEqual((pie_chart.anchor._from.col, pie_chart.anchor._from.row), (7, 4))
+            self.assertEqual((bar_charts[1].anchor._from.col, bar_charts[1].anchor._from.row), (4, 20))
+
+            # Verify Section 1 Cách A headers, separated metric rows, and clear queue labels
+            self.assertEqual(
+                [ws.cell(5, c).value for c in range(1, 5)],
+                ["Nhóm thiết bị", "Chỉ tiêu thống kê", "Giá trị", "Đơn vị / Diễn giải"],
+            )
+            sec1_metrics = {ws.cell(r, 2).value: ws.cell(r, 3).value for r in range(6, 20)}
+            for required_label in (
+                "Tổng thời gian vận hành kho (1x chuẩn)",
+                "Tổng nhiệm vụ Shuttle - Nhập kho",
+                "Tổng nhiệm vụ Shuttle - Xuất kho",
+                "Tổng quãng đường 10 Shuttle",
+                "Tỉ lệ TB Shuttle hoạt động",
+                "Tỉ lệ TB Shuttle đứng chơi",
+                "Tổng thời gian hàng chờ Shuttle",
+                "Tổng số lỗi Shuttle",
+                "Tổng hàng qua 4 Thang nâng - Nhập kho",
+                "Tổng hàng qua 4 Thang nâng - Xuất kho",
+                "Tỉ lệ TB 4 Thang nâng hoạt động",
+                "Tỉ lệ TB 4 Thang nâng nghỉ",
+                "Tổng thời gian hàng chờ Thang nâng",
+                "Tổng số lỗi Thang nâng",
+            ):
+                self.assertIn(required_label, sec1_metrics)
+            self.assertEqual(sec1_metrics["Tổng nhiệm vụ Shuttle - Nhập kho"], 3)
+            self.assertEqual(sec1_metrics["Tổng nhiệm vụ Shuttle - Xuất kho"], 1)
+            self.assertEqual(sec1_metrics["Tổng hàng qua 4 Thang nâng - Nhập kho"], 2)
+            self.assertEqual(sec1_metrics["Tổng hàng qua 4 Thang nâng - Xuất kho"], 2)
+            self.assertEqual(sec1_metrics["Tổng số lỗi Shuttle"], 1)
+            self.assertEqual(sec1_metrics["Tổng số lỗi Thang nâng"], 1)
+            for k_lbl, val in sec1_metrics.items():
+                self.assertNotIn("|", str(val))
+                if k_lbl != "Tổng thời gian vận hành kho (1x chuẩn)":
+                    self.assertNotIn("/", str(val))
+
+            # Verify Section 2 banner stops at D (no merge across E..J behind charts) and Section 3 starts below E21 chart
+            sec2_merges = [rng for rng in ws.merged_cells.ranges if rng.min_row == 21 and rng.max_row == 21]
+            self.assertEqual(len(sec2_merges), 1)
+            self.assertEqual((sec2_merges[0].min_col, sec2_merges[0].max_col), (1, 4))
+            sec3_row = next(
+                r for r in range(1, ws.max_row + 1)
+                if str(ws.cell(r, 1).value or "").startswith("3. BẢNG TỔNG HỢP")
+            )
+            self.assertGreaterEqual(sec3_row, 36)
 
             text = "\n".join(str(c.value) for row in ws.iter_rows(values_only=False) for c in row if c.value is not None)
             for expected in (
-                "THÔNG SỐ SHUTTLE CÀI ĐẶT",
-                "shuttle_speed", "shuttle_turn_s", "shuttle_positioning_s", "shuttle_lift_s",
+                "THÔNG SỐ CÀI ĐẶT SHUTTLE & THANG NÂNG",
+                "shuttle_speed", "lift_speed", "lift_settle_s", "80.0% / 80.0%",
                 "Thang Nhập 1", "Thang Nhập 2", "Thang Xuất 1", "Thang Xuất 2",
                 "TG hàng chờ Thang", "Chờ TB / lượt (s)", "TG hàng chờ Shuttle",
                 "1. Hàng chờ Ô Pickup -> AGV nhận hàng (Nhập)",
@@ -298,10 +362,21 @@ class ReportExporterTests(unittest.TestCase):
                 "LF-IN-0001", "LF-IN-0002", "LF-OUT-0001", "LF-OUT-0002",
                 "Giờ 1 (00:00-01:00)", "Giờ 2 (01:00-02:00)", "Giờ 3 (02:00-03:00)",
                 "Bận rộn nhất (Cao điểm)", "Rảnh nhất (Thấp điểm)",
-                "Trạng thái 10 Shuttle", "Đang hoạt động (Chạy nhiệm vụ)",
-                "Chờ Traffic / Khóa tầng", "Nghỉ / Chờ lệnh & Dự phòng",
+                "Trạng thái 9 Shuttle chính", "Đang hoạt động (Chạy nhiệm vụ)", "Nghỉ / Chờ lệnh",
+                "Thiết bị Kho AS/RS", "Tỉ lệ hoạt động (%)",
+                "Mã quy trình", "Mã Thang nâng", "Mã Shuttle",
+                "Thời điểm bắt đầu", "TG hàng đợi Thang nâng", "TG hàng đợi Shuttle",
+                "Thời điểm kết thúc", "Tổng TG quy trình",
             ):
                 self.assertIn(expected, text)
+
+            # Verify removed columns from Section 4 (4 Lifts)
+            for row_vals in ws.iter_rows(values_only=True):
+                if row_vals and row_vals[0] == "Mã Thang nâng":
+                    hdrs = [v for v in row_vals if v is not None]
+                    self.assertNotIn("Số hàng nhập", hdrs)
+                    self.assertNotIn("Số hàng xuất", hdrs)
+                    break
 
     def test_eight_hour_150_in_300_out_configuration(self):
         self.assertEqual(self.config["cycle_duration_s"], 28800)
@@ -314,7 +389,7 @@ class ReportExporterTests(unittest.TestCase):
         self.assertGreater(self.config["max_stored_inflight"], self.config["initial_outbound_pallets"])
         from cad_navigation import LAYOUT
         n_js = len(LAYOUT.job_slots)
-        cells = {((i // n_js + 4) % 9, LAYOUT.job_slots[i % n_js]) for i in range(self.config["initial_outbound_pallets"])}
+        cells = {((i + 4) % 9, LAYOUT.job_slots[(i // 9) % n_js]) for i in range(self.config["initial_outbound_pallets"])}
         self.assertEqual(len(cells), self.config["initial_outbound_pallets"])
 
 

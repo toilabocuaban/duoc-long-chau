@@ -131,6 +131,7 @@ def _init_z05_floor_state():
             'zones':{0:None,1:None},
             'next_u2':0,
             'u2_active_task':{u2_idx:None for u2_idx in range(len(LG.U2_WORKERS))},
+            'u2_reserved':{u2_idx:False for u2_idx in range(len(LG.U2_WORKERS))},
             'worker_tasks':{0:None,1:None},
             'worker_poses':w_poses,
         }
@@ -445,6 +446,8 @@ reservations={}
 # One pallet per inbound pickup bay: an arrival waits until the AGV has carried the previous load away.
 pickup_bays=[asyncio.Semaphore(1) for _ in INBOUND_PICKUP_SLOTS]
 in_ports=[asyncio.Lock() for _ in range(2)];out_ports=[asyncio.Lock() for _ in range(2)]
+out_buffers={(w,lvl):asyncio.Lock() for w in range(2) for lvl in range(9)}
+out_floor_gates={(w,fl):asyncio.Lock() for w in range(2) for fl in range(4)}
 shuttles=[asyncio.Lock() for _ in range(9)]
 in_queue=asyncio.Queue();stored=asyncio.Queue();out_queue=asyncio.Queue()
 inbound_active=0;outbound_active=0
@@ -827,7 +830,12 @@ async def agv_worker(lane):
                     slot=LAYOUT.slot_point(sid)
                     wh_pick=f"Bàn đệm Nhập {lane+1} ({bx:.2f}, {by:.2f}, T{level+1})"
                     wh_drop=f"Ô kệ {sid} ({slot[0]:.2f}, {slot[1]:.2f}, T{level+1})"
-                    tracker.start_shuttle_task(s,'Nhập kho',f'WH-IN-{job+1:04d}',p,level,sid,scheduler.time,job_id=job,pick_location=wh_pick,drop_location=wh_drop,wait_s=sh_wait)
+                    tracker.start_shuttle_task(
+                        s,'Nhập kho',f'WH-IN-{job+1:04d}',p,level,sid,scheduler.time,
+                        job_id=job,pick_location=wh_pick,drop_location=wh_drop,wait_s=sh_wait,
+                        lift_id=il,lift_wait_s=in_lift_wait,process_start_s=t_pw0,
+                        process_shuttle_wait_s=prep_wait_box[0]+sh_wait,
+                    )
                     await shuttle_async(s,inp['buffer'],z)
                     await deck_async(s,p,.12)
                     in_ports[lane].release()
@@ -1542,17 +1550,33 @@ async def z05_worker_loop(floor,worker_idx):
                     break
                 carton,stack_pos=batch['items'].pop(0)
                 u2_idx=None
-                for k in range(n_u2):
-                    cand=(fst['next_u2']+k)%n_u2
-                    t_cand=fst['u2_active_task'][cand]
-                    if t_cand is None or t_cand.done():
-                        u2_idx=cand
-                        fst['next_u2']=(cand+1)%n_u2
+                while u2_idx is None and not STOP_REQUESTED:
+                    for k in range(n_u2):
+                        cand=(fst['next_u2']+k)%n_u2
+                        t_cand=fst['u2_active_task'][cand]
+                        if (not fst['u2_reserved'][cand]) and (t_cand is None or t_cand.done()):
+                            u2_idx=cand
+                            fst['u2_reserved'][cand]=True
+                            fst['next_u2']=(cand+1)%n_u2
+                            break
+                    if u2_idx is not None:
                         break
-                if u2_idx is None:
-                    u2_idx=fst['next_u2']%n_u2
-                    fst['next_u2']=(u2_idx+1)%n_u2
-                await z05_operator_deliver_one(floor,worker_idx,batch,carton,stack_pos,u2_idx)
+                    pending=[t for t in fst['u2_active_task'].values() if t is not None and not t.done()]
+                    if pending:
+                        await asyncio.wait(pending,return_when=asyncio.FIRST_COMPLETED)
+                    elif any(fst['u2_reserved'].values()):
+                        await engine.until(scheduler.time+0.2)
+                    else:
+                        u2_idx=fst['next_u2']%n_u2
+                        fst['u2_reserved'][u2_idx]=True
+                        fst['next_u2']=(u2_idx+1)%n_u2
+                        break
+                if u2_idx is None or STOP_REQUESTED:
+                    break
+                try:
+                    await z05_operator_deliver_one(floor,worker_idx,batch,carton,stack_pos,u2_idx)
+                finally:
+                    fst['u2_reserved'][u2_idx]=False
             sx,sy,syaw,_=LG.z05_station(floor,worker_idx)
             state=fst['worker_poses'][worker_idx]
             if math.hypot(sx-state['x'],sy-state['y'])>1e-3:
@@ -2013,86 +2037,148 @@ async def requests(total):
         for _ in range(2):await out_queue.put(None)
 
 async def outbound_worker(worker):
-    global completed,outbound_active
-    while not STOP_REQUESTED:
-        request=await out_queue.get()
-        if request is None:return
+    inflight_sem=asyncio.Semaphore(8)
+    active_tasks=set()
+    async def _run_outbound_request(request):
+        global completed,outbound_active
         target_floor=None;claimed_spot_idx=None;spot_handed=False
+        wh_rec=None
         try:
             if CONTINUOUS_MODE:
                 claimed=await _claim_z05_spot(worker)
                 if claimed is None or STOP_REQUESTED:return
                 target_floor,claimed_spot_idx=claimed
             job,level,sid,lane,p=await stored.get()
+            if STOP_REQUESTED:return
             if CONTINUOUS_MODE:await SLOT_COORD.notify()
             floor=(target_floor-1) if target_floor is not None else (job%4)
             s=f'shuttle_{level}';z=C['storage_levels'][level]
             out=LAYOUT.data['ports']['out'][worker];ox,oy=out['lift'];ol=f'out_lift_{worker}'
             oz=C['output_levels'][floor]+.3
-            async with out_ports[worker]:
-                outbound_active+=1
-                t_req_q=REQ_QUEUE_T.pop(request,None)
-                out_lift_wait=max(0.0,scheduler.time-t_req_q) if t_req_q is not None else 0.0
-                tracker.record_lift_wait(ol,out_lift_wait)
-                tracker.record_stage_wait('out_req_to_lift',out_lift_wait)
-                t_shw=scheduler.time
-                async with shuttles[level]:
-                    sh_wait=max(0.0,scheduler.time-t_shw)
-                    tracker.record_stage_wait('out_port_to_shuttle',sh_wait)
-                    slot_pt=LAYOUT.slot_point(sid)
-                    bx,by=out['buffer']
-                    wh_pick=f"Ô kệ {sid} ({slot_pt[0]:.2f}, {slot_pt[1]:.2f}, T{level+1})"
-                    wh_drop=f"Bàn đệm Xuất {worker+1} ({bx:.2f}, {by:.2f}, T{level+1})"
-                    tracker.start_shuttle_task(s,'Xuất kho',f'WH-OUT-{request+1:04d}',p,level,sid,scheduler.time,job_id=job,request_id=request,pick_location=wh_pick,drop_location=wh_drop,wait_s=sh_wait)
-                    event(job,'OUTBOUND_DISPATCH',request=request)
-                    await shuttle_async(s,slot_pt,z)
-                    await deck_async(s,p,.12)
-                    await shuttle_async(s,out['buffer'],z,p)
-                    await deck_async(s,p,-.06)
-                    await shuttle_async(s,(bx,min(LAYOUT.data['road_y'],key=lambda yy:abs(yy-by))),z)
-                    tracker.finish_shuttle_task(s,scheduler.time)
-                tracker.start_lift_task(ol,'Xuất kho',f'LF-OUT-{request+1:04d}',p)
-                t_ol0=scheduler.time
-                z_ol0=(poses.get(ol) or (ox,oy,oz))[2]
-                await engine.move({ol:(ox,oy,z)},C['lift_speed'])
+            outbound_active+=1
+            try:
+                buf_lock=out_buffers[(worker,level)]
+                buf_released=False
+                gate_lock=out_floor_gates[(worker,floor)]
+                gate_held=False
+                await buf_lock.acquire()
                 try:
-                    await settled(job,ol,z)
-                except Exception as exc:
-                    tracker.record_lift_fault(ol,str(exc))
-                    raise
-                event(job,'OUTPUT_CABIN_TRANSFER')
-                await engine.move({p:(ox,oy,z,0)},1)
-                event(job,'OUTPUT_LIFT_TO_FLOOR',floor=floor+1)
-                await engine.move({ol:(ox,oy,oz),p:(ox,oy,oz,0)},C['lift_speed'])
+                    t_req_q=REQ_QUEUE_T.pop(request,None)
+                    pre_lift_wait=max(0.0,scheduler.time-t_req_q) if t_req_q is not None else 0.0
+                    t_shw=scheduler.time
+                    async with shuttles[level]:
+                        sh_wait=max(0.0,scheduler.time-t_shw)
+                        tracker.record_stage_wait('out_port_to_shuttle',sh_wait)
+                        slot_pt=LAYOUT.slot_point(sid)
+                        bx,by=out['buffer']
+                        wh_pick=f"Ô kệ {sid} ({slot_pt[0]:.2f}, {slot_pt[1]:.2f}, T{level+1})"
+                        wh_drop=f"Bàn đệm Xuất {worker+1} ({bx:.2f}, {by:.2f}, T{level+1})"
+                        wh_rec=tracker.start_shuttle_task(
+                            s,'Xuất kho',f'WH-OUT-{request+1:04d}',p,level,sid,scheduler.time,
+                            job_id=job,request_id=request,pick_location=wh_pick,drop_location=wh_drop,
+                            wait_s=sh_wait,lift_id=ol,lift_wait_s=pre_lift_wait,
+                            process_start_s=(t_req_q if t_req_q is not None else scheduler.time),
+                            keep_process_open=True,
+                        )
+                        event(job,'OUTBOUND_DISPATCH',request=request)
+                        await shuttle_async(s,slot_pt,z)
+                        await deck_async(s,p,.12)
+                        await shuttle_async(s,out['buffer'],z,p)
+                        await deck_async(s,p,-.06)
+                        await shuttle_async(s,(bx,min(LAYOUT.data['road_y'],key=lambda yy:abs(yy-by))),z)
+                        tracker.finish_shuttle_task(s,scheduler.time)
+                    t_port_w0=scheduler.time
+                    await out_ports[worker].acquire()
+                    port_held=True
+                    try:
+                        port_wait=max(0.0,scheduler.time-t_port_w0)
+                        total_lift_wait=pre_lift_wait+port_wait
+                        tracker.record_lift_wait(ol,total_lift_wait)
+                        tracker.record_stage_wait('out_req_to_lift',total_lift_wait)
+                        tracker.start_lift_task(ol,'Xuất kho',f'LF-OUT-{request+1:04d}',p)
+                        t_ol0=scheduler.time
+                        z_ol0=(poses.get(ol) or (ox,oy,oz))[2]
+                        await engine.move({ol:(ox,oy,z)},C['lift_speed'])
+                        try:
+                            await settled(job,ol,z)
+                        except Exception as exc:
+                            tracker.record_lift_fault(ol,str(exc))
+                            tracker.finish_warehouse_process(wh_rec,scheduler.time,extra_lift_wait_s=port_wait,fault_count_add=1)
+                            raise
+                        event(job,'OUTPUT_CABIN_TRANSFER')
+                        await engine.move({p:(ox,oy,z,0)},1)
+                        # Pallet has cleared the tier buffer conveyor into the lift cabin.
+                        buf_lock.release()
+                        buf_released=True
+                        event(job,'OUTPUT_LIFT_TO_FLOOR',floor=floor+1)
+                        await engine.move({ol:(ox,oy,oz),p:(ox,oy,oz,0)},C['lift_speed'])
+                        try:
+                            await settled(job,ol,oz)
+                        except Exception as exc:
+                            tracker.record_lift_fault(ol,str(exc))
+                            tracker.finish_warehouse_process(wh_rec,scheduler.time,extra_lift_wait_s=port_wait,fault_count_add=1)
+                            raise
+                        await gate_lock.acquire()
+                        gate_held=True
+                        event(job,'OUTPUT_GATE_TRANSFER')
+                        await engine.move({p:tuple(out['corner'])+(oz,0)},1)
+                        tracker.record_lift_leg(ol,abs(z-z_ol0)+abs(oz-z),max(0.0,scheduler.time-t_ol0))
+                        tracker.finish_lift_task(ol)
+                        tracker.finish_warehouse_process(wh_rec,scheduler.time,extra_lift_wait_s=port_wait)
+                    finally:
+                        if port_held:
+                            out_ports[worker].release()
+                finally:
+                    if not buf_released:
+                        buf_lock.release()
                 try:
-                    await settled(job,ol,oz)
-                except Exception as exc:
-                    tracker.record_lift_fault(ol,str(exc))
-                    raise
-                event(job,'OUTPUT_GATE_TRANSFER')
-                await engine.move({p:tuple(out['corner'])+(oz,0)},1)
-                tracker.record_lift_leg(ol,abs(z-z_ol0)+abs(oz-z),max(0.0,scheduler.time-t_ol0))
-                tracker.finish_lift_task(ol)
-                await engine.move({p:tuple(out['gate'])+(oz,0)},1)
-                event(job,'PALLET_EXIT_GATE')
-                spots=UNPACK_SPOTS[worker]
-                if claimed_spot_idx is not None:
-                    spot_idx=claimed_spot_idx
-                    spot=spots[spot_idx]
-                    unpack_occupant[(worker,floor,spot_idx)]=p
-                else:
-                    k=unpack_count.get((worker,floor),0);unpack_count[(worker,floor)]=k+1
-                    spot_idx=k%len(spots);spot=spots[spot_idx];prev=unpack_occupant.pop((worker,floor,spot_idx),None)
-                    if prev and math.dist(poses.get(prev,(0,0,-5))[:3],(spot[0],spot[1],oz))<0.6:send({prev:(spot[0],spot[1],-5,0)},transmit=not args.fast)
-                    unpack_occupant[(worker,floor,spot_idx)]=p
-                await engine.move({p:(spot[0],spot[1],oz,0)},1)
-                event(job,'UNPACK_SPOT',spot=spot_idx,floor=floor+1)
-                spot_handed=True
-                background_tasks.append(asyncio.create_task(z05_unpack_pallet(floor+1,worker,spot,p,job,spot_idx=claimed_spot_idx)))
-                event(job,'COMPLETE');completed+=1;outbound_active-=1
+                    await engine.move({p:tuple(out['gate'])+(oz,0)},1)
+                    event(job,'PALLET_EXIT_GATE')
+                    spots=UNPACK_SPOTS[worker]
+                    if claimed_spot_idx is not None:
+                        spot_idx=claimed_spot_idx
+                        spot=spots[spot_idx]
+                        unpack_occupant[(worker,floor,spot_idx)]=p
+                    else:
+                        k=unpack_count.get((worker,floor),0);unpack_count[(worker,floor)]=k+1
+                        spot_idx=k%len(spots);spot=spots[spot_idx];prev=unpack_occupant.pop((worker,floor,spot_idx),None)
+                        if prev and math.dist(poses.get(prev,(0,0,-5))[:3],(spot[0],spot[1],oz))<0.6:send({prev:(spot[0],spot[1],-5,0)},transmit=not args.fast)
+                        unpack_occupant[(worker,floor,spot_idx)]=p
+                    await engine.move({p:(spot[0],spot[1],oz,0)},1)
+                    event(job,'UNPACK_SPOT',spot=spot_idx,floor=floor+1)
+                    spot_handed=True
+                    background_tasks.append(asyncio.create_task(z05_unpack_pallet(floor+1,worker,spot,p,job,spot_idx=claimed_spot_idx)))
+                    event(job,'COMPLETE');completed+=1
+                finally:
+                    if gate_held:
+                        gate_lock.release()
+            finally:
+                outbound_active-=1
         finally:
             if claimed_spot_idx is not None and target_floor is not None and not spot_handed:
                 await _release_z05_spot(target_floor,worker,claimed_spot_idx)
+            inflight_sem.release()
+    try:
+        while not STOP_REQUESTED:
+            await inflight_sem.acquire()
+            if STOP_REQUESTED:
+                inflight_sem.release()
+                break
+            request=await out_queue.get()
+            if request is None:
+                inflight_sem.release()
+                break
+            t=asyncio.create_task(_run_outbound_request(request))
+            active_tasks.add(t)
+            t.add_done_callback(active_tasks.discard)
+        if active_tasks:
+            await asyncio.gather(*active_tasks,return_exceptions=True)
+    except asyncio.CancelledError:
+        for t in list(active_tasks):
+            if not t.done():t.cancel()
+        if active_tasks:
+            await asyncio.gather(*active_tasks,return_exceptions=True)
+        raise
 
 async def main():
     global p1_running
@@ -2204,7 +2290,7 @@ async def main():
         send(anim_ops,transmit=False)
     _n_js=max(1,len(LAYOUT.job_slots))
     for i in range(C.get('initial_outbound_pallets',0)):
-        level=(i//_n_js+4)%9;sid=LAYOUT.job_slots[i%_n_js];p=f'pallet_out_{i}'
+        level=(i+4)%9;sid=LAYOUT.job_slots[(i//9)%_n_js];p=f'pallet_out_{i}'
         poses[p]=LAYOUT.slot_point(sid)+(C['storage_levels'][level],0)
         await stored.put((C['jobs']+i,level,sid,i%2,p))
     dock_flow.initialize()
