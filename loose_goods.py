@@ -190,14 +190,17 @@ def u1_med_in_carton(carton_pose, m):
     dx = (m - (U1_MED_PER_CARTON - 1) / 2) * .10
     return (cx + dx, cy, cz + .05, 0.)
 
+_RACK_SHELF_Z = (U1_RACK_CARTON_Z, 0.90, 0.56, 1.58)
+
 def u1_med_on_rack(rack_pose, m, tray_slot=0):
-    """World pose (x, y, z, yaw) of yellow medicine box m (0..2) inside a hollow blue tray on a U1 rack."""
+    """World pose (x, y, z, yaw) of yellow medicine box m (0..2) inside a hollow blue tray on a U1/U2/P1 rack."""
     rx, ry, rz = rack_pose[:3]
     ryaw = rack_pose[3] if len(rack_pose) > 3 else 0.
     tx = -.295 if tray_slot % 2 == 0 else .295
     dx_local = tx + (m - (U1_MED_PER_CARTON - 1) / 2) * .165
     dx, dy = _rot(ryaw, (dx_local, 0.))
-    return (rx + dx, ry + dy, rz + U1_RACK_CARTON_Z, ryaw)
+    z_off = _RACK_SHELF_Z[(tray_slot // 2) % len(_RACK_SHELF_Z)]
+    return (rx + dx, ry + dy, rz + z_off, ryaw)
 
 def u1_carton_on_rack(rack_pose, slot=0):
     """World pose (x, y, z, yaw) of the first medicine box / slot in a hollow blue tray on a U1 rack."""
@@ -243,6 +246,11 @@ def z05_station(floor, zone):
     """(x, y, yaw, z0) of the Zone 05 unpack worker on (floor 1..4, zone 0..1), facing east."""
     w = Z05_WORKERS[zone % len(Z05_WORKERS)]
     return (w['x'], w['y'], 0., LEVELS[floor - 1])
+
+def z05_jack_home(floor, zone):
+    """Parked pose (x, y, z0, yaw) of the Zone 05 manual pallet jack beside worker station."""
+    w = Z05_WORKERS[zone % len(Z05_WORKERS)]
+    return (w['x'], w['y'] - .85, LEVELS[floor - 1], 0.)
 
 def z05_pallet_side(spot_xy, worker_idx=0):
     """Standing position (x, y, yaw) on the west side of a Zone 05 pallet spot, facing east.
@@ -312,6 +320,9 @@ P1_STATIONS = FF.P1_STATIONS
 P1_RACKS_PER_STATION = FF.P1_RACKS_PER_STATION
 P1_CELL_MAP = FF.P1_CELL_MAP
 P1_STATION_CELLS = FF.P1_STATION_CELLS
+U1_AGV_HOME_BRANCHES = FF.U1_AGV_HOME_BRANCHES
+U2_AGV_HOME_STATIONS = FF.U2_AGV_HOME_STATIONS
+P1_AGV_HOME_STATIONS = FF.P1_AGV_HOME_STATIONS
 
 _TROLLEY_SLOTS_LOCAL = (
     (-.24, 0., .30 + CARTON[2] * .5),

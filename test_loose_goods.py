@@ -69,10 +69,11 @@ class LooseGoodsChecks(unittest.TestCase):
                 c_pose = G.u1_carton_on_rack((rx, ry, rz, ryaw), 0)
                 self.assertAlmostEqual(c_pose[2], z0 + G.U1_RACK_CARTON_Z)
                 meds_in = [G.u1_med_in_carton((wx, 11.229, G.zc(f), math.pi / 2), m) for m in range(G.U1_MED_PER_CARTON)]
-                meds_rack = [G.u1_med_on_rack((rx, ry, rz, ryaw), m, 0) for m in range(G.U1_MED_PER_CARTON)]
+                meds_rack = [G.u1_med_on_rack((rx, ry, rz, ryaw), m, slot) for slot in range(4) for m in range(G.U1_MED_PER_CARTON)]
                 self.assertEqual(len({round(m[0], 3) for m in meds_in}), G.U1_MED_PER_CARTON)
-                self.assertEqual(len({round(m[0], 3) for m in meds_rack}), G.U1_MED_PER_CARTON)
-                self.assertTrue(all(abs(m[0] - (rx - .295)) < .20 for m in meds_rack))   # inside the 580mm hollow blue tray
+                self.assertEqual(len({(round(m[0], 3), round(m[2], 3)) for m in meds_rack}), 4 * G.U1_MED_PER_CARTON)
+                self.assertEqual(len({round(m[2], 3) for m in meds_rack}), 2)   # 4 trays span 2 shelf heights (2 trays/shelf)
+                self.assertTrue(all(abs(abs(m[0] - rx) - .295) < .20 for m in meds_rack))   # inside the left/right 580mm hollow blue trays
                 cells = G.U1_BRANCH_CELLS[b]
                 for k in range(len(cells) - 1):
                     store = (cells[k]['x'], cells[k]['y'], z0)

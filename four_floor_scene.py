@@ -106,17 +106,23 @@ def u1_rack_parts():
     return rack_parts(hollow_trays=True)
 
 def p1_rack_parts():
-    """P1 picking rack: hollow blue plastic trays with pre-stocked yellow medicine boxes on the lower shelves."""
-    p = rack_parts(hollow_trays=True)
-    med_col = '.95 .76 .08 1'; strip_col = '.12 .42 .78 1'; cap_col = '.96 .97 .98 1'
-    for z in (.40, .74, 1.08):
-        for tx in (-.295, .295):
-            for m in range(3):
-                mx = tx + (m - 1) * .17
-                p.append((mx, 0, z + .095, .14, .26, .15, med_col, 0))
-                p.append((mx, 0, z + .172, .142, .262, .006, cap_col, 0))
-                p.append((mx, -.131, z + .105, .11, .004, .045, strip_col, 0))
-    return p
+    """P1 picking rack: 4-shelf rack with hollow open-top blue plastic trays (medicine boxes are dynamic models)."""
+    return rack_parts(hollow_trays=True)
+
+def jack_parts():
+    """Manual hydraulic pallet jack (same design as dock_jack at the truck docks) for Zone 05 workers."""
+    j_col = '.90 .55 .02 1'; w_col = '.15 .15 .15 1'; h_col = '.10 .10 .10 1'
+    return [
+        (-.55, 0., .14, .35, .55, .18, j_col, 0),
+        (-.55, -.18, .05, .12, .08, .10, w_col, 0),
+        (-.55, +.18, .05, .12, .08, .10, w_col, 0),
+        (.10, -.25, .065, 1.20, .12, .08, j_col, 0),
+        (.10, +.25, .065, 1.20, .12, .08, j_col, 0),
+        (.62, -.25, .035, .10, .10, .07, w_col, 0),
+        (.62, +.25, .035, .10, .10, .07, w_col, 0),
+        (-.78, 0., .65, .06, .06, 1.05, h_col, 0),
+        (-.78, 0., 1.18, .06, .50, .06, h_col, 0),
+    ]
 
 def trolley_parts(with_cartons=False):
     """Wire-mesh empty-carton trolley (1200 x 800 x 1700 mm): blue base deck at 300 mm, 4 caster wheels,
@@ -365,6 +371,11 @@ U2_STATION_CELLS = {u2_idx: [next(c for c in L['rack_cells']
                     for u2_idx in range(len(U2_WORKERS))}
 U2_RESERVED_CELL_XY = {(round(c['x'], 3), round(c['y'], 3)) for cells in U2_STATION_CELLS.values() for c in cells}
 
+# Shared 10-AGV/floor pool home assignments: 2 U1 + 2 U2 + 6 P1 (3 North + 3 West)
+U1_AGV_HOME_BRANCHES = (1, 4)[:max(1, int(C.get('u1_agvs_per_floor', 2)))]
+U2_AGV_HOME_STATIONS = (1, 4)[:max(1, int(C.get('u2_agvs_per_floor', 2)))]
+P1_AGV_HOME_STATIONS = (1, 3, 5, 8, 10, 12)[:max(1, int(C.get('p1_agvs_per_floor', 6)))]
+
 # P1 picking stations (14 stations per floor: 0..6 North row, 7..13 West row) <-> Kho 04 & Khu 06
 P1_STATIONS = L['stations']
 P1_RACKS_PER_STATION = 2
@@ -440,7 +451,6 @@ def floor_common():
                 continue
             v += place(agv_parts(), a['x'], a['y'], a['yaw'])
             if a['rack']: v += place(rack_parts(), a['x'], a['y'], a['yaw'])
-        fl = L['forklift']; v += place(f4_parts(), fl['fork_tip_x'] - 1.2, fl['y'], fl['yaw'])
     for d in L['devices']:
         if d['kind'] == 'port_gate': v.append(rect_box(d['rect'], 0, 1.8, RED))
     return v
@@ -514,10 +524,11 @@ def models():
     p1_rack_mesh = merge_boxes('ff_p1_rack', place(p1_rack_parts(), 0, 0, 0))
     unpack_rack_mesh = merge_boxes('ff_unpack_rack', place(rack_parts(), 0, 0, 0))
     trolley_empty_mesh = merge_boxes('ff_trolley_empty', place(trolley_parts(with_cartons=False), 0, 0, 0))
+    z05_jack_mesh = merge_boxes('ff_z05_jack', place(jack_parts(), 0, 0, 0))
+    z05_workers = sorted((w for w in people() if w['area'] == 'unpack'), key=lambda w: -w['y'])
     if MOVABLE:
         agv_mesh = merge_boxes('ff_agv', place(agv_parts(), 0, 0, 0))
         rack_mesh = unpack_rack_mesh
-        f4_mesh = merge_boxes('ff_f4', place(f4_parts(), 0, 0, 0))
     b = L['building']
     for k, zf in enumerate(LEVELS):
         f = k + 1
@@ -533,20 +544,25 @@ def models():
             for i, a in enumerate(L['agvs']):
                 out.append(model(f'ff{f}_agv_{i}', (a['x'], a['y'], zf, a['yaw']), agv_mesh, static=False))
                 if a['rack']: out.append(model(f'ff{f}_agvrack_{i}', (a['x'], a['y'], zf, a['yaw']), rack_mesh, static=False))
-            fl = L['forklift']
-            out.append(model(f'ff{f}_f4', (fl['fork_tip_x'] - 1.2, fl['y'], zf, fl['yaw']), f4_mesh, static=False))
-        # U1 sorting-branch stations: 1 AGV + 1 active rack + 1 spare rack in Kho 04 + 1 empty trolley beside worker.
+        # Zone 05 manual pallet jacks (replaces F4 forklift at Zone 05 unpack area)
+        for z_idx, zw in enumerate(z05_workers):
+            out.append(model(f'z05_jack_{f}_{z_idx}', (zw['x'], zw['y'] - .85, zf, 0.), z05_jack_mesh, static=True))
+        # U1 sorting-branch stations: shared 2-AGV pool + 6 station racks + 6 spare racks in Kho 04 + 6 trolleys.
+        for agv_k, home_br in enumerate(U1_AGV_HOME_BRANCHES):
+            bx = cx(U1_BRANCHES[home_br])
+            out.append(model(f'u1_agv_{f}_{agv_k}', (bx, U1_RACK_Y, zf, math.pi / 2), u1_agv_mesh, static=True))
         for br_idx, br_rect in enumerate(U1_BRANCHES):
             bx = cx(br_rect)
-            out.append(model(f'u1_agv_{f}_{br_idx}', (bx, U1_RACK_Y, zf, math.pi / 2), u1_agv_mesh, static=True))
             out.append(model(f'u1_rack_{f}_{br_idx}_0', (bx, U1_RACK_Y, zf, 0.), u1_rack_mesh, static=True))
             for r_idx in range(1, U1_RACKS_PER_BRANCH):
                 cell = U1_BRANCH_CELLS[br_idx][r_idx]
                 out.append(model(f'u1_rack_{f}_{br_idx}_{r_idx}', (cell['x'], cell['y'], zf, cell.get('yaw', 0.)), u1_rack_mesh, static=True))
             out.append(model(f'u1_trolley_{f}_{br_idx}', (bx + .95, 12.05, zf, 0.), trolley_empty_mesh, static=True))
-        # U2 put-away stations opposite Zone 05: 1 AGV + 1 active rack + 1 spare rack in Kho 04 + 1 empty trolley beside worker.
+        # U2 put-away stations opposite Zone 05: shared 2-AGV pool + 6 station racks + 6 spare racks in Kho 04 + 6 trolleys.
+        for agv_k, home_u2 in enumerate(U2_AGV_HOME_STATIONS):
+            ry = U2_RACKS_Y[home_u2]
+            out.append(model(f'u2_agv_{f}_{agv_k}', (U2_RACK_X, ry, zf, 0.), u1_agv_mesh, static=True))
         for u2_idx, ry in enumerate(U2_RACKS_Y):
-            out.append(model(f'u2_agv_{f}_{u2_idx}', (U2_RACK_X, ry, zf, 0.), u1_agv_mesh, static=True))
             out.append(model(f'u2_rack_{f}_{u2_idx}_0', (U2_RACK_X, ry, zf, math.pi / 2), u1_rack_mesh, static=True))
             for r_idx in range(1, U2_RACKS_PER_STATION):
                 cell = U2_STATION_CELLS[u2_idx][r_idx]
@@ -554,12 +570,15 @@ def models():
             wy = U2_WORKERS[u2_idx]['y']
             ty = wy + .95 if u2_idx == 0 else wy - .95
             out.append(model(f'u2_trolley_{f}_{u2_idx}', (-7.95, ty, zf, math.pi / 2), trolley_empty_mesh, static=True))
-        # P1 picking stations (14 stations: 7 North + 7 West): 1 AGV + 1 active rack + 1 spare rack in Kho 04 + 1 trolley at mark.
+        # P1 picking stations (14 stations: 7 North + 7 West): shared 6-AGV pool (3 North + 3 West) + 14 racks + 14 spares + 14 trolleys.
+        for agv_k, home_st in enumerate(P1_AGV_HOME_STATIONS):
+            st_h = P1_STATIONS[home_st]
+            rx, ry = cx(st_h['rack']), cy(st_h['rack'])
+            agv_yaw = -math.pi / 2 if home_st < 7 else 0.
+            out.append(model(f'p1_agv_{f}_{agv_k}', (rx, ry, zf, agv_yaw), u1_agv_mesh, static=True))
         for st_idx, st in enumerate(P1_STATIONS):
             rx, ry = cx(st['rack']), cy(st['rack'])
             ryaw = 0. if st_idx < 7 else math.pi / 2
-            agv_yaw = -math.pi / 2 if st_idx < 7 else 0.
-            out.append(model(f'p1_agv_{f}_{st_idx}', (rx, ry, zf, agv_yaw), u1_agv_mesh, static=True))
             out.append(model(f'p1_rack_{f}_{st_idx}_0', (rx, ry, zf, ryaw), p1_rack_mesh, static=True))
             for r_idx in range(1, P1_RACKS_PER_STATION):
                 cell = P1_STATION_CELLS[st_idx][r_idx]

@@ -118,7 +118,10 @@ def scene(c,model,pallet_deck):
             model(name,pose[:3]+(pose[5],),meshes[name.split('_',1)[1]])
         model(f'dock_deck_{i}',stage(d)[:2]+(0,0),deck)
         model(f'dock_jack_{i}',stage(d)[:2]+(0,-math.pi/2),jack)
-        for j in range(n):model(f'dock_carton_{i}_{j}',(d['x'],d['rear_y']-1,-5),carton)
+        init_stack=list(reversed(even_stack_positions(stage(d),n)))
+        for j in range(n):
+            p_init=init_stack[j] if j<len(init_stack) else (d['x'],d['rear_y']+.62,.255)
+            model(f'dock_carton_{i}_{j}',p_init,carton)
         model(f'dock_scanner_{i}',(d['x']+.75,d['rear_y']+.45,0),scanner)
 
 class DockFlow:
@@ -127,14 +130,25 @@ class DockFlow:
         self.docks=dock_list(c);self.locks=[asyncio.Lock() for _ in self.docks];self.gate=FloorGate()
         self.stats={'scanned_even':0,'scanned_odd':0,'pallets_to_w1':0,'pallets_to_w2':0,'empty_pallet_returns':0}
         self.states={}
+        self.preloaded_batch0={}
         self.fast=fast
         self.ambient_task=None
+    def _restock_stage_visual(self,i,count=None):
+        d=self.docks[i]
+        cnt=count if count is not None else max(18,int(self.c.get('loose_cartons_per_pallet',18)))
+        dst=list(reversed(even_stack_positions(stage(d),cnt)))
+        self.send({
+            f'dock_deck_{i}':stage(d)[:2]+(0,0),
+            **{f'dock_carton_{i}_{j}':dst[j]+(0,) for j in range(min(cnt,len(dst)))},
+        })
     def initialize(self):
+        cnt=max(18,int(self.c.get('loose_cartons_per_pallet',18)))
         for i,d in enumerate(self.docks):
             self.states[i]=(d['x']+.85,d['rear_y']+.75,math.pi)
+            self.preloaded_batch0[i]=True
             self.send(LG.operator_pose(worker_id(i),*self.states[i]))
             self.send({f'dock_deck_{i}':stage(d)[:2]+(0,0),f'dock_jack_{i}':stage(d)[:2]+(0,-math.pi/2)})
-            self.send({f'dock_carton_{i}_{j}':(d['x'],d['rear_y']-1,-5,0) for j in range(max(18,int(self.c['loose_cartons_per_pallet'])))})
+            self._restock_stage_visual(i,cnt)
         if not self.fast and (self.ambient_task is None or self.ambient_task.done()):
             self.ambient_task=asyncio.create_task(self.ambient_loop())
     async def ambient_loop(self):
@@ -428,9 +442,23 @@ class DockFlow:
     async def _unload_at_dock(self,i,d,kind,k,count,emit_classified=True):
         local=[f'dock_carton_{i}_{j}' for j in range(count)]
         src=source_stack(d,count);dst=list(reversed(even_stack_positions(stage(d),count))) if kind!='odd' else list(reversed(LG.stack_positions(stage(d),count)))
-        self.send({n:(d['x'],d['rear_y'],-5,0) for n in local})
         self.emit('TRUCK_BATCH_READY',dock=d['id'],classification=kind,batch=k,cartons=count)
-        for j,(n,p,out) in enumerate(zip(local,src,dst)):
+        if self.preloaded_batch0.pop(i,False):
+            self.send({n:out+(0,) for n,out in zip(local,dst)})
+            await self.idle(i,0.25)
+            if emit_classified:
+                self.stats['scanned_'+kind]+=count
+                for j in range(count):
+                    self.emit('BARCODE_CLASSIFIED',barcode=f'{kind.upper()}-{k:04d}-{j:03d}',classification=kind,dock=d['id'])
+            return local
+        anim_start=max(0,count-2)
+        self.send({local[j]:dst[j]+(0,) for j in range(anim_start)})
+        if emit_classified and anim_start>0:
+            self.stats['scanned_'+kind]+=anim_start
+            for j in range(anim_start):
+                self.emit('BARCODE_CLASSIFIED',barcode=f'{kind.upper()}-{k:04d}-{j:03d}',classification=kind,dock=d['id'])
+        for j in range(anim_start,count):
+            n,p,out=local[j],src[j],dst[j]
             self.send({n:p+(0,)})
             await self.worker(i,(d['x']-.45,d['rear_y']+.25,-math.pi/2))
             self.emit('WORKER_PICK_FROM_TRUCK',dock=d['id'],carton=j,batch=k)
@@ -500,27 +528,34 @@ class DockFlow:
         while not permission.done():
             await self.idle(i,.5)
         await permission
-        gw_s=max(0.0,self.e_time()-t_gw0)
+        t_gw1=self.e_time()
+        gw_s=max(0.0,t_gw1-t_gw0)
         if gw_s>1e-4:
-            self.emit('DOCK_GATE_WAIT',dock=d['id'],classification=kind,batch=k,wait_s=round(gw_s,4))
+            self.emit('DOCK_GATE_WAIT',dock=d['id'],classification=kind,batch=k,wait_s=round(gw_s,4),start_s=round(t_gw0,4),end_s=round(t_gw1,4))
         try:
             if acquire_target is not None:
+                t_tw0=self.e_time()
                 async with acquire_target:
+                    t_tw1=self.e_time()
+                    if t_tw1-t_tw0>1e-4:
+                        self.emit('DOCK_SLOT_WAIT',dock=d['id'],classification=kind,batch=k,wait_s=round(t_tw1-t_tw0,4),start_s=round(t_tw0,4),end_s=round(t_tw1,4))
                     await self.transfer(i,local,target,traffic=traffic)
+                    await consume(i,local)
+                    self._restock_stage_visual(i,len(local))
                     self.stats['pallets_to_w2']+=1
                     await self.transfer(i,[],stage(d),True,without_deck=True,traffic=traffic)
                     self.stats['empty_pallet_returns']+=1
                     self.emit('EMPTY_PALLET_RETURNED',dock=d['id'],batch=k,classification=kind)
             else:
                 await self.transfer(i,local,target,traffic=traffic)
+                await consume(i,local)
+                self._restock_stage_visual(i,len(local))
                 self.stats['pallets_to_w1']+=1
                 await self.transfer(i,[],stage(d),True,without_deck=True,traffic=traffic)
                 self.emit('EMPTY_PALLET_FROM_POOL',dock=d['id'],batch=k)
         finally:
             await traffic.__aexit__(None,None,None)
-        self.send({f'dock_deck_{i}':stage(d)[:2]+(0,0)})
         await self.worker(i,(d['x']+.85,d['rear_y']+.75,math.pi))
-        await consume(i,local)
 
     async def prepare(self,kind,k,target,names,consume,acquire_target=None):
         i=k%len(self.docks);d=self.docks[i]
@@ -533,9 +568,13 @@ class DockFlow:
         d=self.docks[i]
         async with self.locks[i]:
             local=await self._unload_at_dock(i,d,'staged',k,count,emit_classified=False)
+            t_sw0=self.e_time()
             claimed=await claim_slot_fn(i,d['id'],k,count)
+            t_sw1=self.e_time()
+            if t_sw1-t_sw0>1e-4:
+                self.emit('DOCK_SLOT_WAIT',dock=d['id'],classification='staged',batch=k,wait_s=round(t_sw1-t_sw0,4),start_s=round(t_sw0,4),end_s=round(t_sw1,4))
             if claimed is None:
-                self.send({n:(d['x'],d['rear_y'],-5,0) for n in local})
+                self._restock_stage_visual(i,count)
                 return
             kind,target,acquire_target,consume=claimed
             self.stats['scanned_'+kind]+=count

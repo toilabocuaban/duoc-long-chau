@@ -150,8 +150,9 @@ if _spots:
     for i in range(_loose_pool):
         model(f'carton_{i}',(_spots[0][0],_spots[0][1],-5),_carton)
     _z05_pool=max(80,int(C.get('z05_carton_pool',0)),len(loose_goods.Z05_WORKERS)*int(C.get('z05_cartons_per_pallet',loose_goods.Z05_CARTONS_PER_PALLET))*2)
-    _u1_med_total=max(1,int(C.get('u1_cartons_per_rack',1)))*int(C.get('u1_med_boxes_per_carton',loose_goods.U1_MED_PER_CARTON))
-    _u2_med_total=max(1,int(C.get('u2_cartons_per_rack',1)))*int(C.get('u2_med_boxes_per_carton',loose_goods.U1_MED_PER_CARTON))
+    _u1_med_total=max(1,int(C.get('u1_cartons_per_rack',4)))*int(C.get('u1_med_boxes_per_carton',loose_goods.U1_MED_PER_CARTON))
+    _u2_med_total=max(1,int(C.get('u2_cartons_per_rack',4)))*int(C.get('u2_med_boxes_per_carton',loose_goods.U1_MED_PER_CARTON))
+    _p1_med_total=max(1,int(C.get('p1_cartons_per_rack',4)))*int(C.get('p1_med_boxes_per_carton',loose_goods.U1_MED_PER_CARTON))
     for f in loose_goods.floors():
         z0=loose_goods.LEVELS[f-1]
         for b in range(len(loose_goods.BRANCHES)):
@@ -170,8 +171,10 @@ if _spots:
                 model(f'u2_med_{f}_{u2_idx}_{m}',(rx,ry,-5,0),_med_box)
         for st_idx in range(len(loose_goods.P1_STATIONS)):
             r0_pose=loose_goods.p1_rack_pose(f,st_idx)
-            for m in range(loose_goods.U1_MED_PER_CARTON):
-                model(f'p1_med_{f}_{st_idx}_{m}',loose_goods.u1_med_on_rack(r0_pose,m,0),_med_box)
+            for m in range(_p1_med_total):
+                tray_slot=m//loose_goods.U1_MED_PER_CARTON
+                box_i=m%loose_goods.U1_MED_PER_CARTON
+                model(f'p1_med_{f}_{st_idx}_{m}',loose_goods.u1_med_on_rack(r0_pose,box_i,tray_slot),_med_box)
             t_pose=loose_goods.p1_trolley_pose(f,st_idx)
             for c_slot in range(loose_goods.TROLLEY_CAPACITY):
                 model(f'p1_carton_{f}_{st_idx}_{c_slot}',loose_goods.trolley_carton_pose(t_pose,c_slot),_carton)
