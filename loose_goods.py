@@ -170,6 +170,17 @@ def med_box_parts():
             out.append((sx, sy, -.030, .070, .147, .02, MED_ORANGE))
     return out
 
+
+def med_tray_pack_parts():
+    """Full 3-cluster medicine pack filling one 580x415x260 mm hollow blue tray (1 model instead of 3)."""
+    base = med_box_parts()
+    out = []
+    for m in range(U1_MED_PER_CARTON):
+        dx = (m - (U1_MED_PER_CARTON - 1) / 2) * .165
+        for sx, sy, sz, lx, ly, lz, col in base:
+            out.append((sx + dx, sy, sz, lx, ly, lz, col))
+    return out
+
 def u1_worker_id(floor, branch):
     """Unique integer ID for animated U1 sorting worker on (floor 1..4, branch 0..5)."""
     return 100 + floor * 10 + (branch % len(BRANCHES))
@@ -324,16 +335,15 @@ U1_AGV_HOME_BRANCHES = FF.U1_AGV_HOME_BRANCHES
 U2_AGV_HOME_STATIONS = FF.U2_AGV_HOME_STATIONS
 P1_AGV_HOME_STATIONS = FF.P1_AGV_HOME_STATIONS
 
-_TROLLEY_SLOTS_LOCAL = (
-    (-.24, 0., .30 + CARTON[2] * .5),
-    (+.24, 0., .30 + CARTON[2] * .5),
-    (-.24, 0., .30 + CARTON[2] * 1.5),
-    (+.24, 0., .30 + CARTON[2] * 1.5),
-    (0.,   0., .30 + CARTON[2] * 2.5),
+_TROLLEY_SLOTS_LOCAL = tuple(
+    (lx, ly, .30 + CARTON[2] * (.5 + layer))
+    for layer in range(5)
+    for ly in (-.165, .165)
+    for lx in (-.24, .24)
 )
 
 def trolley_carton_pose(trolley_pose, slot=0):
-    """World pose (x, y, z, yaw) of empty carton slot (0..4) stacked inside a wire-mesh trolley."""
+    """World pose (x, y, z, yaw) of empty carton slot (0..19) stacked inside a wire-mesh trolley (5 layers x 2x2)."""
     tx, ty, tz = trolley_pose[:3]
     tyaw = trolley_pose[3] if len(trolley_pose) > 3 else 0.
     lx, ly, lz = _TROLLEY_SLOTS_LOCAL[slot % len(_TROLLEY_SLOTS_LOCAL)]

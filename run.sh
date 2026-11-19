@@ -18,6 +18,14 @@ sim_pid=$!
 ctl_pid=''
 trap 'if [[ -n "$ctl_pid" ]] && kill -0 "$ctl_pid" 2>/dev/null; then kill -TERM "$ctl_pid" 2>/dev/null || true; for _ in 1 2 3 4 5; do kill -0 "$ctl_pid" 2>/dev/null || break; sleep 0.5; done; fi; kill "$sim_pid" ${ctl_pid:+"$ctl_pid"} 2>/dev/null || true; pkill -9 -f "gz sim" 2>/dev/null || true' EXIT
 python3 wait_gui.py
+echo ""
+echo "=========================================================================="
+echo "[CÁCH 4] Cửa sổ Gazebo Sim đã mở riêng (chưa chạy controller.py)."
+echo "  1. Hãy quan sát cửa sổ Gazebo Sim cho tới khi kho 3D hiện lên đầy đủ."
+echo "  2. Sau khi kho 3D đã hiện xong, NHẤN PHÍM ENTER tại đây để chạy mô phỏng!"
+echo "=========================================================================="
+read -r -p ">>> Nhấn ENTER khi kho 3D đã hiển thị để bắt đầu chạy controller.py: " _ </dev/tty || true
+echo "Đang khởi động controller.py..."
 python3 controller.py > >(tee controller.log) 2>&1 &
 ctl_pid=$!
 # Closing the Gazebo window must also end this session's controller; otherwise it keeps running and

@@ -158,7 +158,12 @@ class ReportExporterTests(unittest.TestCase):
             for removed_col in ("Chỉ tiêu Traffic Kho", "ID kỹ thuật", "Tầng kho", "Đổi trục X/Y", "NV gần nhất", "Mã Job / Yêu cầu", "Dock nguồn"):
                 self.assertNotIn(removed_col, sh_text)
             ws_agv_kpi = wb["Khu_Unpack_AGV"]
-            agv_kpi_text = "\n".join(str(c.value) for row in ws_agv_kpi.iter_rows(max_row=8, values_only=False) for c in row if c.value is not None)
+            agv_sec1_r = next(r for r in range(1, ws_agv_kpi.max_row + 1) if str(ws_agv_kpi.cell(r, 1).value or "").startswith("1. "))
+            agv_kpi_text = "\n".join(
+                str(c.value)
+                for row in ws_agv_kpi.iter_rows(min_row=agv_sec1_r, max_row=agv_sec1_r + 5, values_only=False)
+                for c in row if c.value is not None
+            )
             self.assertIn("400", agv_kpi_text)
 
             ws_agv = wb["Khu_Unpack_AGV"]
@@ -308,21 +313,60 @@ class ReportExporterTests(unittest.TestCase):
             self.assertIn("9 Shuttle", str(pie_chart.title.tx.rich.p[0].r[0].t))
             self.assertEqual(pie_chart.legend.position, "b")
 
-            # Verify 3 charts are placed at the top beside Table 1 / Table 2 (E5, H5, E{sec2_row})
+            # Verify merged Section 0 input table starts at Row 4 with 3 charts at top (E5, H5, E{sec1_row})
+            sec0_row = next(
+                r for r in range(1, ws.max_row + 1)
+                if str(ws.cell(r, 1).value or "").startswith("0. TỔNG HỢP THÔNG SỐ ĐẦU VÀO")
+            )
+            sec1_row = next(
+                r for r in range(1, ws.max_row + 1)
+                if str(ws.cell(r, 1).value or "").startswith("1. TỔNG HỢP HOẠT ĐỘNG")
+            )
             sec2_row = next(
                 r for r in range(1, ws.max_row + 1)
                 if str(ws.cell(r, 1).value or "").startswith("2. THÔNG SỐ CÀI ĐẶT")
             )
+            self.assertEqual(sec0_row, 4)
+            self.assertLess(sec0_row, sec1_row)
+            self.assertLess(sec1_row, sec2_row)
             self.assertEqual((bar_charts[0].anchor._from.col, bar_charts[0].anchor._from.row), (4, 4))
             self.assertEqual((pie_chart.anchor._from.col, pie_chart.anchor._from.row), (7, 4))
-            self.assertEqual((bar_charts[1].anchor._from.col, bar_charts[1].anchor._from.row), (4, sec2_row - 1))
+            self.assertEqual((bar_charts[1].anchor._from.col, bar_charts[1].anchor._from.row), (4, sec1_row - 1))
+
+            # Verify merged Section 0 input rows + yellow Shuttle start row + green Lift start row
+            sec0_rows_by_lbl = {
+                ws.cell(r, 2).value: r
+                for r in range(sec0_row + 2, sec1_row)
+                if ws.cell(r, 2).value
+            }
+            self.assertEqual(ws.cell(sec0_rows_by_lbl["Số lượng hàng nhập kế hoạch / ca"], 3).value, 150)
+            self.assertAlmostEqual(ws.cell(sec0_rows_by_lbl["Trung bình tần suất nhập trong 1 giờ"], 3).value, 18.75, places=2)
+            self.assertEqual(ws.cell(sec0_rows_by_lbl["Số lượng hàng xuất kế hoạch / ca"], 3).value, 300)
+            self.assertAlmostEqual(ws.cell(sec0_rows_by_lbl["Trung bình tần suất xuất trong 1 giờ"], 3).value, 37.5, places=2)
+            r_shuttle_start = sec0_rows_by_lbl["Số lượng Shuttle (9 chính + 1 Standby)"]
+            self.assertEqual(ws.cell(r_shuttle_start, 3).value, 10)
+            for c_hl in range(1, 5):
+                self.assertEqual(ws.cell(r_shuttle_start, c_hl).fill.start_color.rgb, "00FFE082")
+            self.assertIn("Thời gian hoạt động liên tục (cấu hình pin)", sec0_rows_by_lbl)
+            self.assertAlmostEqual(ws.cell(sec0_rows_by_lbl["Thời gian hoạt động liên tục (cấu hình pin)"], 3).value, 7.0, places=2)
+            self.assertIn("Thời gian sạc Shuttle (cấu hình)", sec0_rows_by_lbl)
+            r_sh_chg = sec0_rows_by_lbl["Thời gian sạc Shuttle (cấu hình)"]
+            self.assertAlmostEqual(ws.cell(r_sh_chg, 3).value, 2.0, places=2)
+            self.assertIn("120 phút", str(ws.cell(r_sh_chg, 4).value))
+            r_lift_start = sec0_rows_by_lbl["Số lượng Thang Nhập"]
+            self.assertEqual(ws.cell(r_lift_start, 3).value, 2)
+            for c_hl in range(1, 5):
+                self.assertEqual(ws.cell(r_lift_start, c_hl).fill.start_color.rgb, "00A5D6A7")
+            self.assertEqual(ws.cell(sec0_rows_by_lbl["Số lượng Thang Xuất"], 3).value, 2)
+            self.assertAlmostEqual(ws.cell(sec0_rows_by_lbl["Tần suất hoạt động TB (4 thang / giờ)"], 3).value, 56.25, places=2)
+            self.assertIn("Thời gian chờ nhiệm vụ (Nghỉ rảnh)", sec0_rows_by_lbl)
 
             # Verify Section 1 Cách A headers, separated metric rows, and 3-state breakdown
             self.assertEqual(
-                [ws.cell(5, c).value for c in range(1, 5)],
+                [ws.cell(sec1_row + 1, c).value for c in range(1, 5)],
                 ["Nhóm thiết bị", "Chỉ tiêu thống kê", "Giá trị", "Đơn vị / Diễn giải"],
             )
-            sec1_metrics = {ws.cell(r, 2).value: ws.cell(r, 3).value for r in range(6, sec2_row - 1)}
+            sec1_metrics = {ws.cell(r, 2).value: ws.cell(r, 3).value for r in range(sec1_row + 2, sec2_row - 1)}
             for required_label in (
                 "Tổng thời gian vận hành kho (1x chuẩn)",
                 "Tổng nhiệm vụ Shuttle - Nhập kho",
@@ -361,7 +405,7 @@ class ReportExporterTests(unittest.TestCase):
                 r for r in range(1, ws.max_row + 1)
                 if str(ws.cell(r, 1).value or "").startswith("3. BẢNG TỔNG HỢP")
             )
-            self.assertGreaterEqual(sec3_row, sec2_row + 14)
+            self.assertGreaterEqual(sec3_row, sec2_row + 13)
 
             text = "\n".join(str(c.value) for row in ws.iter_rows(values_only=False) for c in row if c.value is not None)
             for expected in (
@@ -439,13 +483,13 @@ class ReportExporterTests(unittest.TestCase):
             for sname, chart_cnt in expected_charts.items():
                 ws = wb[sname]
                 self.assertEqual(len(ws._charts), chart_cnt, f"{sname} chart count mismatch")
-                # Row 4 splits into left A:D section banner and right E:J chart panel banner
+                # Row 4 splits into left A:D Section 0 input banner and right E:J chart panel banner
                 r4_merges = sorted((m.min_col, m.max_col) for m in ws.merged_cells.ranges if m.min_row == 4 and m.max_row == 4)
                 self.assertEqual(r4_merges, [(1, 4), (5, 10)], f"{sname} row 4 banner mismatch")
-                # Row 5 has 4-col Cách A KPI headers
-                self.assertEqual(ws.cell(5, 2).value, "Chỉ tiêu thống kê")
+                self.assertTrue(str(ws.cell(4, 1).value or "").startswith("0. "), f"{sname} row 4 should start with '0. '")
+                # Row 5 has 4-col Section 0 input headers (Giá trị at Col 3) and E5 & H5 anchor top 2 charts
+                self.assertEqual(ws.cell(5, 2).value, "Chỉ tiêu đầu vào", f"{sname} row 5 col 2 header mismatch")
                 self.assertEqual(ws.cell(5, 3).value, "Giá trị")
-                # Top-right charts anchored at E5 & H5
                 top_anchors = [(ch.anchor._from.col, ch.anchor._from.row) for ch in ws._charts[:2]]
                 self.assertEqual(top_anchors, [(4, 4), (7, 4)], f"{sname} top charts should anchor at E5 & H5")
                 # All stacked BarCharts must be bounded 0..100%
@@ -453,31 +497,51 @@ class ReportExporterTests(unittest.TestCase):
                     if type(ch).__name__ == "BarChart" and ch.grouping == "stacked":
                         self.assertEqual(ch.y_axis.scaling.min, 0, f"{sname} stacked min != 0")
                         self.assertEqual(ch.y_axis.scaling.max, 100, f"{sname} stacked max != 100")
-                # All KPI rows in Section 1 keep clean single values without "|" packing
+                # Section 0 must include both yellow (#FFE082) and green (#A5D6A7) sub-block start rows, with no '|' in Col 3
+                sec0_fills = set()
                 r_cur = 6
                 while ws.cell(r_cur, 1).value not in (None, ""):
                     val = ws.cell(r_cur, 3).value
-                    self.assertNotIn("|", str(val), f"{sname} row {r_cur} packed '|' in KPI value")
+                    self.assertNotIn("|", str(val), f"{sname} Section 0 row {r_cur} packed '|' in value")
+                    rgb = ws.cell(r_cur, 1).fill.start_color.rgb
+                    if rgb in ("00FFE082", "00A5D6A7"):
+                        sec0_fills.add(rgb)
+                        for c_hl in range(1, 5):
+                            self.assertEqual(ws.cell(r_cur, c_hl).fill.start_color.rgb, rgb)
                     r_cur += 1
+                self.assertEqual(sec0_fills, {"00FFE082", "00A5D6A7"}, f"{sname} missing yellow/green Section 0 start rows")
+                # Section 1 KPI rows keep clean single values without "|" packing
+                sec1_r = next(r for r in range(1, ws.max_row + 1) if str(ws.cell(r, 1).value or "").startswith("1. "))
+                self.assertEqual(ws.cell(sec1_r + 1, 2).value, "Chỉ tiêu thống kê", f"{sname} Section 1 header mismatch")
+                r_kpi = sec1_r + 2
+                while ws.cell(r_kpi, 1).value not in (None, ""):
+                    val = ws.cell(r_kpi, 3).value
+                    self.assertNotIn("|", str(val), f"{sname} Section 1 row {r_kpi} packed '|' in KPI value")
+                    r_kpi += 1
 
             # Verify AGV log sheet includes hourly buckets up to Giờ 3
             ws_log_text = "\n".join(str(c.value) for r in wb["Chi_Tiet_Nhiem_Vu_AGV_Kho"].iter_rows(values_only=False) for c in r if c.value is not None)
             self.assertIn("Giờ 1 (00:00-01:00)", ws_log_text)
             self.assertIn("Giờ 3 (02:00-03:00)", ws_log_text)
 
-            # Verify 3-state headers across Dock & Worker sheets and Section 3 starts below Chart 3 on sheets 1..5
+            # Verify 3-state headers across Dock & Worker sheets, dynamic 12-carton trolley capacity, and Chart 3 alignment on Sheets 1..5
             ws_dock_hdrs = {c.value for r in wb["Khu_Vuc_Dock"].iter_rows(values_only=False) for c in r if c.value is not None}
             self.assertIn("Tỉ lệ chờ ô & AGV (%)", ws_dock_hdrs)
             self.assertIn("Tỉ lệ nghỉ rảnh (%)", ws_dock_hdrs)
-            ws_wrk_hdrs = {c.value for r in wb["Cong_Nhan_Unpack"].iter_rows(values_only=False) for c in r if c.value is not None}
-            self.assertIn("Tỉ lệ chờ hàng/AGV (%)", ws_wrk_hdrs)
-            self.assertIn("Tỉ lệ nghỉ rảnh (%)", ws_wrk_hdrs)
-            for sname in ("Kho_ASRS_Shuttle", "Khu_Unpack_AGV", "Khu_Vuc_Dock", "Cong_Nhan_Unpack"):
+            ws_wrk_text = "\n".join(str(c.value) for r in wb["Cong_Nhan_Unpack"].iter_rows(values_only=False) for c in r if c.value is not None)
+            self.assertIn("Tỉ lệ chờ hàng/AGV (%)", ws_wrk_text)
+            self.assertIn("Tỉ lệ nghỉ rảnh (%)", ws_wrk_text)
+            self.assertIn("20 thùng/Trolley", ws_wrk_text)
+            self.assertIn("8 khay/Rack", ws_wrk_text)
+            self.assertNotIn("5 thùng/Trolley", ws_wrk_text)
+            for sname in ("Tong_Quan", "Kho_ASRS_Shuttle", "Khu_Unpack_AGV", "Khu_Vuc_Dock", "Cong_Nhan_Unpack"):
                 ws_s = wb[sname]
+                sec1_r = next(r for r in range(1, ws_s.max_row + 1) if str(ws_s.cell(r, 1).value or "").startswith("1. "))
                 sec2_r = next(r for r in range(1, ws_s.max_row + 1) if str(ws_s.cell(r, 1).value or "").startswith("2. "))
                 sec3_r = next(r for r in range(1, ws_s.max_row + 1) if str(ws_s.cell(r, 1).value or "").startswith("3. "))
+                self.assertGreater(sec2_r, sec1_r, f"{sname} sec2 should follow sec1")
                 self.assertGreater(sec3_r, sec2_r, f"{sname} sec3 should follow sec2")
-                self.assertEqual((ws_s._charts[2].anchor._from.col, ws_s._charts[2].anchor._from.row), (4, sec2_r - 1))
+                self.assertEqual((ws_s._charts[2].anchor._from.col, ws_s._charts[2].anchor._from.row), (4, sec1_r - 1))
 
     def test_three_state_interval_separation_and_dock_waits(self):
         tracker = SimulationTracker(self.config, total_jobs=4, cycle_duration_s=100.0)
@@ -592,6 +656,43 @@ class ReportExporterTests(unittest.TestCase):
             wrk_text = "\n".join(str(c.value) for r in wb["Cong_Nhan_Unpack"].iter_rows(values_only=False) for c in r if c.value is not None)
             self.assertIn("Kéo pallet từ Thang Xuất về Z05", wrk_text)
             self.assertNotIn("F4", wrk_text)
+
+    def test_agv_and_forklift_duty_and_charge_specs(self):
+        self.assertEqual(self.config["agv_continuous_hours_min"], 6.0)
+        self.assertEqual(self.config["agv_continuous_hours_max"], 8.0)
+        self.assertEqual(self.config["agv_charge_hours_min"], 1.5)
+        self.assertEqual(self.config["agv_charge_hours_max"], 2.0)
+        self.assertEqual(self.config["agv_forklift_continuous_hours_min"], 6.0)
+        self.assertEqual(self.config["agv_forklift_continuous_hours_max"], 8.0)
+        self.assertEqual(self.config["agv_forklift_charge_hours_min"], 2.0)
+        self.assertEqual(self.config["agv_forklift_charge_hours_max"], 3.0)
+
+        tracker = SimulationTracker(self.config, total_jobs=4, cycle_duration_s=28800.0)
+        # Simulate agv_0 (Forklift) actively charging at stop, and u1_agv_1_0 (Standard AGV) finishing a 1.75h charge
+        tracker.start_agv_task("u1_agv_1_0", "UNP-U1R-T1N1-0001", "Khu Unpack U1", "Cất rack", 10.0)
+        tracker.record_agv_leg("u1_agv_1_0", 500.0, True, 200.0)
+        tracker.finish_agv_task("u1_agv_1_0", 210.0)
+        tracker.start_agv_charge("u1_agv_1_0", 21600.0, 27900.0, is_forklift=False)  # 1.75h charge
+        tracker.finish_agv_charge("u1_agv_1_0", 27900.0)
+
+        tracker.start_agv_charge("agv_0", 23400.0, 31500.0, is_forklift=True)  # 2.25h forklift charge still active at 28800s
+
+        summary = tracker.finalize(28800.0, stop_reason="Kiểm thử pin & sạc AGV + AGV Forklift")
+        self.assertEqual(summary["agv_total_charges"], 2)
+        self.assertEqual(tracker.agvs["agv_0"]["status"], "Đang sạc (2.2h)")
+        self.assertGreater(tracker.agvs["u1_agv_1_0"]["battery_remaining_pct"], 95.0)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            wb = load_workbook(export_excel(tracker, tmp)["latest"])
+            for sname, expected_snippets in (
+                ("Tong_Quan", ("6 - 8h / Sạc 1.5 - 2h", "6 - 8h / Sạc 2 - 3h")),
+                ("Khu_Unpack_AGV", ("6 - 8h / Sạc 1.5 - 2h", "6 - 8h / Sạc 2 - 3h", "6 - 8 giờ / Sạc 1.5 - 2 giờ", "6 - 8 giờ / Sạc 2 - 3 giờ", "Đang sạc (2.2h)")),
+                ("Khu_Vuc_Dock", ("Chạy 6 - 8h / Sạc 2 - 3h", "6 - 8 giờ / Sạc 2 - 3 giờ")),
+                ("Chi_Tiet_Nhiem_Vu_AGV_Kho", ("6 - 8h (Sạc 1.5 - 2h / 2 - 3h)",)),
+            ):
+                txt = "\n".join(str(c.value) for r in wb[sname].iter_rows(values_only=False) for c in r if c.value is not None)
+                for snippet in expected_snippets:
+                    self.assertIn(snippet, txt, f"{sname} missing '{snippet}'")
 
 
 if __name__ == "__main__":

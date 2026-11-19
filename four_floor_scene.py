@@ -152,7 +152,12 @@ def trolley_parts(with_cartons=False):
         for sx in (-1, 1):
             p.append((sx * .585, y, 1.00, .010, .010, 1.38, ROLLER, 0))
     if with_cartons:
-        slots = ((-.24, 0., .425), (.24, 0., .425), (-.24, 0., .675), (.24, 0., .675), (0., 0., .925))
+        slots = tuple(
+            (lx, ly, .425 + layer * .25)
+            for layer in range(5)
+            for ly in (-.165, .165)
+            for lx in (-.24, .24)
+        )
         for lx, ly, lz in slots:
             p.append((lx, ly, lz, .40, .30, .246, CARTON, 0))
             p.append((lx, ly, lz + .122, .06, .302, .006, '.9 .8 .57 1', 0))
@@ -335,7 +340,7 @@ def people():
 
 FLOOR1_AREAS = {'carton_inbound', 'pallet_pick'}
 ANIMATED_WORKER_AREAS = {'carton_inbound', 'pallet_pick', 'sorting', 'unpack', 'put_away', 'picking_station'} if C.get('loose_pallet_spots') else set()
-TROLLEY_CAPACITY = 5
+TROLLEY_CAPACITY = max(1, int(C.get('trolley_capacity', 20)))
 K06_SLOTS_XY = [
     (-6.20, 14.895), (-4.80, 14.895), (-3.40, 14.895), (-2.00, 14.895),
     (-6.20, 12.695), (-4.80, 12.695), (-3.40, 12.695), (-2.00, 12.695),

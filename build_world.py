@@ -146,19 +146,27 @@ if _spots:
     cl,cw,ch=loose_goods.CARTON
     _carton=merge_boxes('loose_carton',[box('c',0,0,0,cl,cw,ch-.004,CARTON),box('t',0,0,ch/2-.003,.06,cw+.002,.006,'.9 .8 .57 1')])
     _med_box=merge_boxes('med_box',[box(f'mb{k}',*b) for k,b in enumerate(loose_goods.med_box_parts())])
+    _med_pack=merge_boxes('med_pack',[box(f'mp{k}',*b) for k,b in enumerate(loose_goods.med_tray_pack_parts())])
     _loose_pool=max(180,int(C.get('loose_carton_pool',0)),int(C.get('loose_pallets',0))*int(C.get('loose_cartons_per_pallet',0)))
     for i in range(_loose_pool):
         model(f'carton_{i}',(_spots[0][0],_spots[0][1],-5),_carton)
     _z05_pool=max(80,int(C.get('z05_carton_pool',0)),len(loose_goods.Z05_WORKERS)*int(C.get('z05_cartons_per_pallet',loose_goods.Z05_CARTONS_PER_PALLET))*2)
-    _u1_med_total=max(1,int(C.get('u1_cartons_per_rack',4)))*int(C.get('u1_med_boxes_per_carton',loose_goods.U1_MED_PER_CARTON))
-    _u2_med_total=max(1,int(C.get('u2_cartons_per_rack',4)))*int(C.get('u2_med_boxes_per_carton',loose_goods.U1_MED_PER_CARTON))
-    _p1_med_total=max(1,int(C.get('p1_cartons_per_rack',4)))*int(C.get('p1_med_boxes_per_carton',loose_goods.U1_MED_PER_CARTON))
+    _u1_mpc=int(C.get('u1_med_boxes_per_carton',loose_goods.U1_MED_PER_CARTON))
+    _u2_mpc=int(C.get('u2_med_boxes_per_carton',loose_goods.U1_MED_PER_CARTON))
+    _p1_mpc=int(C.get('p1_med_boxes_per_carton',loose_goods.U1_MED_PER_CARTON))
+    _u1_med_total=max(1,int(C.get('u1_cartons_per_rack',8)))*_u1_mpc
+    _u2_med_total=max(1,int(C.get('u2_cartons_per_rack',8)))*_u2_mpc
+    _p1_med_total=max(1,int(C.get('p1_cartons_per_rack',8)))*_p1_mpc
+    _p1_med_mesh=_med_pack if _p1_mpc==1 else _med_box
+    for r_idx in range(8):
+        model(f'z05_ret_deck_{r_idx}',(_spots[0][0],_spots[0][1],-5,0),_deck)
     for f in loose_goods.floors():
         z0=loose_goods.LEVELS[f-1]
         for b in range(len(loose_goods.BRANCHES)):
             rx,ry,_,_=loose_goods.u1_rack_pose(f,b)
-            for m in range(_u1_med_total):
-                model(f'u1_med_{f}_{b}_{m}',(rx,ry,-5,0),_med_box)
+            for r_idx in range(loose_goods.U1_RACKS_PER_BRANCH):
+                for m in range(_u1_med_total):
+                    model(f'u1_med_{f}_{b}_{r_idx}_{m}',(rx,ry,-5,0),_med_pack if _u1_mpc==1 else _med_box)
         for z_idx in range(len(loose_goods.Z05_WORKERS)):
             wx,wy,_,_=loose_goods.z05_station(f,z_idx)
             model(f'z05_deck_{f}_{z_idx}',(wx,wy,-5,0),_deck)
@@ -167,14 +175,15 @@ if _spots:
             model(f'z05_carton_{f}_{c_idx}',(w0x,w0y,-5,0),_carton)
         for u2_idx in range(len(loose_goods.U2_WORKERS)):
             rx,ry,_,_=loose_goods.u2_rack_pose(f,u2_idx)
-            for m in range(_u2_med_total):
-                model(f'u2_med_{f}_{u2_idx}_{m}',(rx,ry,-5,0),_med_box)
+            for r_idx in range(loose_goods.U2_RACKS_PER_STATION):
+                for m in range(_u2_med_total):
+                    model(f'u2_med_{f}_{u2_idx}_{r_idx}_{m}',(rx,ry,-5,0),_med_pack if _u2_mpc==1 else _med_box)
         for st_idx in range(len(loose_goods.P1_STATIONS)):
             r0_pose=loose_goods.p1_rack_pose(f,st_idx)
             for m in range(_p1_med_total):
-                tray_slot=m//loose_goods.U1_MED_PER_CARTON
-                box_i=m%loose_goods.U1_MED_PER_CARTON
-                model(f'p1_med_{f}_{st_idx}_{m}',loose_goods.u1_med_on_rack(r0_pose,box_i,tray_slot),_med_box)
+                tray_slot=m//_p1_mpc
+                box_i=1 if _p1_mpc==1 else (m%_p1_mpc)
+                model(f'p1_med_{f}_{st_idx}_{m}',loose_goods.u1_med_on_rack(r0_pose,box_i,tray_slot),_p1_med_mesh)
             t_pose=loose_goods.p1_trolley_pose(f,st_idx)
             for c_slot in range(loose_goods.TROLLEY_CAPACITY):
                 model(f'p1_carton_{f}_{st_idx}_{c_slot}',loose_goods.trolley_carton_pose(t_pose,c_slot),_carton)
