@@ -55,6 +55,14 @@ def lift_cabin(axis='y'):
     return EQ.cabin(box,cylinder,lambda prefix: EQ.chain_conveyor(box,cylinder,1.8,1.6,axis,legs=False)+
         [box(f'{prefix}rail{dx}',dx,0,RAIL_TOP_OFFSET-RAIL_HEIGHT/2,.10,1.8,RAIL_HEIGHT,STEEL) for dx in [-.48,.48]])
 
+def shuttle_lift_cabin():
+    """Shuttle transfer lift cabin with integrated X/Y rail locks so shuttles ride safely between levels."""
+    return EQ.cabin(box,cylinder,lambda prefix:
+        [box(f'{prefix}yrail{dx}',dx,0,RAIL_TOP_OFFSET-RAIL_HEIGHT/2,.10,1.8,RAIL_HEIGHT,STEEL) for dx in [-.48,.48]]+
+        [box(f'{prefix}xrail{dy}',0,dy,RAIL_TOP_OFFSET-RAIL_HEIGHT/2,1.8,.10,RAIL_HEIGHT,STEEL) for dy in [-.49,.49]]+
+        [box(f'{prefix}lock_x{sx}',sx*.82,0,RAIL_TOP_OFFSET+.04,.08,.90,.06,'.88 .22 .10 1') for sx in (-1,1)]+
+        [box(f'{prefix}lock_y{sy}',0,sy*.82,RAIL_TOP_OFFSET+.04,.90,.08,.06,'.88 .22 .10 1') for sy in (-1,1)])
+
 def pallet_deck():
     v=[]
     # Moulded plastic lattice deck with fork pockets and nine support blocks.
@@ -102,6 +110,10 @@ for y in (LOAD_Y, RETURN_Y): v.append(box(f'aisle{y}',3,y,.004,74,.10,.008,'.86 
 for x,y,_,_ in PARKS:
     for dx in [-.7,.7]: v.append(box(f'park{x}_{dx}',x+dx,y,.005,.06,1.9,.01,'.16 .42 .35 1'))
     for dy in [-.95,.95]: v.append(box(f'parkend{x}_{dy}',x,y+dy,.005,1.46,.06,.01,'.16 .42 .35 1'))
+    # Integrated floor charging pad + north-side charger bollard at each Forklift parking bay
+    v.append(box(f'park_chg_pad{x}',x,y,.008,.70,.70,.012,'.85 .62 .12 1'))
+    v.append(box(f'park_chg_post{x}',x,y+1.15,.55,.28,.22,1.10,'.18 .22 .26 1'))
+    v.append(box(f'park_chg_led{x}',x,y+1.03,.92,.14,.02,.08,'.10 .85 .35 1'))
 v.extend([box('back_wall',26,51,10,54,.18,20,'.64 .67 .69 1'),box('right_wall',53,25,10,.18,52,20,'.59 .63 .65 1')])
 for x in range(0,54,6): v.append(box(f'building_column{x}',x,50.8,10,.25,.3,20,'.35 .39 .42 1'))
 model('site',(0,0,0),merge_boxes('site_mesh',v))
@@ -208,6 +220,23 @@ for i,port in enumerate(LAYOUT.data['ports']['out']):
         model(f'out_corner_{i}_{k}',(tx,ty,z),EQ.chain_conveyor(box,cylinder,1.5,1.35,'x'))
         model(f'out_gate_{i}_{k}',(gx,gy,z),EQ.chain_conveyor(box,cylinder,port['gate_length'],1.35,'x'))
     for k,z in enumerate(C['storage_levels']):model(f'out_buffer_{i}_{k}',(bx,by,z),EQ.chain_conveyor(box,cylinder,1.6,1.35,'y',legs=False))
+
+# Dedicated Shuttle Transfer Lift (with X/Y rail locks) at north-east rail intersection (51.80108, 44.75)
+_sh_lx, _sh_ly = 51.80108, 44.75
+model('shuttle_lift_tower', (_sh_lx, _sh_ly, 0), lift_tower('sh4'))
+model('shuttle_lift_cabin', (_sh_lx, _sh_ly, C['storage_levels'][0]), shuttle_lift_cabin())
+model('shuttle_lift_cw', (_sh_lx + 1.45, _sh_ly + .75, 17.3), EQ.counterweight(box))
+# Outer-edge Lithium battery charging stations for Shuttles along east technical aisle (next to right_wall x=53)
+for k, z in enumerate(C['storage_levels']):
+    chg_v = []
+    for bay_idx, cy_chg in enumerate((36.75, 28.75)):
+        chg_v.extend([
+            box(f'sh_chg_cab_{k}_{bay_idx}', 52.55, cy_chg, .55, .45, .70, 1.10, '.18 .22 .26 1'),
+            box(f'sh_chg_fin_{k}_{bay_idx}', 52.79, cy_chg, .65, .04, .56, .70, '.45 .48 .52 1'),
+            box(f'sh_chg_led_{k}_{bay_idx}', 52.31, cy_chg, .95, .03, .22, .10, '.10 .85 .35 1'),
+            box(f'sh_chg_pad_{k}_{bay_idx}', 51.80108, cy_chg, .02, .90, .80, .03, '.85 .62 .12 1'),
+        ])
+    model(f'shuttle_chargers_{k}', (0, 0, z), merge_boxes(f'sh_chg_{k}', chg_v))
 
 _fork_mesh=merge_boxes('agv_fork',[box('carriage',0,0,.25,.1,.98,.5,DARK),box('forkL',.8,-.23,.04,1.6,.12,.08,STEEL),box('forkR',.8,.23,.04,1.6,.12,.08,STEEL)])
 for i in range(2):

@@ -142,7 +142,7 @@ class ReportExporterTests(unittest.TestCase):
                 ["Tong_Quan", "Kho_ASRS_Shuttle", "Khu_Unpack_AGV", "Khu_Vuc_Dock", "Cong_Nhan_Unpack", "Chi_Tiet_Nhiem_Vu_AGV_Kho"],
             )
             ws_sh = wb["Kho_ASRS_Shuttle"]
-            self.assertEqual(len(ws_sh._charts), 3)
+            self.assertEqual(len(ws_sh._charts), 4)
             sh_text = "\n".join(str(c.value) for row in ws_sh.iter_rows(values_only=False) for c in row if c.value is not None)
             self.assertIn("WH-IN-0001", sh_text)
             self.assertIn("WH-OUT-0001", sh_text)
@@ -302,9 +302,9 @@ class ReportExporterTests(unittest.TestCase):
             self.assertIn("Thông số Shuttle cài đặt", ws1_text)
             self.assertIn("Thông số Thang nâng cài đặt", ws1_text)
             ws = wb["Kho_ASRS_Shuttle"]
-            self.assertEqual(len(ws._charts), 3)
+            self.assertEqual(len(ws._charts), 4)
             chart_types = sorted(type(c).__name__ for c in ws._charts)
-            self.assertEqual(chart_types, ["BarChart", "BarChart", "PieChart"])
+            self.assertEqual(chart_types, ["BarChart", "BarChart", "BarChart", "PieChart"])
             bar_charts = [c for c in ws._charts if type(c).__name__ == "BarChart"]
             pie_chart = next(c for c in ws._charts if type(c).__name__ == "PieChart")
             self.assertIn("theo giờ", str(bar_charts[0].title.tx.rich.p[0].r[0].t))
@@ -329,11 +329,15 @@ class ReportExporterTests(unittest.TestCase):
             self.assertEqual(sec0_row, 4)
             self.assertLess(sec0_row, sec1_row)
             self.assertLess(sec1_row, sec2_row)
-            self.assertEqual((bar_charts[0].anchor._from.col, bar_charts[0].anchor._from.row), (4, 4))
-            self.assertEqual((pie_chart.anchor._from.col, pie_chart.anchor._from.row), (7, 4))
-            self.assertEqual((bar_charts[1].anchor._from.col, bar_charts[1].anchor._from.row), (4, sec1_row - 1))
+            self.assertEqual((bar_charts[0].anchor._from.col, bar_charts[0].anchor._from.row), (5, 4))
+            self.assertEqual((pie_chart.anchor._from.col, pie_chart.anchor._from.row), (8, 4))
+            self.assertEqual((bar_charts[1].anchor._from.col, bar_charts[1].anchor._from.row), (5, sec1_row - 1))
 
-            # Verify merged Section 0 input rows + yellow Shuttle start row + green Lift start row
+            # Verify merged Section 0 input rows (5 cols: Nhóm, Chỉ tiêu, Giá trị, Đơn vị, Thực tế & Diễn giải)
+            self.assertEqual(
+                [ws.cell(sec0_row + 1, c).value for c in range(1, 6)],
+                ["Nhóm thông số", "Chỉ tiêu đầu vào", "Giá trị", "Đơn vị", "Thực tế & Diễn giải"],
+            )
             sec0_rows_by_lbl = {
                 ws.cell(r, 2).value: r
                 for r in range(sec0_row + 2, sec1_row)
@@ -345,17 +349,20 @@ class ReportExporterTests(unittest.TestCase):
             self.assertAlmostEqual(ws.cell(sec0_rows_by_lbl["Trung bình tần suất xuất trong 1 giờ"], 3).value, 37.5, places=2)
             r_shuttle_start = sec0_rows_by_lbl["Số lượng Shuttle (9 chính + 1 Standby)"]
             self.assertEqual(ws.cell(r_shuttle_start, 3).value, 10)
-            for c_hl in range(1, 5):
+            self.assertEqual(ws.cell(r_shuttle_start, 4).value, "xe")
+            for c_hl in range(1, 6):
                 self.assertEqual(ws.cell(r_shuttle_start, c_hl).fill.start_color.rgb, "00FFE082")
             self.assertIn("Thời gian hoạt động liên tục (cấu hình pin)", sec0_rows_by_lbl)
             self.assertAlmostEqual(ws.cell(sec0_rows_by_lbl["Thời gian hoạt động liên tục (cấu hình pin)"], 3).value, 7.0, places=2)
             self.assertIn("Thời gian sạc Shuttle (cấu hình)", sec0_rows_by_lbl)
             r_sh_chg = sec0_rows_by_lbl["Thời gian sạc Shuttle (cấu hình)"]
             self.assertAlmostEqual(ws.cell(r_sh_chg, 3).value, 2.0, places=2)
-            self.assertIn("120 phút", str(ws.cell(r_sh_chg, 4).value))
+            self.assertEqual(ws.cell(r_sh_chg, 4).value, "giờ")
+            self.assertIn("120 phút", str(ws.cell(r_sh_chg, 5).value))
             r_lift_start = sec0_rows_by_lbl["Số lượng Thang Nhập"]
             self.assertEqual(ws.cell(r_lift_start, 3).value, 2)
-            for c_hl in range(1, 5):
+            self.assertEqual(ws.cell(r_lift_start, 4).value, "thang")
+            for c_hl in range(1, 6):
                 self.assertEqual(ws.cell(r_lift_start, c_hl).fill.start_color.rgb, "00A5D6A7")
             self.assertEqual(ws.cell(sec0_rows_by_lbl["Số lượng Thang Xuất"], 3).value, 2)
             self.assertAlmostEqual(ws.cell(sec0_rows_by_lbl["Tần suất hoạt động TB (4 thang / giờ)"], 3).value, 56.25, places=2)
@@ -473,9 +480,9 @@ class ReportExporterTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             wb = load_workbook(export_excel(tracker, tmp)["latest"])
             expected_charts = {
-                "Tong_Quan": 3,
-                "Kho_ASRS_Shuttle": 3,
-                "Khu_Unpack_AGV": 3,
+                "Tong_Quan": 4,
+                "Kho_ASRS_Shuttle": 4,
+                "Khu_Unpack_AGV": 4,
                 "Khu_Vuc_Dock": 3,
                 "Cong_Nhan_Unpack": 3,
                 "Chi_Tiet_Nhiem_Vu_AGV_Kho": 2,
@@ -483,15 +490,19 @@ class ReportExporterTests(unittest.TestCase):
             for sname, chart_cnt in expected_charts.items():
                 ws = wb[sname]
                 self.assertEqual(len(ws._charts), chart_cnt, f"{sname} chart count mismatch")
-                # Row 4 splits into left A:D Section 0 input banner and right E:J chart panel banner
+                # All 6 sheets use unified 5-column Section 0 + right chart panel banner
+                sec0_cols = 5
+                expected_r4 = [(1, 5), (6, 11)]
                 r4_merges = sorted((m.min_col, m.max_col) for m in ws.merged_cells.ranges if m.min_row == 4 and m.max_row == 4)
-                self.assertEqual(r4_merges, [(1, 4), (5, 10)], f"{sname} row 4 banner mismatch")
+                self.assertEqual(r4_merges, expected_r4, f"{sname} row 4 banner mismatch")
                 self.assertTrue(str(ws.cell(4, 1).value or "").startswith("0. "), f"{sname} row 4 should start with '0. '")
-                # Row 5 has 4-col Section 0 input headers (Giá trị at Col 3) and E5 & H5 anchor top 2 charts
+                # Row 5 has Section 0 input headers (Giá trị at Col 3, Đơn vị at Col 4, Thực tế & Diễn giải at Col 5)
                 self.assertEqual(ws.cell(5, 2).value, "Chỉ tiêu đầu vào", f"{sname} row 5 col 2 header mismatch")
                 self.assertEqual(ws.cell(5, 3).value, "Giá trị")
+                self.assertEqual(ws.cell(5, 4).value, "Đơn vị")
+                self.assertEqual(ws.cell(5, 5).value, "Thực tế & Diễn giải")
                 top_anchors = [(ch.anchor._from.col, ch.anchor._from.row) for ch in ws._charts[:2]]
-                self.assertEqual(top_anchors, [(4, 4), (7, 4)], f"{sname} top charts should anchor at E5 & H5")
+                self.assertEqual(top_anchors, [(5, 4), (8, 4)], f"{sname} top charts anchor mismatch")
                 # All stacked BarCharts must be bounded 0..100%
                 for ch in ws._charts:
                     if type(ch).__name__ == "BarChart" and ch.grouping == "stacked":
@@ -506,7 +517,7 @@ class ReportExporterTests(unittest.TestCase):
                     rgb = ws.cell(r_cur, 1).fill.start_color.rgb
                     if rgb in ("00FFE082", "00A5D6A7"):
                         sec0_fills.add(rgb)
-                        for c_hl in range(1, 5):
+                        for c_hl in range(1, sec0_cols + 1):
                             self.assertEqual(ws.cell(r_cur, c_hl).fill.start_color.rgb, rgb)
                     r_cur += 1
                 self.assertEqual(sec0_fills, {"00FFE082", "00A5D6A7"}, f"{sname} missing yellow/green Section 0 start rows")
@@ -541,7 +552,7 @@ class ReportExporterTests(unittest.TestCase):
                 sec3_r = next(r for r in range(1, ws_s.max_row + 1) if str(ws_s.cell(r, 1).value or "").startswith("3. "))
                 self.assertGreater(sec2_r, sec1_r, f"{sname} sec2 should follow sec1")
                 self.assertGreater(sec3_r, sec2_r, f"{sname} sec3 should follow sec2")
-                self.assertEqual((ws_s._charts[2].anchor._from.col, ws_s._charts[2].anchor._from.row), (4, sec1_r - 1))
+                self.assertEqual((ws_s._charts[2].anchor._from.col, ws_s._charts[2].anchor._from.row), (5, sec1_r - 1))
 
     def test_three_state_interval_separation_and_dock_waits(self):
         tracker = SimulationTracker(self.config, total_jobs=4, cycle_duration_s=100.0)

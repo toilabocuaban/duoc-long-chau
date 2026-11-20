@@ -141,6 +141,17 @@ class DockFlow:
             f'dock_deck_{i}':stage(d)[:2]+(0,0),
             **{f'dock_carton_{i}_{j}':dst[j]+(0,) for j in range(min(cnt,len(dst)))},
         })
+    def _reset_stage_deck(self,i,count=None):
+        """Place an empty pallet deck on the returning pallet jack at the dock, with all cartons hidden until unloaded."""
+        d=self.docks[i];st=stage(d)
+        cnt=count if count is not None else max(18,int(self.c.get('loose_cartons_per_pallet',18)))
+        self.poses[f'dock_jack_{i}']=st[:2]+(0.,-math.pi/2)
+        self.poses[f'dock_deck_{i}']=st[:2]+(0.,0.)
+        self.send({
+            f'dock_jack_{i}':st[:2]+(0.,-math.pi/2),
+            f'dock_deck_{i}':st[:2]+(0.,0.),
+            **{f'dock_carton_{i}_{j}':(st[0],st[1],-5.,0.) for j in range(cnt)},
+        })
     def initialize(self):
         cnt=max(18,int(self.c.get('loose_cartons_per_pallet',18)))
         for i,d in enumerate(self.docks):
@@ -451,13 +462,7 @@ class DockFlow:
                 for j in range(count):
                     self.emit('BARCODE_CLASSIFIED',barcode=f'{kind.upper()}-{k:04d}-{j:03d}',classification=kind,dock=d['id'])
             return local
-        anim_start=max(0,count-2)
-        self.send({local[j]:dst[j]+(0,) for j in range(anim_start)})
-        if emit_classified and anim_start>0:
-            self.stats['scanned_'+kind]+=anim_start
-            for j in range(anim_start):
-                self.emit('BARCODE_CLASSIFIED',barcode=f'{kind.upper()}-{k:04d}-{j:03d}',classification=kind,dock=d['id'])
-        for j in range(anim_start,count):
+        for j in range(count):
             n,p,out=local[j],src[j],dst[j]
             self.send({n:p+(0,)})
             await self.worker(i,(d['x']-.45,d['rear_y']+.25,-math.pi/2))
@@ -479,7 +484,7 @@ class DockFlow:
                 out_p[n]=c_pose
                 return out_p
             await self.e.move(pick_anim(1),duration=pick_dur,transform=pick_anim,exact=True)
-            await self.worker(i,(d['x']+.70,d['rear_y']+.65,-math.pi/2),n)
+            await self.worker(i,(d['x']+.42,d['rear_y']+.72,-math.pi/4),n)
             await self.idle(i,self.c.get('inbound_scan_s',2),n)
             if emit_classified:
                 self.stats['scanned_'+kind]+=1
@@ -489,9 +494,9 @@ class DockFlow:
                 place_y = out[1]
                 place_yaw = 0.0
             elif out[0] > d['x'] + 0.15:
-                place_x = out[0] + 0.46
-                place_y = out[1]
-                place_yaw = math.pi
+                place_x = out[0]
+                place_y = out[1] + 0.55
+                place_yaw = -math.pi/2
             else:
                 place_x = d['x'] + 0.52
                 place_y = out[1]
@@ -541,17 +546,17 @@ class DockFlow:
                         self.emit('DOCK_SLOT_WAIT',dock=d['id'],classification=kind,batch=k,wait_s=round(t_tw1-t_tw0,4),start_s=round(t_tw0,4),end_s=round(t_tw1,4))
                     await self.transfer(i,local,target,traffic=traffic)
                     await consume(i,local)
-                    self._restock_stage_visual(i,len(local))
                     self.stats['pallets_to_w2']+=1
                     await self.transfer(i,[],stage(d),True,without_deck=True,traffic=traffic)
+                    self._reset_stage_deck(i,len(local))
                     self.stats['empty_pallet_returns']+=1
                     self.emit('EMPTY_PALLET_RETURNED',dock=d['id'],batch=k,classification=kind)
             else:
                 await self.transfer(i,local,target,traffic=traffic)
                 await consume(i,local)
-                self._restock_stage_visual(i,len(local))
                 self.stats['pallets_to_w1']+=1
                 await self.transfer(i,[],stage(d),True,without_deck=True,traffic=traffic)
+                self._reset_stage_deck(i,len(local))
                 self.emit('EMPTY_PALLET_FROM_POOL',dock=d['id'],batch=k)
         finally:
             await traffic.__aexit__(None,None,None)
@@ -574,7 +579,7 @@ class DockFlow:
             if t_sw1-t_sw0>1e-4:
                 self.emit('DOCK_SLOT_WAIT',dock=d['id'],classification='staged',batch=k,wait_s=round(t_sw1-t_sw0,4),start_s=round(t_sw0,4),end_s=round(t_sw1,4))
             if claimed is None:
-                self._restock_stage_visual(i,count)
+                self._reset_stage_deck(i,count)
                 return
             kind,target,acquire_target,consume=claimed
             self.stats['scanned_'+kind]+=count

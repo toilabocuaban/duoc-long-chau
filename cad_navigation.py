@@ -58,8 +58,14 @@ class DesignLayout:
     def slot_point(self,sid):
         s=self.slots[sid];return key((s['x'],s['y']))
 
+    def _snap(self,pt):
+        pt=key(pt)
+        if pt in self.graph:return pt
+        near=min(self.graph,key=lambda n:math.dist(pt,n))
+        return near if math.dist(pt,near)<=0.02 else pt
+
     def path(self,start,end):
-        start,end=key(start),key(end)
+        start,end=self._snap(start),self._snap(end)
         if start not in self.graph or end not in self.graph:raise ValueError(f'Point outside CAD graph: {start} -> {end}')
         queue=[(0,start)];cost={start:0};previous={}
         while queue:

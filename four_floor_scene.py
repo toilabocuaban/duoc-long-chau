@@ -101,6 +101,23 @@ def rack_parts(hollow_trays=False):
     for sy in (-1, 1): p.append((0, sy * .38, 1.675, 1.2, .04, .05, RACK_BEAM, 0))
     return p
 
+MED_YELLOW = '.96 .82 .10 1'; MED_WHITE = '.96 .96 .94 1'; MED_ORANGE = '.95 .42 .08 1'
+
+def loaded_rack_parts():
+    """4-shelf rack with hollow blue trays filled with yellow medicine box clusters (exact med_box_parts geometry)."""
+    p = rack_parts(hollow_trays=True)
+    for z in (.40, .74, 1.08, 1.42):
+        z_off = z + .16
+        for tx in (-.295, .295):
+            for m in range(3):
+                dx = (m - 1) * .165
+                for sx in (-.038, .038):
+                    for sy in (-.078, .078):
+                        p.append((tx + dx + sx, sy, z_off + .035, .068, .145, .15, MED_YELLOW, 0))
+                        p.append((tx + dx + sx, sy, z_off - .065, .068, .145, .05, MED_WHITE, 0))
+                        p.append((tx + dx + sx, sy, z_off - .030, .070, .147, .02, MED_ORANGE, 0))
+    return p
+
 def u1_rack_parts():
     """U1 inbound rack: 4-shelf rack with hollow open-top blue plastic trays (580x415x260 mm)."""
     return rack_parts(hollow_trays=True)
@@ -346,9 +363,10 @@ K06_SLOTS_XY = [
     (-6.20, 12.695), (-4.80, 12.695), (-3.40, 12.695), (-2.00, 12.695),
 ]
 K06_INITIAL_SLOTS = (4, 5, 6, 7)   # Khu 06 slots holding a waiting trolley at start; slots 0-3 start empty
+AGV_CHARGING_BAYS_XY = [(-49.2, 46.8), (-47.8, 46.8), (-13.5, 46.8), (-12.1, 46.8)]   # 4 perimeter AGV charging bays/floor north of y=45.291
 U1_RACK_Y = 12.691             # CAD x1 rack station directly behind each sorting worker (y=11.981)
 U1_BRANCHES = sorted((c['rect'] for c in L['conveyors'] if c['block'] == '*U632'), key=cx)
-U1_RACKS_PER_BRANCH = 2         # 1 rack at U1 station + 1 replacement rack in Kho 04
+U1_RACKS_PER_BRANCH = 3         # 1 rack at U1 station + 2 replacement racks in Kho 04
 
 def _u1_kho04_pool():
     c160 = sorted((c for c in L['rack_cells'] if round(c['y'], 3) == 16.056), key=lambda c: c['x'])
@@ -358,7 +376,7 @@ def _u1_kho04_pool():
     return c160 + c169 + c205
 
 _U1_POOL = _u1_kho04_pool()
-U1_BRANCH_CELLS = {b: [_U1_POOL[b], _U1_POOL[6 + b]]
+U1_BRANCH_CELLS = {b: [_U1_POOL[b], _U1_POOL[6 + b], _U1_POOL[12 + b]]
                    for b in range(len(U1_BRANCHES))}
 U1_RESERVED_CELL_XY = {(round(c['x'], 3), round(c['y'], 3)) for cells in U1_BRANCH_CELLS.values() for c in cells}
 
@@ -368,8 +386,8 @@ U2_RACK_X = -8.773
 U2_RACKS_Y = [40.881, 36.121, 32.121, 28.121, 24.121, 17.959]
 U2_CORRIDORS_Y = [40.881, 36.121, 32.121, 28.121, 24.121, 19.059]
 U2_CELL_ROWS_Y = [41.879, 37.115, 33.123, 29.122, 25.122, 20.561]
-U2_CELL_XS = (-13.105, -14.406)
-U2_RACKS_PER_STATION = 2
+U2_CELL_XS = (-13.105, -14.406, -15.707)
+U2_RACKS_PER_STATION = 3
 U2_STATION_CELLS = {u2_idx: [next(c for c in L['rack_cells']
                                   if round(c['x'], 3) == rx and round(c['y'], 3) == U2_CELL_ROWS_Y[u2_idx])
                              for rx in U2_CELL_XS]
@@ -405,6 +423,18 @@ P1_STATION_CELLS = {
     for st_idx, (cy_row, xs, _) in P1_CELL_MAP.items()
 }
 P1_RESERVED_CELL_XY = {(round(c['x'], 3), round(c['y'], 3)) for cells in P1_STATION_CELLS.values() for c in cells}
+# Remaining unreserved Kho 04 rack cells: populate ~2/3 with yellow-medicine stock racks, leaving ~1/3 empty.
+# Keep 14 movable stock racks/floor (56 total) for P1 AGVs to avoid OOM in Gazebo; merge the rest into ff_static.
+_UNRESERVED_K04_CELLS = sorted(
+    (c for c in L['rack_cells']
+     if (round(c['x'], 3), round(c['y'], 3)) not in (U1_RESERVED_CELL_XY | U2_RESERVED_CELL_XY | P1_RESERVED_CELL_XY)),
+    key=lambda c: (round(c['y'], 3), round(c['x'], 3)),
+)
+K04_STOCK_CELLS = [c for idx, c in enumerate(_UNRESERVED_K04_CELLS) if idx % 3 != 2]
+_K04_MOVABLE_STEP = max(1, len(K04_STOCK_CELLS) // 14)
+K04_MOVABLE_STOCK_CELLS = [K04_STOCK_CELLS[i * _K04_MOVABLE_STEP] for i in range(14)]
+_K04_MOVABLE_XY = {(round(c['x'], 3), round(c['y'], 3)) for c in K04_MOVABLE_STOCK_CELLS}
+K04_STATIC_STOCK_CELLS = [c for c in K04_STOCK_CELLS if (round(c['x'], 3), round(c['y'], 3)) not in _K04_MOVABLE_XY]
 
 def spot_marks(s):
     x0, y0, x1, y1 = s
@@ -424,9 +454,9 @@ def floor_common():
     for c in L['columns']: v.append(rect_box(c, 0, FLOOR_H - .15, CONCRETE))         # structural, 8.3 m grid
     for c in L.get('wall_posts', []):
         if not east_interface(c): v.append(rect_box(c, 0, FLOOR_H - .15, CONCRETE))
-    for r in L['rack_cells']:
-        if (round(r['x'], 3), round(r['y'], 3)) not in (U1_RESERVED_CELL_XY | U2_RESERVED_CELL_XY | P1_RESERVED_CELL_XY):
-            v += place(rack_parts(), r['x'], r['y'], r['yaw'])
+    _loaded_parts = loaded_rack_parts()
+    for r in K04_STATIC_STOCK_CELLS:
+        v += place(_loaded_parts, r['x'], r['y'], r['yaw'])
     for st in L['stations']:
         if st['desk']: v.append(rect_box(st['desk'], 0, .83, DESK)); v.append(rect_box(st['desk'], .83, .85, DESK_TOP))
         for c in st['desk_cells']: v.append(rect_box(c, .85, 1.07, BIN, .015))   # ASSUMPTION: bins 220 mm on an 850 mm desk
@@ -445,6 +475,11 @@ def floor_common():
         if cy(s) >= 0: v += spot_marks(s)
     for s_idx, (kx, ky) in enumerate(K06_SLOTS_XY):   # trolleys here are movable models (k06_trolley_*)
         v += spot_marks([kx - .62, ky - .42, kx + .62, ky + .42])
+    for cx_b, cy_b in AGV_CHARGING_BAYS_XY:
+        v += spot_marks([cx_b - .55, cy_b - .45, cx_b + .55, cy_b + .45])
+        v.append(box(nm('chgpad'), cx_b, cy_b, .008, .60, .55, .012, '.85 .62 .12 1'))
+        v.append(box(nm('chgpost'), cx_b, cy_b + .68, .50, .24, .20, 1.00, '.18 .22 .26 1'))
+        v.append(box(nm('chgled'), cx_b, cy_b + .57, .86, .12, .02, .07, '.10 .85 .35 1'))
     for z in L['unpack_zones']:
         x0, y0, x1, y1 = z
         for e in ((x0, y0, x1, y0), (x1, y0, x1, y1), (x1, y1, x0, y1), (x0, y1, x0, y0)): v.append(line_box(e, .06, .004, TAPE_Y))
@@ -527,6 +562,7 @@ def models():
     u1_agv_mesh = merge_boxes('ff_u1_agv', place(agv_parts(), 0, 0, 0))
     u1_rack_mesh = merge_boxes('ff_u1_rack', place(u1_rack_parts(), 0, 0, 0))
     p1_rack_mesh = merge_boxes('ff_p1_rack', place(p1_rack_parts(), 0, 0, 0))
+    k04_loaded_rack_mesh = merge_boxes('ff_k04_loaded_rack', place(loaded_rack_parts(), 0, 0, 0))
     unpack_rack_mesh = merge_boxes('ff_unpack_rack', place(rack_parts(), 0, 0, 0))
     trolley_empty_mesh = merge_boxes('ff_trolley_empty', place(trolley_parts(with_cartons=False), 0, 0, 0))
     z05_jack_mesh = merge_boxes('ff_z05_jack', place(jack_parts(), 0, 0, 0))
@@ -588,8 +624,13 @@ def models():
             for r_idx in range(1, P1_RACKS_PER_STATION):
                 cell = P1_STATION_CELLS[st_idx][r_idx]
                 out.append(model(f'p1_rack_{f}_{st_idx}_{r_idx}', (cell['x'], cell['y'], zf, cell.get('yaw', 0.)), p1_rack_mesh, static=True))
+            for r_idx in range(P1_RACKS_PER_STATION, 3):
+                out.append(model(f'p1_rack_{f}_{st_idx}_{r_idx}', (rx, ry, -5., ryaw), p1_rack_mesh, static=True))
             tx, ty, tyaw = p1_trolley_xy_yaw(st_idx)
             out.append(model(f'p1_trolley_{f}_{st_idx}', (tx, ty, zf, tyaw), trolley_empty_mesh, static=True))
+        # Movable Kho 04 stock racks loaded with yellow medicine boxes (participate in P1 outbound picking).
+        for k_idx, cell in enumerate(K04_MOVABLE_STOCK_CELLS):
+            out.append(model(f'k04_stock_{f}_{k_idx}', (cell['x'], cell['y'], zf, cell.get('yaw', 0.)), k04_loaded_rack_mesh, static=True))
         # Khu 06 trolley buffer: K06_INITIAL_SLOTS hold waiting trolleys, the other slots start empty.
         for k, slot in enumerate(K06_INITIAL_SLOTS):
             kx, ky = K06_SLOTS_XY[slot]

@@ -446,6 +446,19 @@ def p1_med_in_carton(carton_pose, m):
     dx, dy = _rot(cyaw, (offset, 0.))
     return (cx + dx, cy + dy, cz + .05, cyaw)
 
+ROW_TO_CORRIDOR_Y = {
+    16.056: 13.795, 16.951: 17.959,
+    20.561: 19.059, 21.455: 22.464,
+    25.122: 24.121, 26.024: 27.021,
+    29.122: 28.121, 30.025: 31.021,
+    33.123: 32.121, 34.025: 35.021,
+    37.115: 36.121, 38.025: 39.021,
+    41.879: 40.881, 42.782: 44.191,
+}
+
+def _cell_corridor_y(y, default_y):
+    return ROW_TO_CORRIDOR_Y.get(round(y, 3), default_y)
+
 def p1_agv_route(start_xyz, end_xyz, st_idx):
     """3D polyline along CAD agv_paths connecting P1 station rack spot and Kho 04 rack_cells on the same floor."""
     idx = st_idx % len(P1_STATIONS)
@@ -454,18 +467,23 @@ def p1_agv_route(start_xyz, end_xyz, st_idx):
     _, _, corr_y = P1_CELL_MAP[idx]
     st = P1_STATIONS[idx]
     rx, ry = FF.cx(st['rack']), FF.cy(st['rack'])
+    c1 = corr_y if (abs(x1 - rx) < 1e-2 and abs(y1 - ry) < 1e-2) else _cell_corridor_y(y1, corr_y)
+    c2 = corr_y if (abs(x2 - rx) < 1e-2 and abs(y2 - ry) < 1e-2) else _cell_corridor_y(y2, corr_y)
     raw = [(x1, y1, z)]
     if idx >= 7:
-        if abs(x1 - rx) < 1e-2 and abs(y1 - corr_y) > 1e-2:
-            raw += [(-45.706, y1, z), (-45.706, corr_y, z)]
-        elif abs(y1 - corr_y) > 1e-2:
-            raw.append((x1, corr_y, z))
-        if abs(x2 - rx) < 1e-2 and abs(y2 - corr_y) > 1e-2:
-            raw += [(-45.706, corr_y, z), (-45.706, y2, z), (x2, y2, z)]
-        else:
-            raw += [(x2, corr_y, z), (x2, y2, z)]
+        if abs(x1 - rx) < 1e-2 and abs(y1 - c1) > 1e-2:
+            raw += [(-45.706, y1, z), (-45.706, c1, z)]
+        elif abs(y1 - c1) > 1e-2:
+            raw.append((x1, c1, z))
     else:
-        raw += [(x1, corr_y, z), (x2, corr_y, z), (x2, y2, z)]
+        if abs(y1 - c1) > 1e-2:
+            raw.append((x1, c1, z))
+    if abs(c1 - c2) > 1e-2:
+        raw += [(-45.706, c1, z), (-45.706, c2, z)]
+    if idx >= 7 and abs(x2 - rx) < 1e-2 and abs(y2 - c2) > 1e-2:
+        raw += [(-45.706, c2, z), (-45.706, y2, z), (x2, y2, z)]
+    else:
+        raw += [(x2, c2, z), (x2, y2, z)]
     pts = [raw[0]]
     for p in raw[1:]:
         if math.hypot(p[0] - pts[-1][0], p[1] - pts[-1][1]) > 1e-4:

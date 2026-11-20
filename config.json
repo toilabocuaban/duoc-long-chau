@@ -26,7 +26,7 @@
                         1.0,
                         1.7
                     ],
-    "speed_multiplier":  4.0,
+    "speed_multiplier":  40.0,
     "sim_substep_s":  0.1,
     "agv_speed":  1.8,
     "lift_speed":  0.6,
@@ -86,6 +86,9 @@
     "shuttle_continuous_hours":  7.0,
     "shuttle_charge_hours":  2.0,
     "shuttle_charge_min":  120.0,
+    "charge_threshold_pct":  20.0,
+    "shuttle_drain_pct_per_m":  0.015,
+    "shuttle_drain_idle_pct_per_s":  0.001,
     "lift_availability":  0.8,
     "lift_utilization":  0.8,
     "trolley_capacity":  20,
