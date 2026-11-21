@@ -16,7 +16,13 @@ class ReportExporterTests(unittest.TestCase):
         self.config = json.loads((ROOT / "config.json").read_text(encoding="utf-8"))
 
     def test_shuttles_agvs_dock_workers_and_excel_sheets(self):
-        tracker = SimulationTracker(self.config, total_jobs=10, cycle_duration_s=120.0)
+        cfg = {
+            **self.config,
+            "agv_drain_loaded_pct_per_m": 0.04,
+            "agv_drain_empty_pct_per_m": 0.02,
+            "agv_drain_idle_pct_per_s": 0.002,
+        }
+        tracker = SimulationTracker(cfg, total_jobs=10, cycle_duration_s=120.0)
 
         # Verify initial fleet sizes: 10 shuttles, 2 + 4*(2 + 2 + 6) = 42 pooled AGVs
         self.assertEqual(len(tracker.shuttles), 10)
@@ -142,7 +148,7 @@ class ReportExporterTests(unittest.TestCase):
                 ["Tong_Quan", "Kho_ASRS_Shuttle", "Khu_Unpack_AGV", "Khu_Vuc_Dock", "Cong_Nhan_Unpack", "Chi_Tiet_Nhiem_Vu_AGV_Kho"],
             )
             ws_sh = wb["Kho_ASRS_Shuttle"]
-            self.assertEqual(len(ws_sh._charts), 4)
+            self.assertEqual(len(ws_sh._charts), 3)
             sh_text = "\n".join(str(c.value) for row in ws_sh.iter_rows(values_only=False) for c in row if c.value is not None)
             self.assertIn("WH-IN-0001", sh_text)
             self.assertIn("WH-OUT-0001", sh_text)
@@ -186,7 +192,8 @@ class ReportExporterTests(unittest.TestCase):
             self.assertIn("Z05-T1-CN1", wrk_text)
 
     def test_empty_cycle_export_and_battery_clamp(self):
-        tracker = SimulationTracker(self.config, total_jobs=0, cycle_duration_s=10.0)
+        cfg = {**self.config, "agv_drain_loaded_pct_per_m": 0.04}
+        tracker = SimulationTracker(cfg, total_jobs=0, cycle_duration_s=10.0)
         tracker.record_agv_leg("agv_1", 10000.0, True, 100.0)
         snap = tracker.snapshot(50.0, stop_reason="Bản lưu tạm")
         self.assertEqual(snap.agvs["agv_1"]["battery_remaining_pct"], 0.0)
@@ -302,12 +309,14 @@ class ReportExporterTests(unittest.TestCase):
             self.assertIn("Thông số Shuttle cài đặt", ws1_text)
             self.assertIn("Thông số Thang nâng cài đặt", ws1_text)
             ws = wb["Kho_ASRS_Shuttle"]
-            self.assertEqual(len(ws._charts), 4)
+            self.assertEqual(len(ws._charts), 3)
             chart_types = sorted(type(c).__name__ for c in ws._charts)
-            self.assertEqual(chart_types, ["BarChart", "BarChart", "BarChart", "PieChart"])
+            self.assertEqual(chart_types, ["BarChart", "BarChart", "PieChart"])
             bar_charts = [c for c in ws._charts if type(c).__name__ == "BarChart"]
             pie_chart = next(c for c in ws._charts if type(c).__name__ == "PieChart")
             self.assertIn("theo giờ", str(bar_charts[0].title.tx.rich.p[0].r[0].t))
+            self.assertIn("Đang sạc", str(bar_charts[1].title.tx.rich.p[0].r[0].t))
+            self.assertEqual(len(bar_charts[1].series), 4)
             self.assertEqual(bar_charts[1].y_axis.scaling.min, 0)
             self.assertEqual(bar_charts[1].y_axis.scaling.max, 100)
             self.assertIn("9 Shuttle", str(pie_chart.title.tx.rich.p[0].r[0].t))
@@ -435,6 +444,7 @@ class ReportExporterTests(unittest.TestCase):
                 "Mã quy trình", "Mã Thang nâng", "Mã Shuttle",
                 "Thời điểm bắt đầu", "TG hàng đợi Thang nâng", "TG hàng đợi Shuttle",
                 "Thời điểm kết thúc", "Tổng TG quy trình",
+                "Đang sạc (%)", "TG sạc (phút)", "Pin còn lại (%)",
             ):
                 self.assertIn(expected, text)
 
@@ -481,7 +491,7 @@ class ReportExporterTests(unittest.TestCase):
             wb = load_workbook(export_excel(tracker, tmp)["latest"])
             expected_charts = {
                 "Tong_Quan": 4,
-                "Kho_ASRS_Shuttle": 4,
+                "Kho_ASRS_Shuttle": 3,
                 "Khu_Unpack_AGV": 4,
                 "Khu_Vuc_Dock": 3,
                 "Cong_Nhan_Unpack": 3,
@@ -553,6 +563,8 @@ class ReportExporterTests(unittest.TestCase):
                 self.assertGreater(sec2_r, sec1_r, f"{sname} sec2 should follow sec1")
                 self.assertGreater(sec3_r, sec2_r, f"{sname} sec3 should follow sec2")
                 self.assertEqual((ws_s._charts[2].anchor._from.col, ws_s._charts[2].anchor._from.row), (5, sec1_r - 1))
+                if len(ws_s._charts) == 4:
+                    self.assertEqual((ws_s._charts[3].anchor._from.col, ws_s._charts[3].anchor._from.row), (8, sec1_r - 1))
 
     def test_three_state_interval_separation_and_dock_waits(self):
         tracker = SimulationTracker(self.config, total_jobs=4, cycle_duration_s=100.0)
@@ -628,6 +640,25 @@ class ReportExporterTests(unittest.TestCase):
         tracker = SimulationTracker(self.config, total_jobs=10, cycle_duration_s=120.0)
         self.assertEqual(len(tracker.agvs), 42)
 
+        # 2 full-unpack outbound pulls + 1 partial-return outbound pull + 1 return push-back = 3 total outbound
+        for idx, (pid, lcode, wcode) in enumerate((
+            ("pallet_0", "LF-OUT-0001", "WH-OUT-0001"),
+            ("pallet_2", "LF-OUT-0002", "WH-OUT-0002"),
+        )):
+            tracker.start_lift_task("out_lift_0", "Xuất kho", lcode, pid)
+            tracker.record_lift_leg("out_lift_0", 6.0, 5.0)
+            tracker.finish_lift_task("out_lift_0")
+            tracker.start_shuttle_task("shuttle_0", "Xuất kho", wcode, pid, 0, f"S10{idx+1}", 10.0 + idx * 10.0)
+            tracker.record_shuttle_leg("shuttle_0", 12.0, 8.0)
+            tracker.finish_shuttle_task("shuttle_0", 18.0 + idx * 10.0)
+
+        tracker.start_lift_task("out_lift_1", "Xuất tạm hoàn Z05", "LF-OUT-0003", "pallet_1")
+        tracker.record_lift_leg("out_lift_1", 6.0, 5.0)
+        tracker.finish_lift_task("out_lift_1")
+        tracker.start_shuttle_task("shuttle_1", "Xuất tạm hoàn Z05", "WH-OUT-0003", "pallet_1", 1, "S205", 20.0)
+        tracker.record_shuttle_leg("shuttle_1", 12.0, 8.0)
+        tracker.finish_shuttle_task("shuttle_1", 28.0)
+
         tracker.record_event({"loose": True, "state": "Z05_JACK_PULL_FROM_GATE", "demo_time_s": 5.0, "floor": 1, "worker": 0, "job": 1})
         tracker.record_event({"loose": True, "state": "Z05_PALLET_PARTIAL_RETURN", "demo_time_s": 18.0, "floor": 1, "worker": 0, "job": 1, "unpacked_cartons": 12, "remaining_cartons": 6})
         tracker.record_event({"loose": True, "state": "PALLET_RETURNED_TO_STORAGE", "demo_time_s": 40.0, "floor": 1, "level": 2, "slot": "S205", "pallet_id": "pallet_1", "remaining_cartons": 6})
@@ -652,20 +683,43 @@ class ReportExporterTests(unittest.TestCase):
         self.assertEqual(len(tracker.agvs), 42)
         self.assertEqual(summary["agv_p1_tasks"], 1)
         self.assertEqual(summary["z05_partial_returns"], 1)
+        self.assertEqual(summary["warehouse_outbound_tasks"], 3)
+        self.assertEqual(summary["warehouse_outbound_full_tasks"], 2)
+        self.assertEqual(summary["warehouse_outbound_partial_tasks"], 1)
+        self.assertEqual(summary["lift_outbound_tasks"], 3)
+        self.assertEqual(summary["lift_outbound_full_tasks"], 2)
+        self.assertEqual(summary["lift_outbound_partial_tasks"], 1)
         self.assertEqual(summary["warehouse_return_tasks"], 1)
         self.assertEqual(summary["lift_return_tasks"], 1)
+        self.assertEqual(tracker.shuttles["shuttle_1"]["partial_out_count"], 1)
         self.assertEqual(tracker.shuttles["shuttle_1"]["return_count"], 1)
+        self.assertEqual(tracker.lifts["out_lift_1"]["partial_out_count"], 1)
         self.assertEqual(tracker.lifts["out_lift_0"]["return_count"], 1)
 
         with tempfile.TemporaryDirectory() as tmp:
             wb = load_workbook(export_excel(tracker, tmp)["latest"])
-            sh_text = "\n".join(str(c.value) for r in wb["Kho_ASRS_Shuttle"].iter_rows(values_only=False) for c in r if c.value is not None)
+            ov_text = "\n".join(str(c.value) for r in wb["Tong_Quan"].iter_rows(values_only=False) for c in r if c.value is not None)
+            self.assertIn("2 unpack hết", ov_text)
+            self.assertIn("1 hoàn kho", ov_text)
+
+            ws_sh = wb["Kho_ASRS_Shuttle"]
+            sh_text = "\n".join(str(c.value) for r in ws_sh.iter_rows(values_only=False) for c in r if c.value is not None)
             self.assertIn("Hoàn kho (Hàng dư Z05)", sh_text)
+            self.assertIn("2 unpack hết & 1 hoàn kho", sh_text)
+            sh_sec1_vals = {
+                ws_sh.cell(r, 2).value: ws_sh.cell(r, 3).value
+                for r in range(1, ws_sh.max_row + 1)
+                if ws_sh.cell(r, 2).value in ("Tổng nhiệm vụ Shuttle - Xuất kho", "Tổng hàng qua 4 Thang nâng - Xuất kho")
+            }
+            self.assertEqual(sh_sec1_vals["Tổng nhiệm vụ Shuttle - Xuất kho"], 3)
+            self.assertEqual(sh_sec1_vals["Tổng hàng qua 4 Thang nâng - Xuất kho"], 3)
+
             agv_text = "\n".join(str(c.value) for r in wb["Khu_Unpack_AGV"].iter_rows(values_only=False) for c in r if c.value is not None)
             self.assertIn("P1-AGV-T2-S04", agv_text)
             self.assertIn("Đội P1-Tây-1", agv_text)
             wrk_text = "\n".join(str(c.value) for r in wb["Cong_Nhan_Unpack"].iter_rows(values_only=False) for c in r if c.value is not None)
             self.assertIn("Kéo pallet từ Thang Xuất về Z05", wrk_text)
+            self.assertIn("2 unpack hết & 1 hoàn kho", wrk_text)
             self.assertNotIn("F4", wrk_text)
 
     def test_agv_and_forklift_duty_and_charge_specs(self):

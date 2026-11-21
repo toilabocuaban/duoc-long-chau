@@ -222,6 +222,7 @@ SHUTTLE_LIFT_XY=(51.80108,44.75)
 SHUTTLE_CHARGE_BAYS=((51.80108,36.75),(51.80108,28.75))
 SHUTTLE_LIFT_LOCK=asyncio.Lock()
 SHUTTLE_LOCKS={f'shuttle_{i}':asyncio.Lock() for i in range(10)}
+_SHUTTLE_BUSY_OWNERS={}
 _SHUTTLE_LEVEL_ACTIVE={lvl:f'shuttle_{lvl}' for lvl in range(9)}
 _SHUTTLE_STANDBY='shuttle_9'
 _SHUTTLE_LEVEL_OF={**{f'shuttle_{i}':i for i in range(9)},'shuttle_9':0}
@@ -267,9 +268,10 @@ async def _ensure_level_shuttle(level):
     t_duty=_SHUTTLE_DUTY_START.get(s_cur)
     bat_pct=tracker.get_shuttle_battery_pct(s_cur,t_now) if tracker is not None else 100.0
     needs_chg=(bat_pct<=CHARGE_THRESHOLD_PCT) or (SHUTTLE_CONT_S>0 and t_duty is not None and (t_now-t_duty)>=SHUTTLE_CONT_S)
-    if needs_chg and _SHUTTLE_STANDBY and _SHUTTLE_STANDBY not in _SHUTTLE_CHARGE_UNTIL and not SHUTTLE_LOCKS[_SHUTTLE_STANDBY].locked():
+    if needs_chg and _SHUTTLE_STANDBY and _SHUTTLE_STANDBY not in _SHUTTLE_CHARGE_UNTIL and not SHUTTLE_LOCKS[_SHUTTLE_STANDBY].locked() and _SHUTTLE_STANDBY not in _SHUTTLE_BUSY_OWNERS:
         rep=_SHUTTLE_STANDBY
         await SHUTTLE_LOCKS[rep].acquire()
+        _SHUTTLE_BUSY_OWNERS[rep]='swap'
         try:
             bay_idx=0 if level%2==0 else 1
             charge_pt=SHUTTLE_CHARGE_BAYS[bay_idx]
@@ -289,6 +291,8 @@ async def _ensure_level_shuttle(level):
             event(-1,'SHUTTLE_CHARGING_SWAP',charging=s_cur,replacement=rep,level=level+1,battery_pct=bat_pct,charge_until_s=round(t_now+SHUTTLE_CHARGE_S,1))
             return rep,True
         except BaseException:
+            if _SHUTTLE_BUSY_OWNERS.get(rep)=='swap':
+                _SHUTTLE_BUSY_OWNERS.pop(rep,None)
             SHUTTLE_LOCKS[rep].release()
             raise
     return s_cur,False
@@ -302,10 +306,33 @@ def _level_cond():
     if _LEVEL_COND is None:_LEVEL_COND=asyncio.Condition()
     return _LEVEL_COND
 
-@asynccontextmanager
-async def acquire_level_shuttle(level,priority='normal'):
-    """Acquire the floor's primary shuttle (with strict inbound-first priority per floor) or dispatch
-    the roving standby shuttle via the lift, guarded by per-shuttle locks so no shuttle ever has two owners."""
+class ShuttleLease:
+    """Explicit single-owner shuttle lease safe to hand off between tasks (e.g. prepare -> downstream)."""
+    def __init__(self,level,sid,held_level_lock,acq_info='',release_token=None):
+        self.level=level
+        self.sid=sid
+        self.held_level_lock=held_level_lock
+        self.acq_info=acq_info
+        self._token=release_token
+        self.released=False
+    async def release(self,token=None):
+        if self.released:
+            return
+        if self._token is not None and token is not self._token:
+            return
+        self.released=True
+        cond=_level_cond()
+        if self.sid and _SHUTTLE_BUSY_OWNERS.get(self.sid) is self:
+            _SHUTTLE_BUSY_OWNERS.pop(self.sid,None)
+            if SHUTTLE_LOCKS[self.sid].locked():
+                SHUTTLE_LOCKS[self.sid].release()
+            if self.held_level_lock and shuttles[self.level].locked():
+                shuttles[self.level].release()
+        async with cond:
+            cond.notify_all()
+
+async def acquire_shuttle_lease(level,priority='normal',release_token=None):
+    """Acquire an exclusive ShuttleLease for `level` (inbound-first priority per floor) or roving standby."""
     global _INBOUND_SH_WAITERS
     cond=_level_cond()
     is_high=(priority=='high')
@@ -320,22 +347,24 @@ async def acquire_level_shuttle(level,priority='normal'):
             while True:
                 pri_sid=_SHUTTLE_LEVEL_ACTIVE[level]
                 # Outbound yields whenever this floor has an inbound pallet waiting at the lift/buffer.
-                if not shuttles[level].locked() and not SHUTTLE_LOCKS[pri_sid].locked() and (is_high or _LEVEL_INBOUND_WAITERS.get(level,0)==0):
+                if not shuttles[level].locked() and not SHUTTLE_LOCKS[pri_sid].locked() and pri_sid not in _SHUTTLE_BUSY_OWNERS and (is_high or _LEVEL_INBOUND_WAITERS.get(level,0)==0):
                     await shuttles[level].acquire()
                     await SHUTTLE_LOCKS[pri_sid].acquire()
                     held_level_lock=True
                     acquired_sid=pri_sid
+                    _SHUTTLE_BUSY_OWNERS[pri_sid]=asyncio.current_task().get_name() if asyncio.current_task() else 'main'
                     break
                 sb=_SHUTTLE_STANDBY
                 sb_on_same_lvl=(_SHUTTLE_LEVEL_OF.get(sb,0)==level) if sb else False
                 sb_ok_for_pri=is_high or (_INBOUND_SH_WAITERS==0 and in_queue.empty())
                 # If standby is on another floor, give the floor's own primary shuttle 3s to finish before calling the lift.
-                if sb and sb not in _SHUTTLE_CHARGE_UNTIL and not SHUTTLE_LOCKS[sb].locked() and sb_ok_for_pri:
+                if sb and sb not in _SHUTTLE_CHARGE_UNTIL and not SHUTTLE_LOCKS[sb].locked() and sb not in _SHUTTLE_BUSY_OWNERS and sb_ok_for_pri:
                     sb_bat=tracker.get_shuttle_battery_pct(sb,scheduler.time) if tracker is not None else 100.0
                     if sb_bat>CHARGE_THRESHOLD_PCT and (sb_on_same_lvl or waited_for_primary):
                         await SHUTTLE_LOCKS[sb].acquire()
                         held_level_lock=False
                         acquired_sid=sb
+                        _SHUTTLE_BUSY_OWNERS[sb]=asyncio.current_task().get_name() if asyncio.current_task() else 'main'
                         break
                 if shuttles[level].locked() and not waited_for_primary and sb and not sb_on_same_lvl:
                     try:
@@ -348,35 +377,38 @@ async def acquire_level_shuttle(level,priority='normal'):
             if is_high:
                 _INBOUND_SH_WAITERS-=1
                 _LEVEL_INBOUND_WAITERS[level]=max(0,_LEVEL_INBOUND_WAITERS.get(level,0)-1)
-    if not held_level_lock:
-        s=acquired_sid
-        try:
-            sb_lvl=_SHUTTLE_LEVEL_OF.get(s,0)
+    acq_task_name=asyncio.current_task().get_name() if asyncio.current_task() else 'main'
+    lease=ShuttleLease(level,acquired_sid,held_level_lock,acq_info=f'{scheduler.time:.2f}:{acq_task_name}',release_token=release_token)
+    _SHUTTLE_BUSY_OWNERS[acquired_sid]=lease
+    try:
+        if not held_level_lock:
+            sb_lvl=_SHUTTLE_LEVEL_OF.get(lease.sid,0)
             if sb_lvl!=level:
-                await _move_shuttle_via_lift(s,sb_lvl,level)
-            if tracker is not None and s in tracker.shuttles:
-                tracker.shuttles[s]['status']=f'Hỗ trợ Tầng {level+1} (Active Standby)'
-            yield s
-        finally:
-            SHUTTLE_LOCKS[s].release()
-            async with cond:
-                cond.notify_all()
-    else:
-        owned_sid=acquired_sid
-        s=owned_sid
-        try:
+                await _move_shuttle_via_lift(lease.sid,sb_lvl,level)
+            if tracker is not None and lease.sid in tracker.shuttles:
+                tracker.shuttles[lease.sid]['status']=f'Hỗ trợ Tầng {level+1} (Active Standby)'
+        else:
             s_out,swapped=await _ensure_level_shuttle(level)
             if swapped:
-                SHUTTLE_LOCKS[owned_sid].release()
-                owned_sid=s_out
-                s=s_out
-            yield s
-        finally:
-            if owned_sid and SHUTTLE_LOCKS[owned_sid].locked():
-                SHUTTLE_LOCKS[owned_sid].release()
-            shuttles[level].release()
-            async with cond:
-                cond.notify_all()
+                if _SHUTTLE_BUSY_OWNERS.get(lease.sid) is lease:
+                    _SHUTTLE_BUSY_OWNERS.pop(lease.sid,None)
+                SHUTTLE_LOCKS[lease.sid].release()
+                lease.sid=s_out
+                _SHUTTLE_BUSY_OWNERS[s_out]=lease
+        return lease
+    except BaseException:
+        await lease.release(release_token)
+        raise
+
+@asynccontextmanager
+async def acquire_level_shuttle(level,priority='normal'):
+    """Async context manager wrapper around ShuttleLease for single-task outbound/return callers."""
+    tok=object()
+    lease=await acquire_shuttle_lease(level,priority=priority,release_token=tok)
+    try:
+        yield lease.sid
+    finally:
+        await lease.release(tok)
 
 AGV_CONT_H_MIN=float(C.get('agv_continuous_hours_min',6.0) or 6.0)
 AGV_CONT_H_MAX=float(C.get('agv_continuous_hours_max',8.0) or 8.0)
@@ -1000,6 +1032,190 @@ async def arrivals(total):
     elif placements:
         await asyncio.gather(*placements,return_exceptions=True)
 
+async def _run_inbound_job(lane,job,parked):
+    """Run one inbound pallet cycle in its own frame so background closures never alias later jobs."""
+    global stored_count
+    t_in_q=JOB_IN_QUEUE_T.pop(job,None)
+    if t_in_q is not None:
+        tracker.record_stage_wait('pickup_to_agv',max(0.0,scheduler.time-t_in_q))
+    t_tw0=scheduler.time
+    traffic=dock_flow.gate.agv();await traffic.__aenter__()
+    fg_wait=max(0.0,scheduler.time-t_tw0)
+    tracker.record_agv_leg(f'agv_{lane}',0.0,False,0.0,wait_s=fg_wait)
+    traffic_held=True
+    downstream_started=False
+    try:
+        p=JOB_PALLET_MODEL.pop(job,f'pallet_{job}');bay_idx=JOB_BAY_IDX.pop(job,(job%len(INBOUND_PICKUP_SLOTS)) if INBOUND_PICKUP_SLOTS else 0);even_seq=JOB_EVEN_SEQ.pop(job,None)
+        level=(even_seq%9) if even_seq is not None else (job%9);z=C['storage_levels'][level];s=f'shuttle_{level}'
+        inp=LAYOUT.data['ports']['in'][lane];ix,iy=inp['lift'];bx,by=inp['buffer'];il=f'in_lift_{lane}'
+        pick_xy=INBOUND_PICKUP_SLOTS[bay_idx] if INBOUND_PICKUP_SLOTS else inbound_pickup_position(job)
+        pick_loc=f"Ô Pickup {bay_idx+1} ({pick_xy[0]:.2f}, {pick_xy[1]:.2f})"
+        drop_loc=f"Cửa nhập Kho 01 - Cổng {lane+1} ({ix:.2f}, {inp['drop'][1]:.2f})"
+        tracker.start_agv_task(f'agv_{lane}',f'DK-AGV-{job+1:04d}','Khu Dock -> Kho 01','Chở pallet chẵn từ ô Pickup vào cửa nhập Kho 01',scheduler.time,pallet_or_item=p,dock_id=tracker.job_dock_map.get(job),pick_location=pick_loc,drop_location=drop_loc)
+        if fg_wait>0.0 and f'agv_{lane}' in tracker._active_agv_tasks:
+            tracker._active_agv_tasks[f'agv_{lane}']['wait_s']=round(tracker._active_agv_tasks[f'agv_{lane}'].get('wait_s',0.0)+fg_wait,3)
+        route=route_to_pickup(lane,job,pick_xy)
+        if not parked:route=[((None,None,0,math.pi),'TURN_TOWARDS_PICKUP')]+route[PICKUP_LEGS_FROM_LANE:]
+        await follow_async(job,lane,route,pickup=p)
+        await engine.move(assembly(lane,poses[f'agv_{lane}'],.2,p),.4)
+        event(job,'AGV_CARRY_TO_INBOUND',agv=lane+1)
+        # Signal level inbound priority early so outbound on this level yields before AGV reaches the lift.
+        _LEVEL_INBOUND_WAITERS[level]=_LEVEL_INBOUND_WAITERS.get(level,0)+1
+        inb_wait_reserved=True
+        try:
+            # Clear the pickup bay and dock crossing gate BEFORE waiting on the inbound port/lift.
+            gate=route_to_gate(lane,ix)
+            await follow_async(job,lane,gate[:-1],.2,p)
+            if traffic_held:
+                await traffic.__aexit__(None,None,None)
+                traffic_held=False
+            if CONTINUOUS_MODE:await SLOT_COORD.release_pickup(bay_idx)
+            elif pickup_bays:pickup_bays[bay_idx%len(pickup_bays)].release()
+            # Reserve the inbound port (chain + lift + level buffer) once clear at the gate.
+            t_pw0=scheduler.time
+            await in_ports[lane].acquire()
+        finally:
+            if inb_wait_reserved:
+                _LEVEL_INBOUND_WAITERS[level]=max(0,_LEVEL_INBOUND_WAITERS.get(level,0)-1)
+                inb_wait_reserved=False
+        t_pw1=scheduler.time
+        in_lift_wait=max(0.0,t_pw1-t_pw0)
+        tracker.record_agv_leg(f'agv_{lane}',0.0,True,0.0,wait_s=in_lift_wait)
+        tracker.record_lift_wait(il,in_lift_wait)
+        if t_pw1>t_pw0:
+            tracker.record_lift_wait_span(il,t_pw0,t_pw1)
+        tracker.record_stage_wait('agv_to_in_lift',in_lift_wait)
+        prep_wait_box=[0.0]
+        prep_done_box=[None]
+        lease_box=[None]
+        lease_tok=object()
+        downstream_started=False
+        async def prepare(z=z,level=level,ix=ix):
+            t_sw0=scheduler.time
+            lease=await acquire_shuttle_lease(level,priority='high',release_token=lease_tok)
+            lease_box[0]=lease
+            s_cur=lease.sid
+            t_sw1=scheduler.time
+            prep_wait=max(0.0,t_sw1-t_sw0)
+            prep_wait_box[0]=prep_wait
+            tracker.record_shuttle_wait(s_cur,prep_wait)
+            if t_sw1>t_sw0:
+                tracker.record_shuttle_wait_span(s_cur,t_sw0,t_sw1)
+            await shuttle_async(s_cur,(ix,LAYOUT.data['road_y'][0]),z)
+            prep_done_box[0]=scheduler.time
+        ready=asyncio.create_task(prepare())
+        lift_dn_end_box=[None]
+        async def lift_down(job=job,il=il,ix=ix,iy=iy):
+            z_dn0=(poses.get(il) or (ix,iy,.3))[2]
+            t_dn0=scheduler.time
+            await engine.move({il:(ix,iy,.3)},C['lift_speed'])
+            try:
+                await settled(job,il,.3)
+            except Exception as exc:
+                tracker.record_lift_fault(il,str(exc))
+                raise
+            t_dn1=scheduler.time
+            lift_dn_end_box[0]=t_dn1
+            tracker.record_lift_leg(il,abs(z_dn0-.3),max(0.0,t_dn1-t_dn0),t_start=t_dn0,t_end=t_dn1)
+        lift_ready=asyncio.create_task(lift_down())
+        await lift_ready  # interlock: lift at floor level and settled before approaching the chain
+        await follow_async(job,lane,gate[-1:],.2,p)
+        event(job,'AGV_HANDOVER_CHAIN',agv=lane+1)
+        agv_load[lane]=None;pickups[lane]=p
+        await drive_async(lane,(ix,inp['drop'][1]-.5-.12-2.4,0,math.pi/2),.2,pickup=p)
+        event(job,'FORKS_CLEAR')
+        async def return_trip(job=job,p=p,ix=ix):
+            await engine.move(assembly(lane,poses[f'agv_{lane}'],.02),.3)
+            legs=route_home(lane,ix)
+            await follow_async(job,lane,legs[:3],pickup=p)  # reverse, turn, run back along y=-7
+            pickups[lane]=None
+            await follow_async(job,lane,legs[3:])
+            event(job,'AGV_RETURN_COMPLETE')
+            return 'wait',True
+        home=asyncio.create_task(return_trip())
+        async def downstream():
+            global stored_count,inbound_active
+            inbound_active+=1
+            # Infeed turntable: the pallet arrives with its 1.2 m side along the forks (north-south) and is
+            # turned 90 degrees so it enters the store as X = 1.2 m, Y = 1.0 m (agreed design).
+            event(job,'INFEED_TURNTABLE')
+            start_p=poses[p]
+            def rotate_turntable(q,start_p=start_p):
+                u=3*q*q-2*q*q*q
+                yaw=start_p[3]+(0.-start_p[3])*u
+                return {p:(start_p[0],start_p[1],start_p[2],yaw)}
+            await engine.move({p:start_p[:3]+(0,)},kind='conveyor',duration=TURNTABLE_S,transform=rotate_turntable,exact=True)
+            tracker.start_lift_task(il,'Nhập kho',f'LF-IN-{job+1:04d}',p)
+            t_lc0=scheduler.time
+            if lift_dn_end_box[0] is not None and t_lc0>lift_dn_end_box[0]:
+                tracker.record_lift_wait_span(il,lift_dn_end_box[0],t_lc0)
+            z_up0=(poses.get(il) or (ix,iy,.3))[2]
+            event(job,'CHAIN_TO_INPUT_LIFT')
+            await engine.move({p:(ix,iy,.3,0)},1)
+            event(job,'INPUT_LIFT_ASCEND')
+            await engine.move({il:(ix,iy,z),p:(ix,iy,z,0)},C['lift_speed'])
+            try:
+                await settled(job,il,z)
+            except Exception as exc:
+                tracker.record_lift_fault(il,str(exc))
+                raise
+            event(job,'INPUT_BUFFER_TRANSFER')
+            await engine.move({p:(bx,by,z,0)},C['conveyor_speed'])
+            t_lc1=scheduler.time
+            tracker.record_lift_leg(il,abs(z-z_up0),max(0.0,t_lc1-t_lc0),t_start=t_lc0,t_end=t_lc1)
+            tracker.finish_lift_task(il)
+            event(job,'INPUT_BUFFER_RECEIVE')
+            try:
+                await ready
+                s=lease_box[0].sid
+                t_sh1=scheduler.time
+                sh_wait=0.0
+                if prep_done_box[0] is not None and t_sh1>prep_done_box[0]:
+                    tracker.record_shuttle_wait_span(s,prep_done_box[0],t_sh1)
+                tracker.record_stage_wait('buffer_to_in_shuttle',prep_wait_box[0]+sh_wait)
+                slot_seq=even_seq if even_seq is not None else ((job//2) if CONTINUOUS_MODE else job)
+                sid=LAYOUT.job_slots[slot_seq%len(LAYOUT.job_slots)]
+                slot=LAYOUT.slot_point(sid)
+                wh_pick=f"Bàn đệm Nhập {lane+1} ({bx:.2f}, {by:.2f}, T{level+1})"
+                wh_drop=f"Ô kệ {sid} ({slot[0]:.2f}, {slot[1]:.2f}, T{level+1})"
+                tracker.start_shuttle_task(
+                    s,'Nhập kho',f'WH-IN-{job+1:04d}',p,level,sid,scheduler.time,
+                    job_id=job,pick_location=wh_pick,drop_location=wh_drop,wait_s=sh_wait,
+                    lift_id=il,lift_wait_s=in_lift_wait,process_start_s=t_pw0,
+                    process_shuttle_wait_s=prep_wait_box[0]+sh_wait,
+                )
+                await shuttle_async(s,inp['buffer'],z)
+                await deck_async(s,p,.12)
+                in_ports[lane].release()
+                t_rel=scheduler.time
+                if t_rel>t_lc1:
+                    tracker.record_lift_wait_span(il,t_lc1,t_rel)
+                await shuttle_async(s,slot,z,p)
+                await deck_async(s,p,-.06)
+                access=(slot[0],min(LAYOUT.data['road_y'],key=lambda yy:abs(yy-slot[1])))
+                await shuttle_async(s,access,z)
+                tracker.finish_shuttle_task(s,scheduler.time)
+                event(job,'PALLET_STORED',slot=sid)
+                stored_count+=1;inbound_active-=1;await stored.put((job,level,sid,lane,p))
+            finally:
+                if lease_box[0] is not None:
+                    await lease_box[0].release(lease_tok)
+        downstream_started=True
+        background_tasks.append(asyncio.create_task(downstream()))
+        next_job,parked=await home
+        tracker.finish_agv_task(f'agv_{lane}',scheduler.time)
+        return next_job,parked
+    finally:
+        if not downstream_started and 'ready' in locals():
+            try:
+                await ready
+            except BaseException:
+                pass
+            if lease_box[0] is not None:
+                await lease_box[0].release(lease_tok)
+        if traffic_held:
+            await traffic.__aexit__(None,None,None)
+
 async def agv_worker(lane):
     """AGV dispatch loop.
 
@@ -1013,180 +1229,7 @@ async def agv_worker(lane):
     global stored_count
     job=await in_queue.get();parked=True
     while job is not None:
-        t_in_q=JOB_IN_QUEUE_T.pop(job,None)
-        if t_in_q is not None:
-            tracker.record_stage_wait('pickup_to_agv',max(0.0,scheduler.time-t_in_q))
-        t_tw0=scheduler.time
-        traffic=dock_flow.gate.agv();await traffic.__aenter__()
-        tracker.record_agv_leg(f'agv_{lane}',0.0,False,0.0,wait_s=max(0.0,scheduler.time-t_tw0))
-        traffic_held=True
-        try:
-            p=JOB_PALLET_MODEL.pop(job,f'pallet_{job}');bay_idx=JOB_BAY_IDX.pop(job,(job%len(INBOUND_PICKUP_SLOTS)) if INBOUND_PICKUP_SLOTS else 0);even_seq=JOB_EVEN_SEQ.pop(job,None)
-            level=(even_seq%9) if even_seq is not None else (job%9);z=C['storage_levels'][level];s=f'shuttle_{level}'
-            inp=LAYOUT.data['ports']['in'][lane];ix,iy=inp['lift'];bx,by=inp['buffer'];il=f'in_lift_{lane}'
-            pick_xy=INBOUND_PICKUP_SLOTS[bay_idx] if INBOUND_PICKUP_SLOTS else inbound_pickup_position(job)
-            pick_loc=f"Ô Pickup {bay_idx+1} ({pick_xy[0]:.2f}, {pick_xy[1]:.2f})"
-            drop_loc=f"Cửa nhập Kho 01 - Cổng {lane+1} ({ix:.2f}, {inp['drop'][1]:.2f})"
-            tracker.start_agv_task(f'agv_{lane}',f'DK-AGV-{job+1:04d}','Khu Dock -> Kho 01','Chở pallet chẵn từ ô Pickup vào cửa nhập Kho 01',scheduler.time,pallet_or_item=p,dock_id=tracker.job_dock_map.get(job),pick_location=pick_loc,drop_location=drop_loc)
-            route=route_to_pickup(lane,job,pick_xy)
-            if not parked:route=[((None,None,0,math.pi),'TURN_TOWARDS_PICKUP')]+route[PICKUP_LEGS_FROM_LANE:]
-            await follow_async(job,lane,route,pickup=p)
-            await engine.move(assembly(lane,poses[f'agv_{lane}'],.2,p),.4)
-            event(job,'AGV_CARRY_TO_INBOUND',agv=lane+1)
-            # Signal level inbound priority early so outbound on this level yields before AGV reaches the lift.
-            _LEVEL_INBOUND_WAITERS[level]=_LEVEL_INBOUND_WAITERS.get(level,0)+1
-            inb_wait_reserved=True
-            try:
-                # Clear the pickup bay and dock crossing gate BEFORE waiting on the inbound port/lift.
-                gate=route_to_gate(lane,ix)
-                await follow_async(job,lane,gate[:-1],.2,p)
-                if traffic_held:
-                    await traffic.__aexit__(None,None,None)
-                    traffic_held=False
-                if CONTINUOUS_MODE:await SLOT_COORD.release_pickup(bay_idx)
-                elif pickup_bays:pickup_bays[bay_idx%len(pickup_bays)].release()
-                # Reserve the inbound port (chain + lift + level buffer) once clear at the gate.
-                t_pw0=scheduler.time
-                await in_ports[lane].acquire()
-            finally:
-                if inb_wait_reserved:
-                    _LEVEL_INBOUND_WAITERS[level]=max(0,_LEVEL_INBOUND_WAITERS.get(level,0)-1)
-                    inb_wait_reserved=False
-            t_pw1=scheduler.time
-            in_lift_wait=max(0.0,t_pw1-t_pw0)
-            tracker.record_agv_leg(f'agv_{lane}',0.0,True,0.0,wait_s=in_lift_wait)
-            tracker.record_lift_wait(il,in_lift_wait)
-            if t_pw1>t_pw0:
-                tracker.record_lift_wait_span(il,t_pw0,t_pw1)
-            tracker.record_stage_wait('agv_to_in_lift',in_lift_wait)
-            prep_wait_box=[0.0]
-            prep_done_box=[None]
-            sh_ctx=acquire_level_shuttle(level,priority='high')
-            sh_box=[None]
-            downstream_started=False
-            async def prepare(z=z,level=level,ix=ix):
-                t_sw0=scheduler.time
-                s_cur=await sh_ctx.__aenter__()
-                sh_box[0]=s_cur
-                t_sw1=scheduler.time
-                prep_wait=max(0.0,t_sw1-t_sw0)
-                prep_wait_box[0]=prep_wait
-                tracker.record_shuttle_wait(s_cur,prep_wait)
-                if t_sw1>t_sw0:
-                    tracker.record_shuttle_wait_span(s_cur,t_sw0,t_sw1)
-                await shuttle_async(s_cur,(ix,LAYOUT.data['road_y'][0]),z)
-                prep_done_box[0]=scheduler.time
-            ready=asyncio.create_task(prepare())
-            lift_dn_end_box=[None]
-            async def lift_down(job=job,il=il,ix=ix,iy=iy):
-                z_dn0=(poses.get(il) or (ix,iy,.3))[2]
-                t_dn0=scheduler.time
-                await engine.move({il:(ix,iy,.3)},C['lift_speed'])
-                try:
-                    await settled(job,il,.3)
-                except Exception as exc:
-                    tracker.record_lift_fault(il,str(exc))
-                    raise
-                t_dn1=scheduler.time
-                lift_dn_end_box[0]=t_dn1
-                tracker.record_lift_leg(il,abs(z_dn0-.3),max(0.0,t_dn1-t_dn0),t_start=t_dn0,t_end=t_dn1)
-            lift_ready=asyncio.create_task(lift_down())
-            await lift_ready  # interlock: lift at floor level and settled before approaching the chain
-            await follow_async(job,lane,gate[-1:],.2,p)
-            event(job,'AGV_HANDOVER_CHAIN',agv=lane+1)
-            agv_load[lane]=None;pickups[lane]=p
-            await drive_async(lane,(ix,inp['drop'][1]-.5-.12-2.4,0,math.pi/2),.2,pickup=p)
-            event(job,'FORKS_CLEAR')
-            async def return_trip(job=job,p=p,ix=ix):
-                await engine.move(assembly(lane,poses[f'agv_{lane}'],.02),.3)
-                legs=route_home(lane,ix)
-                await follow_async(job,lane,legs[:3],pickup=p)  # reverse, turn, run back along y=-7
-                pickups[lane]=None
-                await follow_async(job,lane,legs[3:])
-                event(job,'AGV_RETURN_COMPLETE')
-                return 'wait',True
-            home=asyncio.create_task(return_trip())
-            async def downstream(job=job,p=p,level=level,z=z,s=s,inp=inp,ix=ix,iy=iy,bx=bx,by=by,il=il,ready=ready,lane=lane,even_seq=even_seq):
-                global stored_count,inbound_active
-                inbound_active+=1
-                # Infeed turntable: the pallet arrives with its 1.2 m side along the forks (north-south) and is
-                # turned 90 degrees so it enters the store as X = 1.2 m, Y = 1.0 m (agreed design).
-                event(job,'INFEED_TURNTABLE')
-                start_p=poses[p]
-                def rotate_turntable(q,start_p=start_p):
-                    u=3*q*q-2*q*q*q
-                    yaw=start_p[3]+(0.-start_p[3])*u
-                    return {p:(start_p[0],start_p[1],start_p[2],yaw)}
-                await engine.move({p:start_p[:3]+(0,)},kind='conveyor',duration=TURNTABLE_S,transform=rotate_turntable,exact=True)
-                tracker.start_lift_task(il,'Nhập kho',f'LF-IN-{job+1:04d}',p)
-                t_lc0=scheduler.time
-                if lift_dn_end_box[0] is not None and t_lc0>lift_dn_end_box[0]:
-                    tracker.record_lift_wait_span(il,lift_dn_end_box[0],t_lc0)
-                z_up0=(poses.get(il) or (ix,iy,.3))[2]
-                event(job,'CHAIN_TO_INPUT_LIFT')
-                await engine.move({p:(ix,iy,.3,0)},1)
-                event(job,'INPUT_LIFT_ASCEND')
-                await engine.move({il:(ix,iy,z),p:(ix,iy,z,0)},C['lift_speed'])
-                try:
-                    await settled(job,il,z)
-                except Exception as exc:
-                    tracker.record_lift_fault(il,str(exc))
-                    raise
-                event(job,'INPUT_BUFFER_TRANSFER')
-                await engine.move({p:(bx,by,z,0)},C['conveyor_speed'])
-                t_lc1=scheduler.time
-                tracker.record_lift_leg(il,abs(z-z_up0),max(0.0,t_lc1-t_lc0),t_start=t_lc0,t_end=t_lc1)
-                tracker.finish_lift_task(il)
-                event(job,'INPUT_BUFFER_RECEIVE')
-                try:
-                    await ready
-                    s=sh_box[0]
-                    t_sh1=scheduler.time
-                    sh_wait=0.0
-                    if prep_done_box[0] is not None and t_sh1>prep_done_box[0]:
-                        tracker.record_shuttle_wait_span(s,prep_done_box[0],t_sh1)
-                    tracker.record_stage_wait('buffer_to_in_shuttle',prep_wait_box[0]+sh_wait)
-                    slot_seq=even_seq if even_seq is not None else ((job//2) if CONTINUOUS_MODE else job)
-                    sid=LAYOUT.job_slots[slot_seq%len(LAYOUT.job_slots)]
-                    slot=LAYOUT.slot_point(sid)
-                    wh_pick=f"Bàn đệm Nhập {lane+1} ({bx:.2f}, {by:.2f}, T{level+1})"
-                    wh_drop=f"Ô kệ {sid} ({slot[0]:.2f}, {slot[1]:.2f}, T{level+1})"
-                    tracker.start_shuttle_task(
-                        s,'Nhập kho',f'WH-IN-{job+1:04d}',p,level,sid,scheduler.time,
-                        job_id=job,pick_location=wh_pick,drop_location=wh_drop,wait_s=sh_wait,
-                        lift_id=il,lift_wait_s=in_lift_wait,process_start_s=t_pw0,
-                        process_shuttle_wait_s=prep_wait_box[0]+sh_wait,
-                    )
-                    await shuttle_async(s,inp['buffer'],z)
-                    await deck_async(s,p,.12)
-                    in_ports[lane].release()
-                    t_rel=scheduler.time
-                    if t_rel>t_lc1:
-                        tracker.record_lift_wait_span(il,t_lc1,t_rel)
-                    await shuttle_async(s,slot,z,p)
-                    await deck_async(s,p,-.06)
-                    access=(slot[0],min(LAYOUT.data['road_y'],key=lambda yy:abs(yy-slot[1])))
-                    await shuttle_async(s,access,z)
-                    tracker.finish_shuttle_task(s,scheduler.time)
-                    event(job,'PALLET_STORED',slot=sid)
-                    stored_count+=1;inbound_active-=1;await stored.put((job,level,sid,lane,p))
-                finally:
-                    if sh_box[0] is not None:
-                        await sh_ctx.__aexit__(None,None,None)
-            downstream_started=True
-            background_tasks.append(asyncio.create_task(downstream()))
-            job,parked=await home
-            tracker.finish_agv_task(f'agv_{lane}',scheduler.time)
-        finally:
-            if not downstream_started and 'ready' in locals():
-                try:
-                    await ready
-                except BaseException:
-                    pass
-                if sh_box[0] is not None:
-                    await sh_ctx.__aexit__(None,None,None)
-            if traffic_held:
-                await traffic.__aexit__(None,None,None)
+        job,parked=await _run_inbound_job(lane,job,parked)
         if not STOP_REQUESTED:
             t_chg_until,_=_check_agv_needs_charge(f'agv_{lane}')
             if t_chg_until is not None:
@@ -2737,10 +2780,10 @@ async def _z05_return_partial_pallet(floor,zone,spot_xy,spot_idx,pallet_model,de
         if spot_idx is not None and not spot_released:
             await _release_z05_spot(floor,zone,spot_idx)
 
-async def z05_unpack_pallet(floor,zone,spot_xy,pallet_model,job,spot_idx=None,level=0,sid='',lane=0):
+async def z05_unpack_pallet(floor,zone,spot_xy,pallet_model,job,spot_idx=None,level=0,sid='',lane=0,is_partial_override=None):
     """Zone 05 unpack at (floor, zone, spot_xy): handles both full unpack (18/18) and immediate partial unpack
     return to output lift & Kho 01 once all required cartons are lifted off the pallet."""
-    global _z05_pallet_seq
+    global _z05_pallet_seq,completed
     spot_released=False
     is_partial=False
     try:
@@ -2749,7 +2792,11 @@ async def z05_unpack_pallet(floor,zone,spot_xy,pallet_model,job,spot_idx=None,le
             seq=_z05_pallet_seq
             z0=LG.LEVELS[floor-1]
             z05_per=int(C.get('z05_cartons_per_pallet',LG.Z05_CARTONS_PER_PALLET))
-            if Z05_PARTIAL_EVERY>0 and (seq%Z05_PARTIAL_EVERY==(2%Z05_PARTIAL_EVERY)) and 0<Z05_PARTIAL_CARTONS<z05_per and sid:
+            if is_partial_override is not None:
+                is_partial_flag=bool(is_partial_override) and 0<Z05_PARTIAL_CARTONS<z05_per and bool(sid)
+            else:
+                is_partial_flag=Z05_PARTIAL_EVERY>0 and (seq%Z05_PARTIAL_EVERY==(2%Z05_PARTIAL_EVERY)) and 0<Z05_PARTIAL_CARTONS<z05_per and bool(sid)
+            if is_partial_flag:
                 take_n=Z05_PARTIAL_CARTONS
                 is_partial=True
             else:
@@ -2799,6 +2846,8 @@ async def z05_unpack_pallet(floor,zone,spot_xy,pallet_model,job,spot_idx=None,le
                 FREE_EVEN_PALLETS.put_nowait(pallet_model)
                 await SLOT_COORD.notify()
             loose_event('Z05_PALLET_EMPTY',job=job,floor=floor,zone=zone)
+            if not is_partial:
+                event(job,'COMPLETE');completed+=1
         if spot_idx is not None and not spot_released:
             spot_released=True
             await _release_z05_spot(floor,zone,spot_idx)
@@ -2886,15 +2935,20 @@ async def loose_goods():
         loose_event('LOOSE_PALLET_ARRIVAL',pallet=k);jobs.append(asyncio.create_task(unpack(k)))
     await asyncio.gather(*jobs)
 
+REQ_IS_PARTIAL={}
+
 async def requests(total):
     request=0
+    full_dispatched=0
     req_limit=total if total is not None else (OUTBOUND_TARGET if OUTBOUND_TARGET>0 else None)
+    z05_per=int(C.get('z05_cartons_per_pallet',LG.Z05_CARTONS_PER_PALLET))
+    partial_enabled=(Z05_PARTIAL_EVERY>0 and 0<Z05_PARTIAL_CARTONS<z05_per)
     # Pre-fill ALL 16 green Z05 unpack spots (4 floors x 2 zones x 2 spots) and continuously refill whenever any spot is free
     total_z05_spots=len(LG.floors())*sum(len(sp) for sp in UNPACK_SPOTS)
     out_buf=total_z05_spots if (CONTINUOUS_MODE and total is None) else 0
     if req_limit is not None:
         out_buf=min(out_buf,req_limit)
-    while not STOP_REQUESTED and (req_limit is None or request<req_limit):
+    while not STOP_REQUESTED and (req_limit is None or (request<req_limit if total is not None else full_dispatched<req_limit)):
         if request<out_buf:
             await engine.until(request*1.0)
         elif CONTINUOUS_MODE and total is None:
@@ -2908,6 +2962,10 @@ async def requests(total):
         else:
             await engine.until((request-out_buf+1)*C['outbound_interval_s'])
         if STOP_REQUESTED:break
+        is_partial_req=partial_enabled and (request%Z05_PARTIAL_EVERY==(2%Z05_PARTIAL_EVERY))
+        REQ_IS_PARTIAL[request]=is_partial_req
+        if not is_partial_req:
+            full_dispatched+=1
         event(request,'OUTBOUND_REQUEST_QUEUED')
         REQ_QUEUE_T[request]=scheduler.time
         await out_queue.put(request)
@@ -2935,6 +2993,8 @@ async def outbound_worker(worker):
             if STOP_REQUESTED:return
             if CONTINUOUS_MODE:await SLOT_COORD.notify()
             floor=(target_floor-1) if target_floor is not None else (job%4)
+            is_partial_req=REQ_IS_PARTIAL.pop(request,False)
+            out_dir='Xuất tạm hoàn Z05' if is_partial_req else 'Xuất kho'
             s=f'shuttle_{level}';z=C['storage_levels'][level]
             out=LAYOUT.data['ports']['out'][worker];ox,oy=out['lift'];ol=f'out_lift_{worker}'
             oz=C['output_levels'][floor]+.3
@@ -2965,7 +3025,7 @@ async def outbound_worker(worker):
                         wh_pick=f"Ô kệ {sid} ({slot_pt[0]:.2f}, {slot_pt[1]:.2f}, T{level+1})"
                         wh_drop=f"Bàn đệm Xuất {worker+1} ({bx:.2f}, {by:.2f}, T{level+1})"
                         wh_rec=tracker.start_shuttle_task(
-                            s,'Xuất kho',f'WH-OUT-{request+1:04d}',p,level,sid,scheduler.time,
+                            s,out_dir,f'WH-OUT-{request+1:04d}',p,level,sid,scheduler.time,
                             job_id=job,request_id=request,pick_location=wh_pick,drop_location=wh_drop,
                             wait_s=sh_wait,lift_id=ol,lift_wait_s=pre_lift_wait,
                             process_start_s=(t_req_q if t_req_q is not None else scheduler.time),
@@ -2989,7 +3049,7 @@ async def outbound_worker(worker):
                         total_lift_wait=pre_lift_wait+port_wait
                         tracker.record_lift_wait(ol,total_lift_wait)
                         tracker.record_stage_wait('out_req_to_lift',total_lift_wait)
-                        tracker.start_lift_task(ol,'Xuất kho',f'LF-OUT-{request+1:04d}',p)
+                        tracker.start_lift_task(ol,out_dir,f'LF-OUT-{request+1:04d}',p)
                         z_ol0=(poses.get(ol) or (ox,oy,oz))[2]
                         await engine.move({ol:(ox,oy,z)},C['lift_speed'])
                         try:
@@ -3047,8 +3107,7 @@ async def outbound_worker(worker):
                     await _z05_pull_from_gate(floor+1,worker,tuple(out['gate']),spot,p,job)
                     event(job,'UNPACK_SPOT',spot=spot_idx,floor=floor+1)
                     spot_handed=True
-                    background_tasks.append(asyncio.create_task(z05_unpack_pallet(floor+1,worker,spot,p,job,spot_idx=claimed_spot_idx,level=level,sid=sid,lane=lane)))
-                    event(job,'COMPLETE');completed+=1
+                    background_tasks.append(asyncio.create_task(z05_unpack_pallet(floor+1,worker,spot,p,job,spot_idx=claimed_spot_idx,level=level,sid=sid,lane=lane,is_partial_override=is_partial_req)))
                 finally:
                     if gate_held:
                         gate_lock.release()
