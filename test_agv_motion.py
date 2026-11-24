@@ -39,6 +39,33 @@ class MotionChecks(unittest.TestCase):
             for base,_ in samples(insert,(x,back[1],0,math.pi/2)):
                 check_pose(0,base,pallets,f'pallet_{j}',f'pallet_{j}')
 
+    def test_two_forklifts_serve_six_pickup_bays_cleanly(self):
+        from agv_motion import PARKS,pickup_position,route_to_pickup,route_to_gate,OFFSET
+        self.assertEqual(len(PARKS),2)
+        spots=[pickup_position(j) for j in range(6)]
+        pallets={f'pallet_{j}':s for j,s in enumerate(spots)}
+        for agv_i in range(len(PARKS)):
+            for j,(x,y,_,_) in enumerate(spots):
+                insert=route_to_pickup(agv_i,j,spots[j])[-1][0]
+                self.assertAlmostEqual(insert[1],y-OFFSET)
+                for base,_ in samples((x,y-OFFSET-1.5,0,math.pi/2),insert):
+                    check_pose(agv_i,base,pallets,None,f'pallet_{j}')
+                for port_idx in (0,1):
+                    gate=route_to_gate(agv_i,20.30108 if port_idx==0 else 38.30108,port_idx=port_idx)
+                    self.assertEqual(gate[-1][0][0],20.30108 if port_idx==0 else 38.30108)
+                back=route_to_gate(agv_i,20.30108)[0][0]
+                for base,_ in samples(insert,(x,back[1],0,math.pi/2)):
+                    check_pose(agv_i,base,pallets,f'pallet_{j}',f'pallet_{j}')
+        from agv_traffic import Plan,compatible
+        for agv_i in range(len(PARKS)):
+            for peer_j in range(len(PARKS)):
+                if agv_i==peer_j:continue
+                peer=Plan(PARKS[peer_j],PARKS[peer_j],0.0,0.05,False)
+                cur=PARKS[agv_i]
+                for nxt,_ in route_to_pickup(agv_i,0,spots[0]):
+                    self.assertTrue(compatible(Plan(cur,nxt,0.0,5.0,False),peer,0.0,1.0))
+                    cur=nxt
+
     def test_shortest_turn_across_pi(self):
         path=list(samples((0,0,0,3.1),(0,0,0,-3.1)))
         self.assertLess(len(path),10)

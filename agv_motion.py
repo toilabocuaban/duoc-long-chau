@@ -67,13 +67,14 @@ def check_pose(i,base,poses,payload=None,pickup=None):
     body=rect(base,.83,.65)
     moving=[body]
     if payload: moving.append(rect(assembly(i,base,.2,payload)[payload],.6,.5))
-    peer=1-i
-    if f'agv_{peer}' in poses:
-        other=poses[f'agv_{peer}']
-        peer_parts=[rect(other,.83,.65),rect(rigid(other,1.55),.85,.4)]
-        for a in moving:
-            if any(overlaps(a,b,.25) for b in peer_parts):
-                raise RuntimeError(f'Unsafe route: AGV {i+1} intersects parked AGV {peer+1}')
+    for peer in range(len(PARKS)):
+        if peer==i: continue
+        if f'agv_{peer}' in poses:
+            other=poses[f'agv_{peer}']
+            peer_parts=[rect(other,.83,.65),rect(rigid(other,1.55),.85,.4)]
+            for a in moving:
+                if any(overlaps(a,b,.25) for b in peer_parts):
+                    raise RuntimeError(f'Unsafe route: AGV {i+1} intersects parked AGV {peer+1}')
     for name,p in poses.items():
         # Only floor-level pallets are obstacles: skip racked (z>1) and hidden, not-yet-arrived loads (z<-1).
         if not name.startswith('pallet_') or name==payload or abs(p[2])>1.0: continue
@@ -102,8 +103,10 @@ def route_to_pickup(i,job,position=None):
         ((x,RETURN_Y,0,math.pi/2),'ALIGN_WITH_PALLET'),
         ((x,y-OFFSET,0,math.pi/2),'INSERT_FORKS')]              # spot entered from the south
 
-def route_to_gate(i,x):
-    drop=LAYOUT.data['ports']['in'][i]['drop'][1]
+def route_to_gate(i,x,port_idx=None):
+    in_ports = LAYOUT.data['ports']['in']
+    p_idx = (i % len(in_ports)) if port_idx is None else (port_idx % len(in_ports))
+    drop=in_ports[p_idx]['drop'][1]
     return [((None,LOAD_Y,0,math.pi/2),'REVERSE_WITH_LOAD'),
             ((None,LOAD_Y,0,0),'TURN_WITH_LOAD'),
             ((x,LOAD_Y,0,0),'TRAVEL_WITH_LOAD'),

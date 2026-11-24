@@ -239,7 +239,7 @@ for k, z in enumerate(C['storage_levels']):
     model(f'shuttle_chargers_{k}', (0, 0, z), merge_boxes(f'sh_chg_{k}', chg_v))
 
 _fork_mesh=merge_boxes('agv_fork',[box('carriage',0,0,.25,.1,.98,.5,DARK),box('forkL',.8,-.23,.04,1.6,.12,.08,STEEL),box('forkR',.8,.23,.04,1.6,.12,.08,STEEL)])
-for i in range(2):
+for i in range(len(PARKS)):
     v=[chamfer(f'chassis{i}',-.08,0,.48,1.5,1.12,.56,WHITE),chamfer(f'counterweight{i}',-.46,0,.82,.65,1.08,.3,TEAL),box('bumper',-.82,0,.29,.1,1.05,.18,DARK),box('battery',-.1,0,.83,.5,.75,.18,DARK)]
     for a in [-.48,.48]:
         for b in [-.56,.56]:

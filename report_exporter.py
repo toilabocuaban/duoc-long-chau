@@ -214,11 +214,13 @@ class SimulationTracker:
         self.shuttle_drain_per_m = float(config.get("shuttle_drain_pct_per_m", 0.015))
         self.shuttle_drain_idle_per_s = float(config.get("shuttle_drain_idle_pct_per_s", 0.001))
 
+        sh_init_map = config.get("shuttle_initial_battery_by_id") or {}
         self.shuttles: dict[str, dict[str, Any]] = {}
         for i in range(10):
             sid = f"shuttle_{i}"
             level = (i % 9) + 1
             role = f"Hoạt động chính - Tầng {level}" if i < 9 else "Dự phòng (Standby - Đỗ tầng 1)"
+            sh_init_bat = max(0.0, min(self.init_battery_pct, float(sh_init_map.get(sid, self.init_battery_pct))))
             self.shuttles[sid] = {
                 "id": sid,
                 "code": f"Shuttle {i + 1}",
@@ -244,8 +246,9 @@ class SimulationTracker:
                 "idle_pct": 0.0,
                 "fault_count": 0,
                 "fault_notes": [],
+                "init_battery_pct": sh_init_bat,
                 "battery_used_pct": 0.0,
-                "battery_remaining_pct": self.init_battery_pct,
+                "battery_remaining_pct": sh_init_bat,
                 "charge_count": 0,
                 "charge_completed_count": 0,
                 "charge_s": 0.0,
@@ -323,7 +326,8 @@ class SimulationTracker:
             }
 
         self.agvs: dict[str, dict[str, Any]] = {}
-        for i in range(2):
+        n_dock_agvs = max(1, int(config.get("agv_forklift_count", 2)))
+        for i in range(n_dock_agvs):
             self._register_agv(f"agv_{i}")
         u1_cnt = int(config.get("u1_agvs_per_floor", len(LG.U1_AGV_HOME_BRANCHES)))
         u2_cnt = int(config.get("u2_agvs_per_floor", len(LG.U2_AGV_HOME_STATIONS)))
@@ -354,6 +358,7 @@ class SimulationTracker:
         self.loose_stats: dict[str, Any] = {}
         self.traffic_stats: dict[str, Any] = {}
         self.z05_partial_returns: int = 0
+        self.a4_sweep_results: list[dict[str, Any]] = list(config.get("a4_sweep_results") or [])
 
         self.workers: dict[str, dict[str, Any]] = {}
         self._init_workers()
@@ -361,6 +366,8 @@ class SimulationTracker:
     def _register_agv(self, agv_id: str) -> dict[str, Any]:
         if agv_id not in self.agvs:
             code, area, floor, station, group_order = _agv_display_meta(agv_id)
+            agv_init_map = self.config.get("agv_initial_battery_by_id") or {}
+            agv_init_bat = max(0.0, min(self.init_battery_pct, float(agv_init_map.get(agv_id, self.init_battery_pct))))
             self.agvs[agv_id] = {
                 "id": agv_id,
                 "code": code,
@@ -382,8 +389,9 @@ class SimulationTracker:
                 "wait_pct": 0.0,
                 "pure_idle_pct": 0.0,
                 "fault_count": 0,
+                "init_battery_pct": agv_init_bat,
                 "battery_used_pct": 0.0,
-                "battery_remaining_pct": self.init_battery_pct,
+                "battery_remaining_pct": agv_init_bat,
                 "agv_type": "AGV Forklift" if agv_id.startswith("agv_") else "AGV thường",
                 "charge_count": 0,
                 "charge_completed_count": 0,
@@ -764,7 +772,8 @@ class SimulationTracker:
         since_d = max(0.0, float(sh["distance_m"]) - float(sh.get("_last_chg_dist_m", 0.0)))
         since_id = max(0.0, idle_s - float(sh.get("_last_chg_idle_s", 0.0)))
         used = since_d * self.shuttle_drain_per_m + since_id * self.shuttle_drain_idle_per_s
-        return round(max(0.0, self.init_battery_pct - used), 2)
+        base_pct = self.init_battery_pct if sh.get("charge_completed_count", 0) > 0 else float(sh.get("init_battery_pct", self.init_battery_pct))
+        return round(max(0.0, base_pct - used), 2)
 
     def get_agv_battery_pct(self, agv_id: str, t_now: float) -> float:
         if agv_id not in self.agvs:
@@ -781,10 +790,13 @@ class SimulationTracker:
             + since_em * self.drain_empty_per_m
             + since_id * self.drain_idle_per_s
         )
-        return round(max(0.0, self.init_battery_pct - used), 2)
+        base_pct = self.init_battery_pct if agv.get("charge_completed_count", 0) > 0 else float(agv.get("init_battery_pct", self.init_battery_pct))
+        return round(max(0.0, base_pct - used), 2)
 
     def start_agv_charge(self, agv_id: str, t_start: float, t_until: float, is_forklift: bool = False) -> None:
         agv = self._register_agv(agv_id)
+        if not agv.get("charging_active"):
+            agv["battery_remaining_pct"] = self.get_agv_battery_pct(agv_id, t_start)
         agv["agv_type"] = "AGV Forklift" if is_forklift else "AGV thường"
         agv["charge_count"] = agv.get("charge_count", 0) + 1
         agv["charging_active"] = True
@@ -983,9 +995,10 @@ class SimulationTracker:
                 self.record_worker_activity(f"dock_{did}", cartons=cartons)
             if kind == "even":
                 d["even_ready"] += 1
+                n_bays = len(self.config.get("inbound_pickup_slots") or []) or 4
                 self.dock_events.append({
                     "time_s": t, "dock_id": did, "kind": "Pallet chẵn (Even)",
-                    "batch": batch, "state": state, "detail": "Chất đầy pallet tại Dock, chuyển ra 4 Ô Pickup (chờ AGV Dock)",
+                    "batch": batch, "state": state, "detail": f"Chất đầy pallet tại Dock, chuyển ra {n_bays} Ô Pickup (chờ AGV Dock)",
                 })
             elif kind == "odd":
                 d["odd_ready"] += 1
@@ -1152,8 +1165,9 @@ class SimulationTracker:
                 since_id = max(0.0, sh_idle - float(sh.get("_last_chg_idle_s", 0.0)))
                 sh_rem = max(0.0, self.init_battery_pct - (since_d * self.shuttle_drain_per_m + since_id * self.shuttle_drain_idle_per_s))
             else:
-                sh_rem = max(0.0, self.init_battery_pct - sh_used)
-            sh["battery_used_pct"] = round(min(self.init_battery_pct, sh_used), 2)
+                sh_base = float(sh.get("init_battery_pct", self.init_battery_pct))
+                sh_rem = max(0.0, sh_base - sh_used)
+            sh["battery_used_pct"] = round(min(sh.get("init_battery_pct", self.init_battery_pct), sh_used), 2)
             sh["battery_remaining_pct"] = round(sh_rem, 2)
             if sh["fault_count"] > 0:
                 sh["status"] = "Lỗi"
@@ -1214,7 +1228,8 @@ class SimulationTracker:
                 )
                 rem_pct = max(0.0, self.init_battery_pct - since_used)
             else:
-                rem_pct = max(0.0, self.init_battery_pct - used_pct)
+                agv_base = float(agv.get("init_battery_pct", self.init_battery_pct))
+                rem_pct = max(0.0, agv_base - used_pct)
             if agv.get("charging_active") and agv.get("_charge_start_s") is not None:
                 agv["charge_s"] = round(
                     agv.get("charge_s", 0.0) + max(0.0, self.sim_duration_s - float(agv["_charge_start_s"])),
@@ -1231,7 +1246,7 @@ class SimulationTracker:
             agv["idle_pct"] = _pct(idle_s, self.sim_duration_s)
             agv["wait_pct"] = _pct(eff_wait_s, self.sim_duration_s)
             agv["pure_idle_pct"] = _pct(pure_idle_s, self.sim_duration_s)
-            agv["battery_used_pct"] = round(min(self.init_battery_pct, used_pct), 2)
+            agv["battery_used_pct"] = round(min(agv.get("init_battery_pct", self.init_battery_pct), used_pct), 2)
             agv["battery_remaining_pct"] = round(rem_pct, 2)
             if agv["fault_count"] > 0:
                 agv["status"] = "Lỗi"
@@ -1734,6 +1749,51 @@ def _make_pie_chart(
     return chart
 
 
+def _make_line_chart(
+    ws,
+    title: str,
+    x_title: str,
+    y_title: str,
+    width: float,
+    height: float,
+    min_col: int,
+    max_col: int,
+    min_row: int,
+    max_row: int,
+    cat_col: int = 1,
+    legend_pos: str = "b",
+    y_min: float | None = 0,
+    series_colors: list[str] | None = None,
+) -> LineChart:
+    chart = LineChart()
+    chart.style = 10
+    _style_chart_title(chart, title)
+    chart.x_axis.title = x_title
+    chart.y_axis.title = y_title
+    if y_min is not None:
+        chart.y_axis.scaling.min = y_min
+    chart.width = width
+    chart.height = height
+    data_ref = Reference(ws, min_col=min_col, max_col=max_col, min_row=min_row, max_row=max_row)
+    cats_ref = Reference(ws, min_col=cat_col, min_row=min_row + 1, max_row=max_row)
+    chart.add_data(data_ref, titles_from_data=True)
+    chart.set_categories(cats_ref)
+    for s_idx, ser in enumerate(chart.series):
+        ser.smooth = False
+        ser.marker.symbol = "circle"
+        ser.marker.size = 7
+        ser.graphicalProperties.line.width = 28000
+        if series_colors and s_idx < len(series_colors) and series_colors[s_idx]:
+            col_hex = series_colors[s_idx]
+            ser.graphicalProperties.line.solidFill = col_hex
+            ser.marker.graphicalProperties.solidFill = col_hex
+            ser.marker.graphicalProperties.line.solidFill = col_hex
+            if s_idx == 2:
+                ser.graphicalProperties.line.dashStyle = "dash"
+    chart.legend.position = legend_pos
+    return chart
+
+
 def _build_hourly_rows(
     items: list[dict[str, Any]],
     sim_dur: float,
@@ -2000,7 +2060,7 @@ def _build_sheet_overview(
         (f"Đội AGV ({len(tracker.agvs)} xe)", "Tổng quãng đường toàn đội AGV", round(summary["agv_total_distance_m"], 2), "#,##0.00", "mét di chuyển toàn nhà máy"),
         (f"Đội AGV ({len(tracker.agvs)} xe)", "Tỉ lệ TB AGV chạy có ích", round(summary["agv_avg_active_pct"], 2), '0.00"%"', f"Pin TB còn: {summary['agv_avg_battery_pct']:.2f}%"),
         (f"Đội AGV ({len(tracker.agvs)} xe)", "Tỉ lệ TB AGV có lệnh chờ Traffic", round(summary["agv_avg_wait_pct"], 2), '0.00"%"', f"Nghỉ rảnh hoàn toàn: {summary['agv_avg_pure_idle_pct']:.2f}%"),
-        ("Nhân sự (125)", "Tỉ lệ TB Công nhân làm việc", round(summary["worker_avg_active_pct"], 2), '0.00"%"', f"Chờ hàng/AGV: {summary['worker_avg_cmd_wait_pct']:.2f}% | Nghỉ: {summary['worker_avg_pure_idle_pct']:.2f}%"),
+        (f"Nhân sự ({len(tracker.workers)})", "Tỉ lệ TB Công nhân làm việc", round(summary["worker_avg_active_pct"], 2), '0.00"%"', f"Chờ hàng/AGV: {summary['worker_avg_cmd_wait_pct']:.2f}% | Nghỉ: {summary['worker_avg_pure_idle_pct']:.2f}%"),
         ("Khu Dock", "Pallet chẵn hoàn tất phân loại", int(summary["dock_even_pallets"]), "#,##0", f"Barcode quét: {summary['dock_scanned_even']} kiện chẵn"),
         ("Khu Dock", "Pallet lẻ hoàn tất phân loại", int(summary["dock_odd_pallets"]), "#,##0", f"Barcode quét: {summary['dock_scanned_odd']} kiện lẻ"),
         ("Unpack T1", "Pallet lẻ unpack lên băng tải", loose_pallets, "#,##0", f"Tổng thùng lên băng tải: {loose_cartons} thùng"),
@@ -2051,7 +2111,7 @@ def _build_sheet_overview(
     pk_bat_avg = sum(a.get("battery_remaining_pct", 100.0) for a in pk_list) / max(1, len(pk_list))
     ov_bat_rows = [
         ["Shuttle AS/RS (10 xe)", round(sh_bat_avg, 2), sh_chg_min, sh_chg_cnt, "Sạc mép ngoài kệ khi <= 20%"],
-        ["AGV Forklift Dock (2 xe)", round(fk_bat_avg, 2), round(sum(float(a.get("charge_s", 0.0)) for a in fk_list) / 60.0, 2), sum(int(a.get("charge_count", 0)) for a in fk_list), "Sạc tại điểm đỗ PARKS"],
+        [f"AGV Forklift Dock ({len(fk_list)} xe)", round(fk_bat_avg, 2), round(sum(float(a.get("charge_s", 0.0)) for a in fk_list) / 60.0, 2), sum(int(a.get("charge_count", 0)) for a in fk_list), "Sạc tại điểm đỗ PARKS"],
         [f"AGV Kéo Kệ Picking ({len(pk_list)} xe)", round(pk_bat_avg, 2), round(sum(float(a.get("charge_s", 0.0)) for a in pk_list) / 60.0, 2), sum(int(a.get("charge_count", 0)) for a in pk_list), "Sạc tại hốc biên tầng 1..4"],
     ]
     ob_hdr = row
@@ -2470,6 +2530,7 @@ def _build_asrs_sheet(wb: Workbook, tracker: SimulationTracker, summary: dict[st
     ws2.row_dimensions[row - 1].height = 22
     ws2.row_dimensions[row].height = 22
     row += 1
+    sec3_start_row = row
 
     row = _style_section(ws2, row, 16, "3. BẢNG TỔNG HỢP TRẠNG THÁI & HÀNG CHỜ 10 SHUTTLE (TỪ SHUTTLE 1 ĐẾN SHUTTLE 10)")
     shuttle_rows = []
@@ -2772,6 +2833,54 @@ def _build_asrs_sheet(wb: Workbook, tracker: SimulationTracker, summary: dict[st
         major_unit=20,
     ), f"F{sec1_start_row}")
 
+    a4_results = list(getattr(tracker, "a4_sweep_results", None) or cfg.get("a4_sweep_results") or [])
+    if a4_results:
+        row = _style_section(ws2, row, 7, "6.1 SỐ LIỆU QUÉT TẦN SUẤT XUẤT - KỊCH BẢN A4 (TÌM NĂNG LỰC TỐI ĐA)")
+        a4_rows = []
+        for pt in sorted(a4_results, key=lambda item: float(item.get("outbound_interval_s", 0)), reverse=True):
+            iv_s = float(pt.get("outbound_interval_s", 0))
+            rate_hr = float(pt.get("freq_per_hour") or (round(3600.0 / iv_s, 1) if iv_s > 0 else 0.0))
+            tgt_val = int(pt.get("warehouse_outbound_target", 0))
+            lift_val = int(pt.get("lift_outbound_tasks", 0))
+            comp_val = int(pt.get("complete", 0))
+            part_val = int(pt.get("lift_outbound_partial_tasks", max(0, lift_val - int(pt.get("lift_outbound_full_tasks", comp_val)))))
+            note_lbl = (
+                "Vùng bão hòa (đạt ngưỡng tối đa chuỗi xuất)"
+                if tgt_val > comp_val + 10
+                else "Tăng theo tần suất đặt"
+            )
+            a4_rows.append([
+                f"{rate_hr:g} pallet/h ({iv_s:g}s)",
+                lift_val,
+                comp_val,
+                tgt_val,
+                part_val,
+                f"{float(pt.get('out_lift_active_pct', 0.0)):.1f}% / {float(pt.get('out_lift_cmd_wait_pct', 0.0)):.1f}%",
+                note_lbl,
+            ])
+        a4_hdr_row = row
+        a4_last_row = a4_hdr_row + len(a4_rows)
+        row = _write_table(
+            ws2, row,
+            [
+                "Tần suất xuất (nhịp)", "Pallet ra Thang Xuất", "Unpack hết hoàn tất",
+                "Mục tiêu đặt (28.800/s)", "Hoàn kho Z05", "Thang Xuất chạy / Chờ (%)", "Đánh giá công suất",
+            ],
+            a4_rows,
+            col_formats={2: "#,##0", 3: "#,##0", 4: "#,##0", 5: "#,##0"},
+            right_cols={2, 3, 4, 5},
+            center_cols={1, 6},
+            auto_filter=False,
+        )
+        ws2.add_chart(_make_line_chart(
+            ws2,
+            "Đồ thị Kịch bản A4: Pallet ra Thang Xuất theo tần suất xuất (Tìm năng lực tối đa)",
+            "Tần suất xuất (pallet/giờ | nhịp s)",
+            "Số pallet (ca 8 giờ)",
+            34.5, 12.2, 2, 4, a4_hdr_row, a4_last_row,
+            series_colors=["1F4E79", "70AD47", "808080"],
+        ), f"F{sec2_start_row}")
+
     row = _style_section(ws2, row, 15, "7. NHẬT KÝ CHI TIẾT THEO QUY TRÌNH KHO AS/RS (THANG NÂNG & SHUTTLE)")
     wh_rows = []
     sum_wh_dur = sum_wh_lf_wait = sum_wh_sh_wait = sum_wh_dist = 0.0
@@ -2828,6 +2937,7 @@ def _build_asrs_sheet(wb: Workbook, tracker: SimulationTracker, summary: dict[st
         min_span_heights=[
             (sec0_tbl_start, sec1_start_row - 1, 13.0),
             (sec1_start_row, sec2_start_row - 1, 14.5),
+            *(([(sec2_start_row, sec3_start_row - 1, 13.5)]) if a4_results else []),
         ],
     )
 
@@ -3054,7 +3164,7 @@ def _build_agv_sheet(
         ["Khoảng cách giữ an toàn (agv_following_gap_m)", f"{float(cfg.get('agv_following_gap_m', 1.0)):.2f}", "m", "Khoảng cách an toàn khi bám đuôi trên tuyến hành lang"],
         ["Định mức đầy Rack / Trolley gọi AGV", f"{u1_rack_cap} khay / {trolley_cap} thùng", "khay | thùng", f"Chỉ gọi AGV khi đầy {u1_rack_cap} khay/Rack hoặc đầy {trolley_cap} thùng/Trolley"],
         ["AGV thường (U1/U2/P1) - TG chạy & Sạc", f"{agv_d_h} giờ / Sạc {agv_c_h} giờ", "giờ (1x)", f"{n_std_agvs} xe chở Rack & Trolley (4 tầng): hoạt động liên tục {agv_d_h} tiếng, thời gian sạc {agv_c_h} tiếng (90 - 120 phút)"],
-        ["AGV Forklift (Khu Dock) - TG chạy & Sạc", f"{fl_d_h} giờ / Sạc {fl_c_h} giờ", "giờ (1x)", f"{n_dock_agvs} xe nâng pallet (AGV-01, AGV-02): hoạt động liên tục {fl_d_h} tiếng, thời gian sạc {fl_c_h} tiếng (120 - 180 phút)"],
+        ["AGV Forklift (Khu Dock) - TG chạy & Sạc", f"{fl_d_h} giờ / Sạc {fl_c_h} giờ", "giờ (1x)", f"{n_dock_agvs} xe nâng pallet ({', '.join(f'AGV-{i+1:02d}' for i in range(n_dock_agvs))}): hoạt động liên tục {fl_d_h} tiếng, thời gian sạc {fl_c_h} tiếng (120 - 180 phút)"],
         ["Pin ban đầu / Hao tải / Hao rỗng", f"{tracker.init_battery_pct:.0f}% / {tracker.drain_loaded_per_m}%/m / {tracker.drain_empty_per_m}%/m", "% | %/m", f"Mức tiêu hao pin khi đứng chờ: {tracker.drain_idle_per_s}%/s"],
         ["Kiểm tra va chạm & Giao cắt 4 tầng", f"{int(agv_tr.get('trips', 0))} lượt | {swept_chk:,} checks", "4 tầng (T1..T4)", f"Tổng TG chờ nút giao U1/U2/P1 (AGV_TRAFFIC): {_fmt_vi_hms(agv_tr.get('wait_s', 0.0))}"],
     ]
@@ -3246,6 +3356,7 @@ def _build_agv_sheet(
 def _build_dock_sheet(wb: Workbook, tracker: SimulationTracker, summary: dict[str, Any], sim_dur: float) -> None:
     """Build Sheet 4: Khu_Vuc_Dock with separated 3-state KPI rows, dock specs, 3 top charts and detailed logs."""
     cfg = tracker.config
+    n_pickup_bays = len(cfg.get("inbound_pickup_slots") or []) or 4
     ws4 = wb.create_sheet("Khu_Vuc_Dock")
     dock_agv_rows = [t for t in tracker.agv_tasks if t["area"] == "Khu Dock -> Kho 01"]
     row = _style_banner(
@@ -3276,7 +3387,7 @@ def _build_dock_sheet(wb: Workbook, tracker: SimulationTracker, summary: dict[st
         tot_empty_ret += d["empty_returns"]
         per_dock_rows.append([
             f"Dock {did:02d}", d["worker_code"],
-            f"Xe tải Dock {did:02d}", "4 Ô Pickup (Chẵn) / Bàn Unpack T1 (Lẻ)",
+            f"Xe tải Dock {did:02d}", f"{n_pickup_bays} Ô Pickup (Chẵn) / Bàn Unpack T1 (Lẻ)",
             d["even_batches"], d["odd_batches"], d["even_cartons"], d["odd_cartons"],
             d["even_ready"], d["odd_ready"], d["empty_returns"],
             _excel_days(d_busy), _excel_days(d_cw), _excel_days(d_pid),
@@ -3355,10 +3466,10 @@ def _build_dock_sheet(wb: Workbook, tracker: SimulationTracker, summary: dict[st
         ),
         (
             "Phân luồng Dock",
-            "Luồng Chẵn (Cửa Tây -> 4 Ô Pickup)",
+            f"Luồng Chẵn (Cửa Tây -> {n_pickup_bays} Ô Pickup)",
             str(cfg.get("even_flow", "storage")),
             None,
-            f"luồng | Cửa 1..6 ưu tiên 4 Ô Pickup -> {n_dock_agvs} AGV Forklift (Chạy {fl_d_h}h / Sạc {fl_c_h}h) vào Kho 01",
+            f"luồng | Cửa 1..6 ưu tiên {n_pickup_bays} Ô Pickup -> {n_dock_agvs} AGV Forklift (Chạy {fl_d_h}h / Sạc {fl_c_h}h) vào Kho 01",
             FILL_INPUT_LIFT,
         ),
         (
@@ -3391,7 +3502,7 @@ def _build_dock_sheet(wb: Workbook, tracker: SimulationTracker, summary: dict[st
         ("Cơ sở hạ tầng", "Số cửa Dock hoạt động", len(tracker.dock_order), "#,##0", f"Cửa Dock vật lý: {cfg.get('dock_physical_count', len(tracker.dock_order))}"),
         ("Pallet Chẵn", "Batch xe tải Pallet Chẵn", tot_even_batches, "#,##0", "batch xe tải chẵn"),
         ("Pallet Chẵn", "Tổng kiện chẵn quét Barcode", int(summary["dock_scanned_even"]), "#,##0", "kiện chẵn đã quét"),
-        ("Pallet Chẵn", "Pallet chẵn hoàn tất tại Dock", tot_even_ready, "#,##0", f"Giao ra 4 Ô Pickup: {tracker.dock_flow_stats.get('pallets_to_w1', 0)}"),
+        ("Pallet Chẵn", "Pallet chẵn hoàn tất tại Dock", tot_even_ready, "#,##0", f"Giao ra {n_pickup_bays} Ô Pickup: {tracker.dock_flow_stats.get('pallets_to_w1', 0)}"),
         ("AGV Dock", "Tổng nhiệm vụ AGV Dock -> Kho 01", len(dock_agv_rows), "#,##0", f"Đang thực hiện: {dk_running} lượt"),
         ("AGV Dock", "Nhiệm vụ AGV Dock đã hoàn thành", dk_done, "#,##0", f"Quãng đường AGV Dock: {sum_dk_dist:,.2f} m"),
         ("Pallet Lẻ", "Batch xe tải Pallet Lẻ", tot_odd_batches, "#,##0", "batch xe tải lẻ"),
@@ -3421,7 +3532,7 @@ def _build_dock_sheet(wb: Workbook, tracker: SimulationTracker, summary: dict[st
         ["Vận tốc kéo pallet (dock_pallet_speed)", f"{float(cfg.get('dock_pallet_speed', 1.6)):.2f}", "m/s", "Tốc độ kéo pallet từ Dock ra Ô Pickup / Bàn Unpack"],
         ["Thời gian quét Barcode (inbound_scan_s)", f"{float(cfg.get('inbound_scan_s', 0.4)):.2f}", "giây/kiện", "Quét phân loại luồng hàng Chẵn / Lẻ tại cửa Dock"],
         ["Thao tác nhấc / đặt (pick / place)", f"{float(cfg.get('dock_pick_s', 0.35)):.2f} / {float(cfg.get('dock_place_s', 0.35)):.2f}", "giây", "Thời gian nâng và hạ pallet tại điểm nhận/trả"],
-        ["AGV Forklift Khu Dock - TG chạy & Sạc", f"{fl_d_h} giờ / Sạc {fl_c_h} giờ", "giờ (1x)", f"{n_dock_agvs} xe nâng pallet (AGV-01, AGV-02) chạy liên tục {fl_d_h}h, thời gian sạc {fl_c_h}h (120 - 180 phút)"],
+        ["AGV Forklift Khu Dock - TG chạy & Sạc", f"{fl_d_h} giờ / Sạc {fl_c_h} giờ", "giờ (1x)", f"{n_dock_agvs} xe nâng pallet ({', '.join(f'AGV-{i+1:02d}' for i in range(n_dock_agvs))}) chạy liên tục {fl_d_h}h, thời gian sạc {fl_c_h}h (120 - 180 phút)"],
         ["Luồng phân loại (even / odd flow)", f"{cfg.get('even_flow', 'storage')} / {cfg.get('odd_flow', 'w2_spiral')}", "2 luồng", "Cửa 1..6 ưu tiên Ô Pickup (Kho AS/RS); Cửa 7..11 ưu tiên Bàn Unpack T1"],
     ]
     row = _write_table(

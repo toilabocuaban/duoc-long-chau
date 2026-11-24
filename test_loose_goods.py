@@ -91,11 +91,17 @@ class LooseGoodsChecks(unittest.TestCase):
     def test_z05_unpack_and_u2_stations_to_kho04(self):
         reserved = G.FF.U1_RESERVED_CELL_XY | G.FF.U2_RESERVED_CELL_XY | G.FF.P1_RESERVED_CELL_XY
         static_racks = [c for c in G.L['rack_cells'] if (round(c['x'], 3), round(c['y'], 3)) not in reserved]
-        self.assertEqual(len(G.Z05_WORKERS), 2)
+        self.assertEqual(len(G.Z05_WORKERS), 4)
         self.assertEqual(len(G.U2_WORKERS), 6)
+        z05_spots = [s for s in G.L['pallet_spots'] if (s[1] + s[3]) / 2 > 0]
+        self.assertEqual(len(z05_spots), 6)
         for f in G.floors():
             z0 = G.LEVELS[f - 1]
-            for z_idx in range(len(G.Z05_WORKERS)):
+            jacks = [G.z05_jack_home(f, wi) for wi in range(len(G.Z05_WORKERS))]
+            for i in range(len(jacks)):
+                for j in range(i + 1, len(jacks)):
+                    self.assertGreater(math.hypot(jacks[i][0] - jacks[j][0], jacks[i][1] - jacks[j][1]), 0.8)
+            for z_idx in range(2):
                 spot_xy = (-1.705, 37.19 if z_idx == 0 else 30.27)
                 stack = G.z05_stack_positions(spot_xy, f, 18)
                 self.assertEqual(len(stack), 18)

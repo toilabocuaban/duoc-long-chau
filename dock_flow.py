@@ -3,14 +3,15 @@ import asyncio
 import math
 import time
 from contextlib import asynccontextmanager
+from agv_motion import PARKS as AGV_PARKS
 import loose_goods as LG
 import truck_scene as TS
 from sdf_parts import box, merge_boxes
 
 class FloorGate:
-    """AGVs may run together; manual pallet crossings exclude moving AGVs.
-    Up to two manual dock transfers with non-overlapping corridors can cross when no AGV is waiting."""
-    def __init__(self,max_manual=2):
+    """AGVs may run together when max_agv > 1; manual pallet crossings exclude moving AGVs in overlapping corridors.
+    Up to two manual dock transfers with non-overlapping corridors can cross when no conflicting AGV is waiting."""
+    def __init__(self,max_manual=2,max_agv=1):
         self.condition=asyncio.Condition()
         self.agvs=0
         self.agv_waiting=0
@@ -18,54 +19,72 @@ class FloorGate:
         self.waiting=0
         self.last_turn='agv'
         self.max_manual=max_manual
+        self.max_agv=max(1,int(max_agv))
         self.active_spans=[]
+        self.agv_spans=[]
+        self.waiting_agv_spans=[]
+        self.waiting_manual_spans=[]
 
     @property
     def crossing(self):
         return self.crossings > 0
 
-    def _span_clear(self,span):
-        if span is None:return True
-        return all(span[1]<a[0] or span[0]>a[1] for a in self.active_spans)
+    def _span_clear(self,span,spans):
+        if span is None:return not spans
+        for a in spans:
+            if a is None or not (span[1]<a[0] or span[0]>a[1]):
+                return False
+        return True
 
     @asynccontextmanager
-    async def agv(self):
+    async def agv(self,span=None):
         async with self.condition:
             self.agv_waiting+=1
+            self.waiting_agv_spans.append(span)
             try:
                 await self.condition.wait_for(
-                    lambda: self.crossings==0 and self.agvs==0 and (not self.waiting or self.last_turn=='manual')
+                    lambda: self.agvs<self.max_agv
+                    and self._span_clear(span,self.active_spans)
+                    and (self._span_clear(span,self.waiting_manual_spans) if self.waiting and self.last_turn!='manual' else True)
                 )
                 self.agvs+=1
                 self.last_turn='agv'
+                self.agv_spans.append(span)
             finally:
                 self.agv_waiting-=1
+                if span in self.waiting_agv_spans:
+                    self.waiting_agv_spans.remove(span)
         try:yield
         finally:
             async with self.condition:
                 self.agvs-=1
+                if span in self.agv_spans:
+                    self.agv_spans.remove(span)
                 self.condition.notify_all()
 
     @asynccontextmanager
     async def manual(self,span=None):
         async with self.condition:
             self.waiting+=1
+            self.waiting_manual_spans.append(span)
             try:
                 await self.condition.wait_for(
-                    lambda: self.agvs==0
-                    and (self.crossings==0 or (self.crossings<self.max_manual and not self.agv_waiting))
-                    and self._span_clear(span)
+                    lambda: self._span_clear(span,self.agv_spans)
+                    and (self.crossings==0 or (self.crossings<self.max_manual and self._span_clear(span,self.waiting_agv_spans)))
+                    and self._span_clear(span,self.active_spans)
                 )
                 self.crossings+=1
                 self.last_turn='manual'
-                if span is not None:self.active_spans.append(span)
+                self.active_spans.append(span)
             finally:
                 self.waiting-=1
+                if span in self.waiting_manual_spans:
+                    self.waiting_manual_spans.remove(span)
         try:yield
         finally:
             async with self.condition:
                 self.crossings-=1
-                if span is not None and span in self.active_spans:
+                if span in self.active_spans:
                     self.active_spans.remove(span)
                 self.condition.notify_all()
 
@@ -127,7 +146,7 @@ def scene(c,model,pallet_deck):
 class DockFlow:
     def __init__(self,c,engine,send,poses,fast,emit):
         self.c=c;self.e=engine;self.send=lambda p:send(p,transmit=not fast);self.poses=poses;self.emit=emit
-        self.docks=dock_list(c);self.locks=[asyncio.Lock() for _ in self.docks];self.gate=FloorGate()
+        self.docks=dock_list(c);self.locks=[asyncio.Lock() for _ in self.docks];self.gate=FloorGate(max_manual=2,max_agv=len(AGV_PARKS))
         self.stats={'scanned_even':0,'scanned_odd':0,'pallets_to_w1':0,'pallets_to_w2':0,'empty_pallet_returns':0}
         self.states={}
         self.preloaded_batch0={}

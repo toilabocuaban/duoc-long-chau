@@ -27,6 +27,7 @@ class ReportExporterTests(unittest.TestCase):
         # Verify initial fleet sizes: 10 shuttles, 2 + 4*(2 + 2 + 6) = 42 pooled AGVs
         self.assertEqual(len(tracker.shuttles), 10)
         self.assertEqual(len(tracker.agvs), 42)
+        self.assertIn("agv_1", tracker.agvs)
         self.assertIn("u1_agv_1_0", tracker.agvs)
         self.assertIn("u1_agv_4_1", tracker.agvs)
         self.assertNotIn("u1_agv_1_2", tracker.agvs)
@@ -758,6 +759,54 @@ class ReportExporterTests(unittest.TestCase):
                 txt = "\n".join(str(c.value) for r in wb[sname].iter_rows(values_only=False) for c in r if c.value is not None)
                 for snippet in expected_snippets:
                     self.assertIn(snippet, txt, f"{sname} missing '{snippet}'")
+
+    def test_a4_sweep_chart_on_top_of_asrs_sheet(self):
+        cfg = {
+            **self.config,
+            "a4_sweep_results": [
+                {"outbound_interval_s": 120.0, "freq_per_hour": 30.0, "warehouse_outbound_target": 240, "lift_outbound_tasks": 360, "complete": 240, "lift_outbound_partial_tasks": 120, "out_lift_active_pct": 32.0, "out_lift_cmd_wait_pct": 18.0},
+                {"outbound_interval_s": 90.0, "freq_per_hour": 40.0, "warehouse_outbound_target": 320, "lift_outbound_tasks": 480, "complete": 320, "lift_outbound_partial_tasks": 160, "out_lift_active_pct": 42.0, "out_lift_cmd_wait_pct": 25.0},
+                {"outbound_interval_s": 75.0, "freq_per_hour": 48.0, "warehouse_outbound_target": 384, "lift_outbound_tasks": 576, "complete": 384, "lift_outbound_partial_tasks": 192, "out_lift_active_pct": 50.0, "out_lift_cmd_wait_pct": 35.0},
+                {"outbound_interval_s": 60.0, "freq_per_hour": 60.0, "warehouse_outbound_target": 480, "lift_outbound_tasks": 622, "complete": 406, "lift_outbound_partial_tasks": 207, "out_lift_active_pct": 55.0, "out_lift_cmd_wait_pct": 43.0},
+                {"outbound_interval_s": 45.0, "freq_per_hour": 80.0, "warehouse_outbound_target": 640, "lift_outbound_tasks": 623, "complete": 407, "lift_outbound_partial_tasks": 207, "out_lift_active_pct": 55.2, "out_lift_cmd_wait_pct": 43.1},
+            ],
+        }
+        tracker = SimulationTracker(cfg, total_jobs=4, cycle_duration_s=28800.0)
+        tracker.finalize(28800.0, stop_reason="Kiểm thử đồ thị A4")
+        with tempfile.TemporaryDirectory() as tmp:
+            wb = load_workbook(export_excel(tracker, tmp)["latest"])
+            ws_asrs = wb["Kho_ASRS_Shuttle"]
+            sec2_r = next(r for r in range(1, ws_asrs.max_row + 1) if str(ws_asrs.cell(r, 1).value or "").startswith("2. "))
+            sec3_r = next(r for r in range(1, ws_asrs.max_row + 1) if str(ws_asrs.cell(r, 1).value or "").startswith("3. "))
+            self.assertEqual(len(ws_asrs._charts), 4)
+            self.assertEqual(type(ws_asrs._charts[3]).__name__, "LineChart")
+            self.assertEqual((ws_asrs._charts[3].anchor._from.col, ws_asrs._charts[3].anchor._from.row), (5, sec2_r - 1))
+            self.assertLess(ws_asrs._charts[3].anchor._from.row, sec3_r - 1)
+            asrs_txt = "\n".join(str(c.value) for r in ws_asrs.iter_rows(values_only=False) for c in r if c.value is not None)
+            self.assertIn("6.1 SỐ LIỆU QUÉT TẦN SUẤT XUẤT - KỊCH BẢN A4", asrs_txt)
+            self.assertIn("80 pallet/h (45s)", asrs_txt)
+
+    def test_carryover_initial_battery_by_id(self):
+        cfg = {
+            **self.config,
+            "agv_initial_battery_by_id": {"agv_0": 35.0, "agv_1": 62.5},
+            "shuttle_initial_battery_by_id": {"shuttle_0": 48.0},
+            "agv_drain_loaded_pct_per_m": 0.1,
+            "agv_drain_empty_pct_per_m": 0.05,
+            "agv_drain_idle_pct_per_s": 0.0,
+            "shuttle_drain_pct_per_m": 0.1,
+            "shuttle_drain_idle_pct_per_s": 0.0,
+        }
+        tr = SimulationTracker(cfg, total_jobs=2, cycle_duration_s=100.0)
+        self.assertEqual(tr.get_agv_battery_pct("agv_0", 0.0), 35.0)
+        self.assertEqual(tr.get_agv_battery_pct("agv_1", 0.0), 62.5)
+        self.assertEqual(tr.get_shuttle_battery_pct("shuttle_0", 0.0), 48.0)
+        tr.record_agv_leg("agv_0", 100.0, True, 20.0)
+        tr.record_agv_leg("agv_0", 100.0, False, 20.0)
+        self.assertEqual(tr.get_agv_battery_pct("agv_0", 40.0), 20.0)
+        tr.start_agv_charge("agv_0", 40.0, 100.0, is_forklift=True)
+        tr.finish_agv_charge("agv_0", 100.0)
+        self.assertEqual(tr.get_agv_battery_pct("agv_0", 100.0), 100.0)
 
 
 if __name__ == "__main__":

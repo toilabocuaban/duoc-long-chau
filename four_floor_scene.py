@@ -345,7 +345,9 @@ def people():
     for z in L['unpack_zones']:
         spots = [s for s in L['pallet_spots'] if z[0] <= cx(s) <= z[2] and z[1] <= cy(s) <= z[3]]
         y = sum(cy(s) for s in spots) / len(spots) if spots else cy(z)
-        out.append({'x': min(s[0] for s in spots) - .8 if spots else z[0] + .6, 'y': y, 'area': 'unpack', 'yaw': 0.})
+        wx = min(s[0] for s in spots) - .8 if spots else z[0] + .6
+        out.append({'x': wx, 'y': y + .95, 'area': 'unpack', 'yaw': 0.})
+        out.append({'x': wx, 'y': y - .95, 'area': 'unpack', 'yaw': 0.})
     pick = [s for s in L['pallet_spots'] if cy(s) < 0]
     if pick:
         out.append({'x': sum(cx(s) for s in pick) / len(pick), 'y': max(s[3] for s in pick) + .9, 'area': 'pallet_pick', 'yaw': -math.pi / 2})
