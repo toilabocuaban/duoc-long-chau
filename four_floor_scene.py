@@ -524,8 +524,11 @@ def floor_extra(f):
             if c['block'] == '*U753': v += incline(c['rect'])
         for w in people():
             if w['area'] in FLOOR1_AREAS and w['area'] not in ANIMATED_WORKER_AREAS: v += place(person_parts(), w['x'], w['y'], w['yaw'])
-        for s in L['pallet_spots']:
-            if cy(s) < 0: v += spot_marks(s)
+        for slot in C.get('inbound_pickup_slots', []):   # 8 even buffer zones near the 2 inbound lifts & forklifts
+            x, y = slot[0], slot[1]
+            yaw = slot[3] if len(slot) > 3 else math.pi / 2
+            hx, hy = (.6, .5) if abs(math.sin(yaw)) < .5 else (.5, .6)
+            v += spot_marks([x - hx, y - hy, x + hx, y + hy])
         for x, y, yaw in C.get('loose_pallet_spots', []):   # loose-goods unpack spots (agreed, floor 1)
             hx, hy = (.6, .5) if abs(math.sin(yaw)) < .5 else (.5, .6)
             v += spot_marks([x - hx, y - hy, x + hx, y + hy])

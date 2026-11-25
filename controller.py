@@ -454,6 +454,9 @@ _AGV_CHARGE_HOURS={}
 _ACTIVE_FORKLIFT_JOBS=set()
 
 def _should_yield_to_peer_forklift(lane):
+    """Yield only for autonomous AGVs on battery balancing; human-driven forklifts run continuously."""
+    if C.get('forklift_type','human_driven')=='human_driven':
+        return False
     """Build a natural battery stagger while queue < 2 by letting the lower-battery Forklift take solo work
     until a ~35% reserve margin exists, while immediately launching both Forklifts on queue bursts (>=2)
     or whenever the peer is charging."""
@@ -508,6 +511,8 @@ def _check_agv_needs_charge(agv_id,dry_run=False):
             _complete_agv_charge(agv_id)
     t_start=_AGV_DUTY_START.setdefault(agv_id,0.0)
     is_forklift,duty_s,charge_s=_agv_battery_profile(agv_id)
+    if is_forklift and C.get('forklift_type','human_driven')=='human_driven':
+        return None,0.0
     bat_pct=tracker.get_agv_battery_pct(agv_id,scheduler.time) if tracker is not None else 100.0
     if is_forklift and bat_pct>5.0:
         other_chg=sum(1 for k in range(len(PARKS)) if f'agv_{k}'!=agv_id and _is_agv_charging(f'agv_{k}'))
@@ -596,6 +601,21 @@ MAX_STORED_INFLIGHT=int(C.get('max_stored_inflight',65))
 INBOUND_TARGET=max(0,int(C.get('warehouse_inbound_target',0)))
 OUTBOUND_TARGET=max(0,int(C.get('warehouse_outbound_target',0)))
 INBOUND_EVEN_INTERVAL_S=max(0.0,float(C.get('inbound_even_interval_s',0.0)))
+HOURLY_INBOUND_SCHEDULE=[max(0,int(x)) for x in (C.get('hourly_inbound_schedule') or ())]
+HOURLY_OUTBOUND_SCHEDULE=[max(0,int(x)) for x in (C.get('hourly_outbound_schedule') or ())]
+
+def build_hourly_release_times(schedule,window_s=3600.0):
+    """Return sorted release timestamps (s) spreading each hour's count evenly across its window."""
+    times=[]
+    w=max(1e-6,float(window_s))
+    for h_idx,raw_cnt in enumerate(schedule or ()):
+        cnt=max(0,int(raw_cnt))
+        if cnt<=0:continue
+        t0=h_idx*w
+        step=w/cnt
+        for j in range(cnt):
+            times.append(t0+j*step)
+    return times
 tracker=SimulationTracker(C,total_jobs=(0 if CONTINUOUS_MODE else (args.jobs if args.jobs is not None else C['jobs'])),cycle_duration_s=CYCLE_DURATION_S,continuous_mode=CONTINUOUS_MODE)
 
 def _pose_changed(old,new):
@@ -964,9 +984,13 @@ async def arrivals(total):
         cont_lock=asyncio.Lock()
         cont_job_seq=0
         cont_even_seq=0
-        even_limit=INBOUND_TARGET if INBOUND_TARGET>0 else None
+        in_release_times=build_hourly_release_times(HOURLY_INBOUND_SCHEDULE) if HOURLY_INBOUND_SCHEDULE else None
+        even_limit=INBOUND_TARGET if INBOUND_TARGET>0 else (len(in_release_times) if in_release_times is not None else None)
         even_buf=max(1,len(INBOUND_PICKUP_SLOTS))
-        even_released=(min(even_limit,even_buf) if even_limit is not None else even_buf) if INBOUND_EVEN_INTERVAL_S>0 else even_limit
+        if in_release_times is not None:
+            even_released=0
+        else:
+            even_released=(min(even_limit,even_buf) if even_limit is not None else even_buf) if INBOUND_EVEN_INTERVAL_S>0 else even_limit
         even_claimed=0
         def _reserve_even():
             nonlocal even_claimed
@@ -981,6 +1005,15 @@ async def arrivals(total):
             return True
         async def _pace_even_inbound():
             nonlocal even_released
+            if in_release_times is not None:
+                lim=even_limit if even_limit is not None else len(in_release_times)
+                for idx,t_rel in enumerate(in_release_times[:lim]):
+                    if t_rel>scheduler.time:
+                        await engine.until(t_rel)
+                    if STOP_REQUESTED:break
+                    even_released=idx+1
+                    await SLOT_COORD.notify()
+                return
             k=0
             while not STOP_REQUESTED and (even_limit is None or (even_buf+k)<=even_limit):
                 if k>0:
@@ -990,7 +1023,7 @@ async def arrivals(total):
                 even_released=min(even_limit,nxt) if even_limit is not None else nxt
                 k+=1
                 await SLOT_COORD.notify()
-        even_pacer=asyncio.create_task(_pace_even_inbound()) if INBOUND_EVEN_INTERVAL_S>0 else None
+        even_pacer=asyncio.create_task(_pace_even_inbound()) if (in_release_times is not None or INBOUND_EVEN_INTERVAL_S>0) else None
         async def dock_worker_loop(dock_i):
             nonlocal cont_job_seq,cont_even_seq
             global odd_pallet_seq,max_pending
@@ -1147,13 +1180,14 @@ async def _run_inbound_job(lane,job,parked):
     inp=LAYOUT.data['ports']['in'][port_idx];ix,iy=inp['lift'];bx,by=inp['buffer'];il=f'in_lift_{port_idx}'
     agv_span=(min(PARKS[lane][0],pick_xy[0])-1.5,max(ix,PARKS[lane][0],pick_xy[0])+1.5)
     t_tw0=scheduler.time
-    await pickup_maneuver_lock.acquire()
-    pm_held=True
     traffic_held=False
+    pm_held=False
     downstream_started=False
     try:
         traffic=dock_flow.gate.agv(agv_span);await traffic.__aenter__()
         traffic_held=True
+        await pickup_maneuver_lock.acquire()
+        pm_held=True
         fg_wait=max(0.0,scheduler.time-t_tw0)
         tracker.record_agv_leg(f'agv_{lane}',0.0,False,0.0,wait_s=fg_wait)
         pick_loc=f"Ô Pickup {bay_idx+1} ({pick_xy[0]:.2f}, {pick_xy[1]:.2f})"
@@ -1162,7 +1196,10 @@ async def _run_inbound_job(lane,job,parked):
         if fg_wait>0.0 and f'agv_{lane}' in tracker._active_agv_tasks:
             tracker._active_agv_tasks[f'agv_{lane}']['wait_s']=round(tracker._active_agv_tasks[f'agv_{lane}'].get('wait_s',0.0)+fg_wait,3)
         route=route_to_pickup(lane,job,pick_xy)
-        if not parked:route=[((None,None,0,math.pi),'TURN_TOWARDS_PICKUP')]+route[PICKUP_LEGS_FROM_LANE:]
+        if not parked:
+            cur_x=poses.get(f'agv_{lane}',(PARKS[lane][0],0))[0]
+            yaw_pick=0.0 if pick_xy[0]>=cur_x else math.pi
+            route=[((None,None,0,yaw_pick),'TURN_TOWARDS_PICKUP')]+route[PICKUP_LEGS_FROM_LANE:]
         await follow_async(job,lane,route,pickup=p)
         await engine.move(assembly(lane,poses[f'agv_{lane}'],.2,p),.4)
         event(job,'AGV_CARRY_TO_INBOUND',agv=lane+1)
@@ -1176,7 +1213,7 @@ async def _run_inbound_job(lane,job,parked):
         try:
             # Clear the narrow pickup bay maneuver (REVERSE + TURN onto LOAD_Y), then release pickup_maneuver_lock
             # so the next AGV can pick while this AGV travels eastbound along LOAD_Y.
-            gate=route_to_gate(lane,ix,port_idx=port_idx)
+            gate=route_to_gate(lane,ix,port_idx=port_idx,from_x=pick_xy[0])
             await follow_async(job,lane,gate[:2],.2,p)
             if pm_held:
                 pickup_maneuver_lock.release()
@@ -1255,8 +1292,9 @@ async def _run_inbound_job(lane,job,parked):
             # Hot-redispatch along RETURN_Y when active alone (peer charging) or on west lane so lone Forklift skips parking turns.
             peer_charging=any(_is_agv_charging(f'agv_{k}') for k in range(len(PARKS)) if k!=lane)
             bat_now=tracker.get_agv_battery_pct(f'agv_{lane}',scheduler.time) if tracker is not None else 100.0
-            needs_chg_now=(_check_agv_needs_charge(f'agv_{lane}',dry_run=True)[0] is not None) or (bat_now<CHARGE_THRESHOLD_PCT+0.5)
-            if (not STOP_REQUESTED) and (not needs_chg_now) and (not in_queue.empty()) and (not pickup_maneuver_lock.locked()) and (peer_charging or lane==0):
+            human_fk=(C.get('forklift_type','human_driven')=='human_driven')
+            needs_chg_now=(_check_agv_needs_charge(f'agv_{lane}',dry_run=True)[0] is not None) or ((not human_fk) and bat_now<CHARGE_THRESHOLD_PCT+0.5)
+            if (not STOP_REQUESTED) and (not needs_chg_now) and (not in_queue.empty()) and (not pickup_maneuver_lock.locked()) and (human_fk or peer_charging or lane==0):
                 nxt=in_queue.get_nowait()
                 if nxt is not None:
                     event(job,'AGV_RETURN_COMPLETE',hot_redispatch=True)
@@ -3210,17 +3248,22 @@ REQ_IS_PARTIAL={}
 async def requests(total):
     request=0
     full_dispatched=0
-    req_limit=total if total is not None else (OUTBOUND_TARGET if OUTBOUND_TARGET>0 else None)
+    out_release_times=build_hourly_release_times(HOURLY_OUTBOUND_SCHEDULE) if (HOURLY_OUTBOUND_SCHEDULE and total is None) else None
+    req_limit=total if total is not None else (OUTBOUND_TARGET if OUTBOUND_TARGET>0 else (len(out_release_times) if out_release_times is not None else None))
     z05_per=int(C.get('z05_cartons_per_pallet',LG.Z05_CARTONS_PER_PALLET))
     partial_enabled=(Z05_PARTIAL_EVERY>0 and 0<Z05_PARTIAL_CARTONS<z05_per)
     # Keep outbound pipeline fed up to outbound_prefill_limit without dumping 16 requests at t=0
     total_z05_spots=len(LG.floors())*sum(len(sp) for sp in UNPACK_SPOTS)
     prefill_lim=max(4,int(C.get('outbound_prefill_limit',6)))
-    out_buf=min(total_z05_spots,prefill_lim) if (CONTINUOUS_MODE and total is None) else 0
+    out_buf=0 if out_release_times is not None else (min(total_z05_spots,prefill_lim) if (CONTINUOUS_MODE and total is None) else 0)
     if req_limit is not None:
         out_buf=min(out_buf,req_limit)
     while not STOP_REQUESTED and (req_limit is None or (request<req_limit if total is not None else full_dispatched<req_limit)):
-        if request<out_buf:
+        if out_release_times is not None:
+            t_target=out_release_times[min(full_dispatched,len(out_release_times)-1)]
+            if t_target>scheduler.time:
+                await engine.until(t_target)
+        elif request<out_buf:
             await engine.until(request*1.0)
         elif CONTINUOUS_MODE and total is None:
             while not STOP_REQUESTED:
@@ -3578,7 +3621,6 @@ async def main():
             for st_idx in range(len(LG.P1_STATIONS)):
                 wx,wy,wyaw,wz=LG.p1_station(f,st_idx)
                 anim_ops.update(LG.operator_pose(LG.p1_worker_id(f,st_idx),wx,wy,wyaw,z0=wz))
-        anim_ops.update(LG.operator_pose(500,-31.91375,-1.26,-math.pi/2,z0=0.))
         send(anim_ops,transmit=False)
     _n_js=max(1,len(LAYOUT.job_slots))
     for i in range(C.get('initial_outbound_pallets',0)):

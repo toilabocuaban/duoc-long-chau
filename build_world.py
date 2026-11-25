@@ -79,15 +79,15 @@ def pallet(name, xyz):
     for a in range(3):
         for b in range(2):
             for c in range(3):
-                bx,by,bz=(a-1)*.39,(b-.5)*.49,.15+(c+.5)*1.55/3
-                v.append(box(f'box{a}{b}{c}',bx,by,bz,.38,.48,1.55/3-.012,CARTON))
-                v.append(box(f'tape{a}{b}{c}',bx,by,bz+1.55/6-.005,.055,.478,.004,'.9 .8 .57 1'))
+                bx,by,bz=(a-1)*.39,(b-.5)*.49,.15+(c+.5)*1.25/3
+                v.append(box(f'box{a}{b}{c}',bx,by,bz,.38,.48,1.25/3-.012,CARTON))
+                v.append(box(f'tape{a}{b}{c}',bx,by,bz+1.25/6-.005,.055,.478,.004,'.9 .8 .57 1'))
                 if b==0:
                     v.append(box(f'label{a}{c}',bx,by-.242,bz,.14,.004,.1,'.86 .86 .79 1'))
                     for q in range(6): v.append(box(f'barcode{a}{c}{q}',bx-.05+q*.018,by-.245,bz,.006,.003,.065,'.12 .12 .12 1'))
     for x in [-.33,.33]:
-        v.append(box(f'wrapfront{x}',x,-.49,.925,.018,.005,1.55,'.92 .89 .74 1'))
-        v.append(box(f'wraptop{x}',x,0,1.702,.018,.98,.004,'.92 .89 .74 1'))
+        v.append(box(f'wrapfront{x}',x,-.49,.775,.018,.005,1.25,'.92 .89 .74 1'))
+        v.append(box(f'wraptop{x}',x,0,1.402,.018,.98,.004,'.92 .89 .74 1'))
     # All pallets are identical: batch the 134 boxes into one shared mesh per colour
     # (a few draw calls per pallet instead of 134), generated once and reused.
     global PALLET_MESH
@@ -106,14 +106,16 @@ for x in range(-56,57,4): v.append(box(f'jointx{x}',x,22.89,-.015,.012,66.22,.00
 for y in range(-8,57,4): v.append(box(f'jointy{y}',1,y,-.015,112,.012,.004,'.38 .41 .42 1'))
 # Inbound AGV lanes on floor 1 (4-floor building) continuing into the 4-way store; pallet spots are drawn by the 4-floor scene.
 from agv_motion import LOAD_Y, RETURN_Y
-for y in (LOAD_Y, RETURN_Y): v.append(box(f'aisle{y}',3,y,.004,74,.10,.008,'.86 .70 .19 1'))
+_HUMAN_FORKLIFT = C.get('forklift_type', 'human_driven') == 'human_driven'
+for y in (LOAD_Y, RETURN_Y): v.append(box(f'aisle{y}',-4,y,.004,92,.10,.008,'.86 .70 .19 1'))
 for x,y,_,_ in PARKS:
     for dx in [-.7,.7]: v.append(box(f'park{x}_{dx}',x+dx,y,.005,.06,1.9,.01,'.16 .42 .35 1'))
     for dy in [-.95,.95]: v.append(box(f'parkend{x}_{dy}',x,y+dy,.005,1.46,.06,.01,'.16 .42 .35 1'))
-    # Integrated floor charging pad + north-side charger bollard at each Forklift parking bay
-    v.append(box(f'park_chg_pad{x}',x,y,.008,.70,.70,.012,'.85 .62 .12 1'))
-    v.append(box(f'park_chg_post{x}',x,y+1.15,.55,.28,.22,1.10,'.18 .22 .26 1'))
-    v.append(box(f'park_chg_led{x}',x,y+1.03,.92,.14,.02,.08,'.10 .85 .35 1'))
+    if not _HUMAN_FORKLIFT:
+        # Integrated floor charging pad + north-side charger bollard at each AGV Forklift parking bay
+        v.append(box(f'park_chg_pad{x}',x,y,.008,.70,.70,.012,'.85 .62 .12 1'))
+        v.append(box(f'park_chg_post{x}',x,y+1.15,.55,.28,.22,1.10,'.18 .22 .26 1'))
+        v.append(box(f'park_chg_led{x}',x,y+1.03,.92,.14,.02,.08,'.10 .85 .35 1'))
 v.extend([box('back_wall',26,51,10,54,.18,20,'.64 .67 .69 1'),box('right_wall',53,25,10,.18,52,20,'.59 .63 .65 1')])
 for x in range(0,54,6): v.append(box(f'building_column{x}',x,50.8,10,.25,.3,20,'.35 .39 .42 1'))
 model('site',(0,0,0),merge_boxes('site_mesh',v))
@@ -150,9 +152,6 @@ if _spots:
             wx,wy,wyaw,wz=loose_goods.p1_station(f,st_idx)
             for name,pose in loose_goods.operator_pose(loose_goods.p1_worker_id(f,st_idx),wx,wy,wyaw,z0=wz).items():
                 model(name,(pose[0],pose[1],pose[2],pose[5]),_part_mesh[name.split('_',1)[1]])
-    wx, wy, wyaw = -31.91375, -1.26, -math.pi / 2
-    for name, pose in loose_goods.operator_pose(500, wx, wy, wyaw, z0=0.).items():
-        model(name, (pose[0], pose[1], pose[2], pose[5]), _part_mesh[name.split('_', 1)[1]])
     _deck=merge_boxes('loose_deck',pallet_deck())
     for s,(x,y,yaw) in enumerate(_spots): model(f'loose_pallet_{s}',(x,y,-5,yaw),_deck)
     cl,cw,ch=loose_goods.CARTON
@@ -247,8 +246,30 @@ for i in range(len(PARKS)):
     for b in [-.45,.45]:
         v.extend([box(f'mast{b}',.68,b,1.3,.12,.10,2.6,DARK),box(f'rail{b}',.755,b,1.3,.025,.05,2.4,STEEL),cylinder(f'hydraulic{b}',.58,b*.65,1.2,.045,1.8,STEEL)])
     for h in [.2,1.3,2.5]: v.append(box(f'mastcross{h}',.68,0,h,.13,1,.08,DARK))
-    v.extend([box('scanner',-.25,0,1.0,.24,.35,.16,DARK),box('scanwindow',-.25,-.18,1,.2,.015,.06,'.2 .45 .6 1'),cylinder('beacon',-.5,0,1.12,.06,.10,'.95 .48 .03 1')])
-    for b in [-.48,.48]: v.append(box(f'status{b}',-.25,b,.67,.45,.025,.035,'.12 .8 .55 1'))
+    if _HUMAN_FORKLIFT:
+        # Human-driven forklift: overhead guard, seat, steering wheel, and seated operator.
+        for b in [-.42,.42]:
+            v.append(box(f'guard_post_f{b}',.38,b,1.45,.05,.05,1.35,DARK))
+            v.append(box(f'guard_post_r{b}',-.55,b,1.45,.05,.05,1.35,DARK))
+        v.append(box('guard_roof',-.08,0,2.14,1.02,.92,.05,DARK))
+        v.extend([
+            box('seat_base',-.15,0,.92,.38,.42,.10,DARK),
+            box('seat_back',-.32,0,1.18,.10,.40,.46,DARK),
+            box('steer_col',.26,0,1.05,.07,.07,.55,DARK),
+            cylinder('steer_wheel',.22,0,1.32,.16,.03,DARK,0.35),
+            # Seated human driver (pants, safety vest, arms, head + hard hat)
+            box('drv_thighs',-.02,0,1.04,.34,.32,.14,'.14 .20 .32 1'),
+            box('drv_legs',.14,0,.86,.14,.30,.32,'.14 .20 .32 1'),
+            box('drv_torso',-.18,0,1.25,.24,.34,.44,'.95 .45 .05 1'),
+            box('drv_arm_l',.02,-.18,1.30,.32,.09,.09,'.95 .45 .05 1'),
+            box('drv_arm_r',.02,.18,1.30,.32,.09,.09,'.95 .45 .05 1'),
+            box('drv_head',-.16,0,1.58,.18,.18,.20,'.85 .68 .55 1'),
+            box('drv_hat',-.16,0,1.70,.22,.21,.08,'.98 .82 .08 1'),
+            cylinder('beacon',-.50,0,2.20,.06,.10,'.95 .48 .03 1'),
+        ])
+    else:
+        v.extend([box('scanner',-.25,0,1.0,.24,.35,.16,DARK),box('scanwindow',-.25,-.18,1,.2,.015,.06,'.2 .45 .6 1'),cylinder('beacon',-.5,0,1.12,.06,.10,'.95 .48 .03 1')])
+        for b in [-.48,.48]: v.append(box(f'status{b}',-.25,b,.67,.45,.025,.035,'.12 .8 .55 1'))
     model(f'agv_{i}',PARKS[i],merge_boxes(f'agv_body_{i}',v))
     model(f'fork_{i}',assembly(i,PARKS[i],.02)[f'fork_{i}'],_fork_mesh)
 for i in range(10):

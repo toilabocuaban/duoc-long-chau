@@ -16,7 +16,7 @@ from cad_navigation import LAYOUT
 _C = json.loads((Path(__file__).resolve().parent / 'config.json').read_text())
 # Facing north (forks away from the lanes). An AGV waiting at its park column on the return lane must stay
 # clear of a loaded AGV turning east under the easternmost spot (load sweep up to x ~ -27.65): forks reach px - 2.4.
-PARKS = [(-24, -4.5, 0, math.pi / 2), (-19, -4.5, 0, math.pi / 2)]
+PARKS = [(22.0, -4.5, 0, math.pi / 2), (36.6, -4.5, 0, math.pi / 2)]
 LOAD_Y = -8.4
 RETURN_Y = -6.4
 TRANSIT_Y = LOAD_Y
@@ -96,27 +96,32 @@ PICKUP_LEGS_FROM_LANE = 2   # route_to_pickup()[2:] starts on the return lane (u
 def route_to_pickup(i,job,position=None):
     x,y,_,_=position if position is not None else pickup_position(job)
     px=PARKS[i][0]
+    yaw_travel = 0.0 if x >= px else math.pi
     return [
         ((px,RETURN_Y,0,math.pi/2),'ALIGN_DEPARTURE'),        # reverse out of the parking box onto the lane
-        ((px,RETURN_Y,0,math.pi),'TURN_IN_PICKUP_AISLE'),
-        ((x,RETURN_Y,0,math.pi),'TRAVEL_TO_PICKUP'),
+        ((px,RETURN_Y,0,yaw_travel),'TURN_IN_PICKUP_AISLE'),
+        ((x,RETURN_Y,0,yaw_travel),'TRAVEL_TO_PICKUP'),
         ((x,RETURN_Y,0,math.pi/2),'ALIGN_WITH_PALLET'),
         ((x,y-OFFSET,0,math.pi/2),'INSERT_FORKS')]              # spot entered from the south
 
-def route_to_gate(i,x,port_idx=None):
+def route_to_gate(i,x,port_idx=None,from_x=None):
     in_ports = LAYOUT.data['ports']['in']
     p_idx = (i % len(in_ports)) if port_idx is None else (port_idx % len(in_ports))
     drop=in_ports[p_idx]['drop'][1]
+    ref_x = PARKS[i][0] if from_x is None else from_x
+    yaw_gate = 0.0 if x >= ref_x else math.pi
     return [((None,LOAD_Y,0,math.pi/2),'REVERSE_WITH_LOAD'),
-            ((None,LOAD_Y,0,0),'TURN_WITH_LOAD'),
-            ((x,LOAD_Y,0,0),'TRAVEL_WITH_LOAD'),
+            ((None,LOAD_Y,0,yaw_gate),'TURN_WITH_LOAD'),
+            ((x,LOAD_Y,0,yaw_gate),'TRAVEL_WITH_LOAD'),
             ((x,LOAD_Y,0,math.pi/2),'ALIGN_WITH_CONVEYOR'),
             ((x,drop-OFFSET,0,math.pi/2),'APPROACH_INBOUND')]
 
 def route_home(i,x):
+    px=PARKS[i][0]
+    yaw_ret = 0.0 if px >= x else math.pi
     return [((x,RETURN_Y,0,math.pi/2),'REVERSE_CLEAR_OF_CONVEYOR'),
-            ((x,RETURN_Y,0,math.pi),'TURN_TO_RETURN'),
-            ((PARKS[i][0],RETURN_Y,0,math.pi),'RETURN_ALONG_AISLE'),
-            ((PARKS[i][0],RETURN_Y,0,math.pi/2),'ALIGN_WITH_PARKING'),
-            ((PARKS[i][0],PARKS[i][1],0,math.pi/2),'PARK'),
+            ((x,RETURN_Y,0,yaw_ret),'TURN_TO_RETURN'),
+            ((px,RETURN_Y,0,yaw_ret),'RETURN_ALONG_AISLE'),
+            ((px,RETURN_Y,0,math.pi/2),'ALIGN_WITH_PARKING'),
+            ((px,PARKS[i][1],0,math.pi/2),'PARK'),
             (PARKS[i],'PARK_ALIGNED')]

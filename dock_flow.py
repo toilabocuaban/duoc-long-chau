@@ -1,6 +1,7 @@
 """Visible dock unloading, simulated barcode manifest, reusable pallet-jack transfer."""
 import asyncio
 import math
+import random
 import time
 from contextlib import asynccontextmanager
 from agv_motion import PARKS as AGV_PARKS
@@ -96,6 +97,7 @@ def source_stack(d,n):
     x,y=d['x']-.60,d['rear_y']-.35
     return [(x,y,.72) for _ in range(n)]
 def worker_id(i):return 10+i
+def worker_b_id(i):return 600+i
 
 def even_stack_positions(spot, count=18):
     """Carton centers for an even flow (standard high-bay storage pallet): 3 layers of 6 = 18 cartons.
@@ -132,9 +134,25 @@ def scene(c,model,pallet_deck):
     ])
     scanner=merge_boxes('dock_scanner',[box('stand',0,0,.5,.06,.06,1,'.3 .3 .3 1'),box('reader',0,0,1.02,.22,.16,.12,'.05 .12 .12 1'),box('light',0,-.085,1.03,.14,.01,.04,'.1 1 .2 1')])
     n=max(18,int(c.get('loose_cartons_per_pallet',18)))
+    n_workers_per_dock=max(1,int(c.get('dock_workers_per_truck',2)))
+    n_slots_per_dock=max(1,int(c.get('dock_pallet_slots_per_truck',6)))
+    slot_pad=merge_boxes('dock_stage_slot',[
+        box('pad',0,0,.003,1.10,1.30,.006,'.18 .46 .36 1'),
+        box('line_l',-.52,0,.006,.04,1.26,.008,'.88 .76 .20 1'),
+        box('line_r',.52,0,.006,.04,1.26,.008,'.88 .76 .20 1'),
+    ])
     for i,d in enumerate(dock_list(c)):
         for name,pose in LG.operator_pose(worker_id(i),d['x']+.85,d['rear_y']+.75,math.pi).items():
             model(name,pose[:3]+(pose[5],),meshes[name.split('_',1)[1]])
+        if n_workers_per_dock>=2:
+            for name,pose in LG.operator_pose(worker_b_id(i),d['x']-.85,d['rear_y']+.75,0.0).items():
+                model(name,pose[:3]+(pose[5],),meshes[name.split('_',1)[1]])
+        for s_idx in range(n_slots_per_dock):
+            col=(s_idx%2)-0.5
+            row=s_idx//2
+            sx=d['x']+col*1.25
+            sy=d['rear_y']-0.75-row*1.45
+            model(f'dock_stage_slot_{i}_{s_idx}',(sx,sy,0.0,0.0),slot_pad)
         model(f'dock_deck_{i}',stage(d)[:2]+(0,0),deck)
         model(f'dock_jack_{i}',stage(d)[:2]+(0,-math.pi/2),jack)
         init_stack=list(reversed(even_stack_positions(stage(d),n)))
@@ -258,17 +276,16 @@ class DockFlow:
         await self.e.move(at(1),duration=max(.1,duration),transform=at,exact=True)
     def transfer_waypoints(self,i,target,returning=False):
         """Remain inside: cross AGV lanes at own dock X, then use the internal corridor.
-        Detour North to y = -3.20 when crossing between West (x < -25.0) and East (x > -18.0)
-        to cleanly clear the AGV parking bays (x in [-24.8, -18.2], y in [-5.45, -3.55])."""
+        Detour North to y = -3.20 when crossing past the forklift parking bay at x = 22.5."""
         start=self.poses[f'dock_jack_{i}'];end=target[:2]+(0,0)
         inside_y=-5.35
         x_from=start[0]
         x_to=self.docks[i]['x'] if returning else end[0]
         pts=[(start[0],inside_y,0,0)]
-        if x_from < -25.0 and x_to > -18.0:
-            pts.extend([(-25.5,inside_y,0,0),(-25.5,-3.20,0,0),(-17.5,-3.20,0,0),(-17.5,inside_y,0,0)])
-        elif x_from > -18.0 and x_to < -25.0:
-            pts.extend([(-17.5,inside_y,0,0),(-17.5,-3.20,0,0),(-25.5,-3.20,0,0),(-25.5,inside_y,0,0)])
+        if x_from < 20.7 and x_to > 23.3:
+            pts.extend([(20.7,inside_y,0,0),(20.7,-3.20,0,0),(23.3,-3.20,0,0),(23.3,inside_y,0,0)])
+        elif x_from > 23.3 and x_to < 20.7:
+            pts.extend([(23.3,inside_y,0,0),(23.3,-3.20,0,0),(20.7,-3.20,0,0),(20.7,inside_y,0,0)])
         if returning:
             pts.extend([(self.docks[i]['x'],inside_y,0,0),end])
         else:
@@ -504,7 +521,11 @@ class DockFlow:
                 return out_p
             await self.e.move(pick_anim(1),duration=pick_dur,transform=pick_anim,exact=True)
             await self.worker(i,(d['x']+.42,d['rear_y']+.72,-math.pi/4),n)
-            await self.idle(i,self.c.get('inbound_scan_s',2),n)
+            scan_min=float(self.c.get('inbound_scan_min_s',self.c.get('inbound_scan_s',2)))
+            scan_max=float(self.c.get('inbound_scan_max_s',scan_min))
+            n_dock_workers=max(1,int(self.c.get('dock_workers_per_truck',1)))
+            scan_dur=random.uniform(min(scan_min,scan_max),max(scan_min,scan_max))/n_dock_workers
+            await self.idle(i,scan_dur,n)
             if emit_classified:
                 self.stats['scanned_'+kind]+=1
                 self.emit('BARCODE_CLASSIFIED',barcode=f'{kind.upper()}-{k:04d}-{j:03d}',classification=kind,dock=d['id'])
@@ -546,7 +567,9 @@ class DockFlow:
     async def _deliver_staged_pallet(self,i,d,kind,k,target,local,consume,acquire_target=None,staged_cartons=0):
         extra={'cartons':staged_cartons} if staged_cartons else {}
         self.emit('DOCK_PALLET_READY',dock=d['id'],classification=kind,batch=k,**extra)
-        span=(min(d['x'],target[0])-1.5,max(d['x'],target[0])+1.5)
+        # Reserve only the dock's own X crossing of the forklift aisle; once on inside_y = -5.35
+        # or detouring at -3.20, the handlift stays north of RETURN_Y = -6.4 and LOAD_Y = -8.4.
+        span=(d['x']-1.5,d['x']+1.5)
         t_gw0=self.e_time()
         traffic=self.gate.manual(span);permission=asyncio.create_task(traffic.__aenter__())
         while not permission.done():

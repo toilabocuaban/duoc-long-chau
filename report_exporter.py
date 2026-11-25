@@ -11,6 +11,7 @@ from typing import Any
 from openpyxl import Workbook
 from openpyxl.chart import BarChart, LineChart, PieChart, Reference
 from openpyxl.chart.label import DataLabelList
+from openpyxl.chart.layout import Layout, ManualLayout
 from openpyxl.drawing.text import CharacterProperties
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
@@ -1668,6 +1669,62 @@ def _finalize_dashboard_sheet(
         _ensure_row_span_height(ws, s_row, e_row, min_cm)
 
 
+def _apply_clean_chart_layout(chart, legend_pos: str = "t", is_pie: bool = False) -> None:
+    """Prevent title/axis/legend overlap, show axis units/values, and clean pie labels in Excel."""
+    chart.roundedCorners = False
+    eff_leg = legend_pos if is_pie else ("t" if legend_pos == "b" else legend_pos)
+    if getattr(chart, "title", None) is not None:
+        chart.title.overlay = False
+    if getattr(chart, "legend", None) is not None:
+        chart.legend.position = eff_leg
+        chart.legend.overlay = False
+    if is_pie:
+        chart.layout = Layout(
+            manualLayout=ManualLayout(
+                xMode="edge", yMode="edge", wMode="edge", hMode="edge",
+                x=0.08, y=0.14, w=0.84, h=0.62,
+            )
+        )
+        dl = DataLabelList()
+        dl.showPercent = True
+        dl.showVal = False
+        dl.showCatName = False
+        dl.showSerName = False
+        dl.showLegendKey = False
+        dl.showLeaderLines = True
+        chart.dataLabels = dl
+        if getattr(chart, "series", None):
+            chart.series[0].dLbls = dl
+    else:
+        chart.x_axis.delete = False
+        chart.y_axis.delete = False
+        chart.x_axis.axPos = "b"
+        chart.y_axis.axPos = "l"
+        chart.x_axis.tickLblPos = "nextTo"
+        chart.y_axis.tickLblPos = "nextTo"
+        chart.x_axis.majorTickMark = "out"
+        chart.y_axis.majorTickMark = "out"
+        chart.layout = Layout(
+            manualLayout=ManualLayout(
+                xMode="edge", yMode="edge", wMode="edge", hMode="edge",
+                x=0.11, y=0.23, w=0.85, h=0.57,
+            )
+        )
+        if getattr(getattr(chart.y_axis, "scaling", None), "max", None) == 100:
+            chart.y_axis.number_format = '0"%"'
+        else:
+            chart.y_axis.number_format = '#,##0'
+        if isinstance(chart, BarChart):
+            dl = DataLabelList()
+            dl.showVal = True
+            dl.showSerName = False
+            dl.showCatName = False
+            dl.showLegendKey = False
+            dl.showPercent = False
+            dl.dLblPos = "ctr" if getattr(chart, "grouping", None) == "stacked" else "outEnd"
+            chart.dataLabels = dl
+
+
 def _make_bar_chart(
     ws,
     title: str,
@@ -1717,7 +1774,7 @@ def _make_bar_chart(
             if s_idx < len(chart.series) and hex_rgb:
                 chart.series[s_idx].graphicalProperties.solidFill = hex_rgb
                 chart.series[s_idx].graphicalProperties.line.solidFill = hex_rgb
-    chart.legend.position = legend_pos
+    _apply_clean_chart_layout(chart, legend_pos=legend_pos, is_pie=False)
     return chart
 
 
@@ -1745,7 +1802,10 @@ def _make_pie_chart(
     chart.dataLabels.showPercent = True
     chart.dataLabels.showVal = False
     chart.dataLabels.showCatName = False
-    chart.legend.position = legend_pos
+    chart.dataLabels.showSerName = False
+    chart.dataLabels.showLegendKey = False
+    chart.dataLabels.showLeaderLines = True
+    _apply_clean_chart_layout(chart, legend_pos=legend_pos, is_pie=True)
     return chart
 
 
@@ -1790,7 +1850,7 @@ def _make_line_chart(
             ser.marker.graphicalProperties.line.solidFill = col_hex
             if s_idx == 2:
                 ser.graphicalProperties.line.dashStyle = "dash"
-    chart.legend.position = legend_pos
+    _apply_clean_chart_layout(chart, legend_pos=legend_pos, is_pie=False)
     return chart
 
 

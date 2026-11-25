@@ -24,7 +24,7 @@
     "pallet_size": [
         1.2,
         1.0,
-        1.7
+        1.4
     ],
     "speed_multiplier": 40.0,
     "sim_substep_s": 0.1,
@@ -38,42 +38,14 @@
     "inbound_even_interval_s": 95.0,
     "outbound_interval_s": 72.0,
     "inbound_pickup_slots": [
-        [
-            -33.485,
-            -2.765,
-            0,
-            1.5707963268
-        ],
-        [
-            -32.44,
-            -2.765,
-            0,
-            1.5707963268
-        ],
-        [
-            -31.395,
-            -2.765,
-            0,
-            1.5707963268
-        ],
-        [
-            -30.335,
-            -2.765,
-            0,
-            1.5707963268
-        ],
-        [
-            -29.29,
-            -2.765,
-            0,
-            1.5707963268
-        ],
-        [
-            -28.245,
-            -2.765,
-            0,
-            1.5707963268
-        ]
+        [25.6, -2.765, 0, 1.5707963268],
+        [26.645, -2.765, 0, 1.5707963268],
+        [27.69, -2.765, 0, 1.5707963268],
+        [28.735, -2.765, 0, 1.5707963268],
+        [29.78, -2.765, 0, 1.5707963268],
+        [30.825, -2.765, 0, 1.5707963268],
+        [31.87, -2.765, 0, 1.5707963268],
+        [32.915, -2.765, 0, 1.5707963268]
     ],
     "initial_outbound_pallets": 160,
     "agv_acceleration": 0.5,
@@ -106,7 +78,27 @@
     "trolley_capacity": 20,
     "loose_pallet_spots": [
         [
+            -12.2,
+            -2.2,
+            0
+        ],
+        [
             -10.7,
+            -2.2,
+            0
+        ],
+        [
+            -9.2,
+            -2.2,
+            0
+        ],
+        [
+            -7.7,
+            -2.2,
+            0
+        ],
+        [
+            -6.2,
             -2.2,
             0
         ],
@@ -165,7 +157,17 @@
     "truck_body_height_m": 2.85,
     "truck_cargo_transparency": 0.85,
     "truck_count_visible": 11,
-    "inbound_scan_s": 0.4,
+    "forklift_type": "human_driven",
+    "dock_workers_per_truck": 2,
+    "dock_handlifts_per_truck": 2,
+    "dock_pallet_slots_per_truck": 6,
+    "inbound_scan_s": 8.5,
+    "inbound_scan_min_s": 7.0,
+    "inbound_scan_max_s": 10.0,
+    "odd_pallet_size": [1.2, 1.0, 1.7],
+    "inbound_total_cartons_8h": 12000,
+    "inbound_cartons_per_truck": 200,
+    "inbound_trucks_per_day": 60,
     "p1_pick_box_s": 12.0,
     "dock_unload_s": 8.0,
     "dock_worker_speed": 1.8,
@@ -184,7 +186,24 @@
     "cycle_duration_s": 28800,
     "continuous_mode": true,
     "warehouse_inbound_target": 150,
+    "warehouse_inbound_odd_target": 250,
+    "warehouse_inbound_odd_gt10_target": 130,
+    "warehouse_inbound_odd_lt10_target": 120,
     "warehouse_outbound_target": 300,
+    "inbound_truck_mix": {
+        "odd_pct": 60,
+        "even_pct": 40
+    },
+    "carton_specs": {
+        "sku_count": 13000,
+        "drug_pct": 60,
+        "non_drug_pct": 40,
+        "avg_weight_kg": [5, 10],
+        "max_dims_mm": [770, 465, 570],
+        "min_dims_mm": [173, 85, 72],
+        "min_weight_kg": 0.23,
+        "max_weight_kg": 42.0
+    },
     "continuous_extra_pallets": 50,
     "max_stored_inflight": 220,
     "agv_initial_battery_pct": 100.0,
