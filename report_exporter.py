@@ -3420,7 +3420,7 @@ def _build_dock_sheet(wb: Workbook, tracker: SimulationTracker, summary: dict[st
     ws4 = wb.create_sheet("Khu_Vuc_Dock")
     dock_agv_rows = [t for t in tracker.agv_tasks if t["area"] == "Khu Dock -> Kho 01"]
     row = _style_banner(
-        ws4, 1, 18,
+        ws4, 1, 19,
         "BÁO CÁO KHU VỰC DOCK (AGV DOCK, PALLET CHẴN/LẺ, PICK/DROP, TRAFFIC GIAO CẮT)",
         f"Thời gian thực tế chuẩn 1x: {summary['sim_duration_hms']} | Tách riêng Hoạt động / Chờ ô & AGV / Nghỉ rảnh (Tổng 100%).",
     )
@@ -3428,6 +3428,9 @@ def _build_dock_sheet(wb: Workbook, tracker: SimulationTracker, summary: dict[st
     tot_d_busy = tot_d_cw = tot_d_pid = tot_d_wait = tot_d_slot_wait = 0.0
     tot_even_batches = tot_odd_batches = tot_even_cartons = tot_odd_cartons = 0
     tot_even_ready = tot_odd_ready = tot_empty_ret = 0
+    cartons_per_truck = max(1.0, float(cfg.get("inbound_cartons_per_truck", 200) or 200))
+    cartons_per_pallet = max(1, int(cfg.get("loose_cartons_per_pallet", 30) or 30))
+    tot_trucks_handled = 0.0
     for did in tracker.dock_order:
         d = tracker.docks[did]
         d_busy = float(d["busy_s"])
@@ -3445,6 +3448,9 @@ def _build_dock_sheet(wb: Workbook, tracker: SimulationTracker, summary: dict[st
         tot_even_ready += d["even_ready"]
         tot_odd_ready += d["odd_ready"]
         tot_empty_ret += d["empty_returns"]
+        d_cartons = (d["even_cartons"] + d["odd_cartons"]) or ((d["even_ready"] + d["odd_ready"]) * cartons_per_pallet)
+        d_trucks = round(d_cartons / cartons_per_truck, 2)
+        tot_trucks_handled += d_trucks
         per_dock_rows.append([
             f"Dock {did:02d}", d["worker_code"],
             f"Xe tải Dock {did:02d}", f"{n_pickup_bays} Ô Pickup (Chẵn) / Bàn Unpack T1 (Lẻ)",
@@ -3453,6 +3459,7 @@ def _build_dock_sheet(wb: Workbook, tracker: SimulationTracker, summary: dict[st
             _excel_days(d_busy), _excel_days(d_cw), _excel_days(d_pid),
             d["active_pct"], d.get("cmd_wait_pct", 0.0), d.get("pure_idle_pct", d["idle_pct"]),
             f"{d['agv_tasks']} ({_fmt_codes(d['agv_task_codes'], 6)})" if d["agv_tasks"] else "0",
+            d_trucks,
         ])
 
     sum_dk_dur = sum((t["duration_s"] or 0.0) for t in dock_agv_rows)
@@ -3560,6 +3567,7 @@ def _build_dock_sheet(wb: Workbook, tracker: SimulationTracker, summary: dict[st
     row = _style_section(ws4, row, 4, "1. TỔNG HỢP HOẠT ĐỘNG KHU VỰC DOCK")
     dock_kpis = [
         ("Cơ sở hạ tầng", "Số cửa Dock hoạt động", len(tracker.dock_order), "#,##0", f"Cửa Dock vật lý: {cfg.get('dock_physical_count', len(tracker.dock_order))}"),
+        ("Xe tải Dock", "Tổng số xe tải xử lý", round(tot_trucks_handled, 2), "#,##0.00", f"xe tải ({int(cartons_per_truck)} thùng/xe | 60% lẻ - 40% chẵn)"),
         ("Pallet Chẵn", "Batch xe tải Pallet Chẵn", tot_even_batches, "#,##0", "batch xe tải chẵn"),
         ("Pallet Chẵn", "Tổng kiện chẵn quét Barcode", int(summary["dock_scanned_even"]), "#,##0", "kiện chẵn đã quét"),
         ("Pallet Chẵn", "Pallet chẵn hoàn tất tại Dock", tot_even_ready, "#,##0", f"Giao ra {n_pickup_bays} Ô Pickup: {tracker.dock_flow_stats.get('pallets_to_w1', 0)}"),
@@ -3607,7 +3615,7 @@ def _build_dock_sheet(wb: Workbook, tracker: SimulationTracker, summary: dict[st
     ws4.row_dimensions[row].height = 22
     row += 1
 
-    row = _style_section(ws4, row, 18, "3. THỐNG KÊ CHI TIẾT TỪNG CỬA DOCK (PICK / DROP, 3 TRẠNG THÁI & TRAFFIC)")
+    row = _style_section(ws4, row, 19, "3. THỐNG KÊ CHI TIẾT TỪNG CỬA DOCK (PICK / DROP, 3 TRẠNG THÁI & TRAFFIC)")
     d_hdr_row = row
     d_last_data_row = d_hdr_row + len(per_dock_rows)
     row = _write_table(
@@ -3618,14 +3626,15 @@ def _build_dock_sheet(wb: Workbook, tracker: SimulationTracker, summary: dict[st
             "Pallet chẵn xong", "Pallet lẻ xong", "Pallet rỗng hồi",
             "TG làm việc thực tế", "TG chờ ô & AGV", "TG nghỉ rảnh",
             "Tỉ lệ chạy (%)", "Tỉ lệ chờ ô & AGV (%)", "Tỉ lệ nghỉ rảnh (%)", "NV AGV Dock (Số lượng & Mã)",
+            "Số xe tải xử lý (xe)",
         ],
         per_dock_rows,
         col_formats={
             **{c: "#,##0" for c in range(5, 12)},
             12: FMT_HMS_TENTH, 13: FMT_HMS_TENTH, 14: FMT_HMS_TENTH,
-            15: "0.00", 16: "0.00", 17: "0.00",
+            15: "0.00", 16: "0.00", 17: "0.00", 19: "#,##0.00",
         },
-        right_cols=set(range(5, 18)),
+        right_cols=set(range(5, 18)) | {19},
         center_cols={1, 2},
         total_row=[
             "TỔNG / TB", "", "", "",
@@ -3633,7 +3642,7 @@ def _build_dock_sheet(wb: Workbook, tracker: SimulationTracker, summary: dict[st
             tot_even_ready, tot_odd_ready, tot_empty_ret,
             _excel_days(tot_d_busy), _excel_days(tot_d_cw), _excel_days(tot_d_pid),
             avg_dock_act, avg_dock_cw, avg_dock_pid,
-            f"{len(dock_agv_rows)} NV",
+            f"{len(dock_agv_rows)} NV", round(tot_trucks_handled, 2),
         ],
         auto_filter=False,
     )
@@ -3716,7 +3725,7 @@ def _build_dock_sheet(wb: Workbook, tracker: SimulationTracker, summary: dict[st
         center_cols={2, 3, 5},
     )
     _finalize_dashboard_sheet(
-        ws4, 18,
+        ws4, 19,
         width_bounds={**DASHBOARD_COL_BOUNDS, 4: (26, 36), 5: (36, 42)},
         wrapped_ranges=[
             (sec0_data_start, sec0_data_end, 5),

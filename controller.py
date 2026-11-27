@@ -68,6 +68,26 @@ Z05_CARTON_POOL=max(80,int(C.get('z05_carton_pool',0)),len(LG.Z05_WORKERS)*int(C
 FREE_RET_DECKS=asyncio.Queue()
 FREE_CARTONS=asyncio.Queue()
 FREE_Z05_CARTONS={f:asyncio.Queue() for f in LG.floors()}
+_EXTRA_CARTON_SEQS={}
+def _alloc_pool_cartons(q,prefix,start_idx,pos0,n):
+    out=[]
+    for _ in range(n):
+        if not q.empty():
+            out.append(q.get_nowait())
+        else:
+            seq=_EXTRA_CARTON_SEQS.get(prefix,0)
+            _EXTRA_CARTON_SEQS[prefix]=seq+1
+            name=f'{prefix}{start_idx+seq}'
+            poses.setdefault(name,pos0)
+            last_tx_poses.setdefault(name,pos0)
+            out.append(name)
+    return out
+def _alloc_loose_cartons(n):
+    pos0=(LOOSE_SPOTS[0][0],LOOSE_SPOTS[0][1],-5,0) if LOOSE_SPOTS else (0.0,0.0,-5,0)
+    return _alloc_pool_cartons(FREE_CARTONS,'carton_',LOOSE_CARTON_POOL,pos0,n)
+def _alloc_z05_cartons(floor,n):
+    w0x,w0y,_,_=LG.z05_station(floor,0)
+    return _alloc_pool_cartons(FREE_Z05_CARTONS[floor],f'z05_carton_{floor}_',Z05_CARTON_POOL,(w0x,w0y,-5,0),n)
 p1_running=False
 _EVENTS_FP=None
 
@@ -599,7 +619,9 @@ JOB_IN_QUEUE_T={}
 REQ_QUEUE_T={}
 MAX_STORED_INFLIGHT=int(C.get('max_stored_inflight',65))
 INBOUND_TARGET=max(0,int(C.get('warehouse_inbound_target',0)))
+INBOUND_ODD_TARGET=max(0,int(C.get('warehouse_inbound_odd_target',0)))
 OUTBOUND_TARGET=max(0,int(C.get('warehouse_outbound_target',0)))
+DAY_DURATION_S=max(1.0,float(C.get('cycle_duration_s',28800.0) or 28800.0))
 INBOUND_EVEN_INTERVAL_S=max(0.0,float(C.get('inbound_even_interval_s',0.0)))
 HOURLY_INBOUND_SCHEDULE=[max(0,int(x)) for x in (C.get('hourly_inbound_schedule') or ())]
 HOURLY_OUTBOUND_SCHEDULE=[max(0,int(x)) for x in (C.get('hourly_outbound_schedule') or ())]
@@ -635,7 +657,7 @@ def _load_entity_ids():
     if ok:ENTITY_IDS.update({m.name:m.id for m in scene.model})
 
 def _flush_tx(batch):
-    if STOP_REQUESTED or not batch:return
+    if STOP_REQUESTED or not batch or node is None:return
     if not ENTITY_IDS:_load_entity_ids()
     req=Pose_V()
     for name,xyz in batch.items():
@@ -707,7 +729,8 @@ def event(job,state,**extra):
     record={'job':job,'state':state,'demo_time_s':round(scheduler.time,5),**extra}
     events.append(record);event_count+=1
     tracker.record_event(record)
-    (ROOT/'status.json').write_text(json.dumps(record,indent=2))
+    if not (args.fast and getattr(args,'step_dt',None)):
+        (ROOT/'status.json').write_text(json.dumps(record,indent=2))
     _write_event(record)
     print(f'Pallet {job+1:02d}: {state}',flush=True)
 
@@ -761,7 +784,8 @@ class Engine:
         # while flushing poses to Gazebo at 20 FPS so 40x stays accurate without leaping past collisions.
         global in_engine_loop
         in_engine_loop=True
-        dt,sub_steps,frame=_sim_step_params()
+        base_dt,sub_steps,frame=_sim_step_params()
+        exact_fast=bool(args.fast and getattr(args,'step_dt',None) and args.step_dt>0)
         next_frame_wall=time.perf_counter()+frame
         try:
             while self.running and not STOP_REQUESTED:
@@ -770,17 +794,23 @@ class Engine:
                     if task.done() and not task.cancelled() and task.exception() is not None:raise task.exception()
                 if self.total_ticks%200==0 and background_tasks:
                     background_tasks[:]=[t for t in background_tasks if not t.done()]
+                items=list({id(v):v for v in self.motions.values()}.values()) if self.motions else []
+                dt=base_dt
+                if exact_fast and not items and self._waiters:
+                    dt=max(base_dt,self._waiters[0][0]-scheduler.time)
                 scheduler.time+=dt
                 while self._waiters and self._waiters[0][0]<=scheduler.time+1e-6:
                     _,_,w_fut=heapq.heappop(self._waiters)
                     if not w_fut.done():w_fut.set_result(None)
                 changes={};finished=[]
-                items={id(v):v for v in self.motions.values()}.values()
                 for m in items:
                     m['elapsed']+=dt;t=min(1,m['elapsed']/m['duration'])
+                    if t>=1:
+                        finished.append(m)
+                    elif args.fast and not any(n.startswith(('agv_','shuttle_','in_lift_','out_lift_','shuttle_lift')) for n in m['targets']):
+                        continue
                     q=m['shape'](t)
                     changes.update(m['transform'](q) if m['transform'] else {n:tuple(a+(b-a)*q for a,b in zip(m['starts'][n],v)) for n,v in m['targets'].items()})
-                    if t>=1:finished.append(m)
                 active_agvs=[i for i in range(len(PARKS)) if f'agv_{i}' in changes]
                 if len(active_agvs)>=2:
                     for idx_a in range(len(active_agvs)):
@@ -793,9 +823,9 @@ class Engine:
                                 self.following_ticks+=1
                                 break
                     self.dual_agv_ticks+=1
-                prospective={**poses,**changes}
-                for i in range(len(PARKS)):
-                    if f'agv_{i}' in changes:
+                if active_agvs:
+                    prospective={**poses,**changes}
+                    for i in active_agvs:
                         global route_checks
                         payload=agv_load[i];check_pose(i,changes[f'agv_{i}'],prospective,payload,pickups[i]);route_checks+=1
                 if sum(n.startswith('shuttle_') and n[8:].isdigit() for n in changes)>1:self.multi_shuttle_ticks+=1
@@ -985,28 +1015,50 @@ async def arrivals(total):
         cont_job_seq=0
         cont_even_seq=0
         in_release_times=build_hourly_release_times(HOURLY_INBOUND_SCHEDULE) if HOURLY_INBOUND_SCHEDULE else None
-        even_limit=INBOUND_TARGET if INBOUND_TARGET>0 else (len(in_release_times) if in_release_times is not None else None)
+        max_days=max(1,int(round(CYCLE_DURATION_S/DAY_DURATION_S))) if CYCLE_DURATION_S>0 else None
+        def _cur_day():
+            d_idx=int(scheduler.time//DAY_DURATION_S)
+            return min(max_days-1,d_idx) if max_days is not None else d_idx
+        def _even_limit_now():
+            if INBOUND_TARGET>0:
+                return (_cur_day()+1)*INBOUND_TARGET
+            return len(in_release_times) if in_release_times is not None else None
+        def _odd_limit_now():
+            if INBOUND_ODD_TARGET>0:
+                return (_cur_day()+1)*INBOUND_ODD_TARGET
+            return None
+        even_total_limit=(max_days*INBOUND_TARGET if (INBOUND_TARGET>0 and max_days is not None) else (len(in_release_times) if in_release_times is not None else None))
         even_buf=max(1,len(INBOUND_PICKUP_SLOTS))
         if in_release_times is not None:
             even_released=0
         else:
-            even_released=(min(even_limit,even_buf) if even_limit is not None else even_buf) if INBOUND_EVEN_INTERVAL_S>0 else even_limit
+            even_released=(min(even_total_limit,even_buf) if even_total_limit is not None else even_buf) if INBOUND_EVEN_INTERVAL_S>0 else even_total_limit
         even_claimed=0
+        odd_claimed=0
         def _reserve_even():
             nonlocal even_claimed
             even_claimed+=1
+        def _reserve_odd():
+            nonlocal odd_claimed
+            odd_claimed+=1
         def _can_even():
             if FREE_EVEN_PALLETS.empty() or stored.qsize()>=MAX_STORED_INFLIGHT:
                 return False
             if even_released is not None and even_claimed>=even_released:
                 return False
-            if even_limit is not None and even_claimed>=even_limit:
+            lim=_even_limit_now()
+            if lim is not None and even_claimed>=lim:
+                return False
+            return True
+        def _can_odd():
+            lim=_odd_limit_now()
+            if lim is not None and odd_claimed>=lim:
                 return False
             return True
         async def _pace_even_inbound():
             nonlocal even_released
             if in_release_times is not None:
-                lim=even_limit if even_limit is not None else len(in_release_times)
+                lim=even_total_limit if even_total_limit is not None else len(in_release_times)
                 for idx,t_rel in enumerate(in_release_times[:lim]):
                     if t_rel>scheduler.time:
                         await engine.until(t_rel)
@@ -1015,29 +1067,44 @@ async def arrivals(total):
                     await SLOT_COORD.notify()
                 return
             k=0
-            while not STOP_REQUESTED and (even_limit is None or (even_buf+k)<=even_limit):
+            while not STOP_REQUESTED and (even_total_limit is None or (even_buf+k)<=even_total_limit):
                 if k>0:
                     await engine.until(k*INBOUND_EVEN_INTERVAL_S)
                 if STOP_REQUESTED:break
                 nxt=even_buf+k
-                even_released=min(even_limit,nxt) if even_limit is not None else nxt
+                even_released=min(even_total_limit,nxt) if even_total_limit is not None else nxt
                 k+=1
                 await SLOT_COORD.notify()
+        async def _pace_daily_boundaries():
+            if INBOUND_TARGET<=0 and INBOUND_ODD_TARGET<=0:
+                return
+            d_next=1
+            while not STOP_REQUESTED and (max_days is None or d_next<max_days):
+                await engine.until(d_next*DAY_DURATION_S)
+                if STOP_REQUESTED:break
+                d_next+=1
+                await SLOT_COORD.notify()
         even_pacer=asyncio.create_task(_pace_even_inbound()) if (in_release_times is not None or INBOUND_EVEN_INTERVAL_S>0) else None
+        day_pacer=asyncio.create_task(_pace_daily_boundaries()) if (max_days is None or max_days>1) else None
         async def dock_worker_loop(dock_i):
             nonlocal cont_job_seq,cont_even_seq
             global odd_pallet_seq,max_pending
             batch_k=0
             while not STOP_REQUESTED:
+                # 60% odd / 40% even mix per truck across docks and batches
+                desired_kind='even' if ((dock_i*2+batch_k)%5) in (0,2) else 'odd'
+                next_desired_kind='even' if ((dock_i*2+batch_k+1)%5) in (0,2) else 'odd'
                 claimed_meta={'kind':None,'job_id':None,'slot_idx':None,'p_model':None,'cartons':None,'handed':False}
-                async def claim_slot_fn(di,dock_id,k,count):
+                async def claim_slot_fn(di,dock_id,k,count,prefer=desired_kind):
                     nonlocal cont_job_seq,cont_even_seq
                     global odd_pallet_seq,max_pending
                     res=await SLOT_COORD.claim_next(
                         _can_even,
-                        lambda:FREE_CARTONS.qsize()>=LOOSE_PER,
+                        _can_odd,
                         on_even_claim=_reserve_even,
+                        on_odd_claim=_reserve_odd,
                         dock_x=dock_flow.docks[di]['x'],
+                        prefer_flow=prefer,
                     )
                     if res is None or STOP_REQUESTED:
                         return None
@@ -1066,8 +1133,8 @@ async def arrivals(total):
                             await in_queue.put(job_id)
                             max_pending=max(max_pending,in_queue.qsize())
                         return ('even',bay_pos,None,receive_even)
-                    reserved_cartons=[FREE_CARTONS.get_nowait() for _ in range(LOOSE_PER)]
-                    spot=LOOSE_SPOTS[slot_idx];stack=LG.stack_positions(spot,LOOSE_PER)
+                    reserved_cartons=_alloc_loose_cartons(LOOSE_PER)
+                    spot=LOOSE_SPOTS[slot_idx];stack=LG.stack_positions(spot,LOOSE_PER,total_height=ODD_PALLET_HEIGHT_M)
                     claimed_meta.update({'kind':'odd','job_id':job_id,'slot_idx':slot_idx,'cartons':reserved_cartons,'handed':False})
                     async def receive_odd(_i,cartons,job_id=job_id,odd_idx=odd_idx,s=slot_idx,spot=spot,stack=stack,names=reserved_cartons):
                         send({n:poses[n][:2]+(-5,0) for n in cartons},transmit=not args.fast)
@@ -1078,7 +1145,7 @@ async def arrivals(total):
                         await LOOSE_POOL.add(s,odd_idx,job_id,list(zip(names,stack)))
                     return ('odd',spot,SpotHold(LOOSE_SPOT_FREE[slot_idx]),receive_odd)
                 try:
-                    await dock_flow.prestage_and_deliver(dock_i,batch_k,LOOSE_PER,claim_slot_fn)
+                    await dock_flow.prestage_and_deliver(dock_i,batch_k,LOOSE_PER,claim_slot_fn,desired_kind=desired_kind,next_desired_kind=next_desired_kind)
                 except asyncio.CancelledError:
                     raise
                 except BaseException:
@@ -1104,6 +1171,10 @@ async def arrivals(total):
         finally:
             if even_pacer is not None and not even_pacer.done():
                 even_pacer.cancel()
+            if day_pacer is not None and not day_pacer.done():
+                day_pacer.cancel()
+            if hasattr(dock_flow,'stop_all_bg'):
+                dock_flow.stop_all_bg()
         return
     # Finite runs keep their configured cadence; a pallet is only placed once its pickup bay is empty.
     async def place(job):
@@ -1114,7 +1185,7 @@ async def arrivals(total):
             global odd_pallet_seq
             odd_idx=odd_pallet_seq;odd_pallet_seq+=1
             s=odd_idx%len(LOOSE_SPOTS);spot=LOOSE_SPOTS[s]
-            stack=LG.stack_positions(spot,LOOSE_PER)
+            stack=LG.stack_positions(spot,LOOSE_PER,total_height=ODD_PALLET_HEIGHT_M)
             async def receive_odd(dock_i,cartons):
                 names=[await FREE_CARTONS.get() for _ in range(LOOSE_PER)]
                 send({n:poses[n][:2]+(-5,0) for n in cartons},transmit=not args.fast)
@@ -1141,7 +1212,7 @@ async def arrivals(total):
             if pickup_bays:
                 await pickup_bays[job%len(pickup_bays)].acquire()
                 bay_acquired=True
-            await dock_flow.prepare('even',job,inbound_pickup_position(job),list(range(18)),receive)
+            await dock_flow.prepare('even',job,inbound_pickup_position(job),list(range(LOOSE_PER or 30)),receive)
         except BaseException:
             if not handed and use_pool:
                 JOB_PALLET_MODEL.pop(job,None)
@@ -1294,7 +1365,7 @@ async def _run_inbound_job(lane,job,parked):
             bat_now=tracker.get_agv_battery_pct(f'agv_{lane}',scheduler.time) if tracker is not None else 100.0
             human_fk=(C.get('forklift_type','human_driven')=='human_driven')
             needs_chg_now=(_check_agv_needs_charge(f'agv_{lane}',dry_run=True)[0] is not None) or ((not human_fk) and bat_now<CHARGE_THRESHOLD_PCT+0.5)
-            if (not STOP_REQUESTED) and (not needs_chg_now) and (not in_queue.empty()) and (not pickup_maneuver_lock.locked()) and (human_fk or peer_charging or lane==0):
+            if (not STOP_REQUESTED) and (not needs_chg_now) and (not in_queue.empty()) and (not pickup_maneuver_lock.locked()) and (peer_charging or lane==0):
                 nxt=in_queue.get_nowait()
                 if nxt is not None:
                     event(job,'AGV_RETURN_COMPLETE',hot_redispatch=True)
@@ -1429,6 +1500,7 @@ LOOSE_SPOTS=[tuple(s) for s in C.get('loose_pallet_spots',[])]
 ODD_SPOT_LOCKS=[asyncio.Lock() for _ in LOOSE_SPOTS] or [asyncio.Lock()]
 LOOSE_PALLETS=int(C.get('loose_pallets',0)) if LOOSE_SPOTS else 0
 LOOSE_PER=int(C.get('loose_cartons_per_pallet',0))
+ODD_PALLET_HEIGHT_M=float((C.get('odd_pallet_size') or [1.2,1.0,1.7])[2])
 loose_stats={'pallets_unpacked':0,'cartons_on_belt':0,'cartons_delivered':0,'per_floor':{},'shared_picks':0}
 LOOSE_SPOT_FREE=[asyncio.Semaphore(1) for _ in LOOSE_SPOTS]
 
@@ -1453,7 +1525,7 @@ class SlotCoordinator:
         for idx,busy in enumerate(self.loose_busy):
             if not busy:return idx
         return None
-    async def claim_next(self,can_even_fn,can_odd_fn=None,on_even_claim=None,dock_x=None):
+    async def claim_next(self,can_even_fn,can_odd_fn=None,on_even_claim=None,on_odd_claim=None,dock_x=None,prefer_flow=None):
         west_split=-21.0
         has_west=bool(dock_flow.docks) and any(d['x']<west_split for d in dock_flow.docks)
         has_east=bool(dock_flow.docks) and any(d['x']>=west_split for d in dock_flow.docks)
@@ -1462,7 +1534,17 @@ class SlotCoordinator:
                 bay=self._free_bay() if can_even_fn() else None
                 odd_ok=bool(LOOSE_SPOTS) and (True if can_odd_fn is None else can_odd_fn())
                 spot=self._free_spot() if odd_ok else None
-                if dock_x is not None and has_west and has_east:
+                if prefer_flow=='odd':
+                    pick='odd' if spot is not None else ('even' if bay is not None else None)
+                    if pick is None:
+                        await self._c().wait()
+                        continue
+                elif prefer_flow=='even':
+                    pick='even' if bay is not None else ('odd' if spot is not None else None)
+                    if pick is None:
+                        await self._c().wait()
+                        continue
+                elif dock_x is not None and has_west and has_east:
                     # Prefer West Docks -> Pickup Bays and East Docks -> Loose Spots, falling back if preferred side is full/empty.
                     if dock_x<west_split:
                         pick='even' if bay is not None else ('odd' if spot is not None else None)
@@ -1489,6 +1571,8 @@ class SlotCoordinator:
                     return 'even',bay
                 self.loose_busy[spot]=True
                 self.last_flow='odd'
+                if on_odd_claim is not None:
+                    on_odd_claim()
                 return 'odd',spot
             return None
     async def release_pickup(self,bay_idx):
@@ -1708,6 +1792,8 @@ async def pallet_pick_supervisor_loop():
 
 U1_PHASES=(.15,.10,.15,.20,.12,.10,.08,.10)
 
+_U1_PACE_T={}
+
 async def _u1_operator_cycle(floor,branch,carton,rack_pose,rack_idx,trolley_slot,tray_slot=0):
     """U1 sorting worker at the end of branch (*U632):
     1. Opens carton on the belt end, revealing 3 yellow medicine boxes inside.
@@ -1723,6 +1809,25 @@ async def _u1_operator_cycle(floor,branch,carton,rack_pose,rack_idx,trolley_slot
     med_count=int(C.get('u1_med_boxes_per_carton',LG.U1_MED_PER_CARTON))
     med_offset=tray_slot*med_count
     med_names=[f'u1_med_{floor}_{branch}_{rack_idx}_{med_offset+m}' for m in range(med_count)]
+    if args.fast and getattr(args,'step_dt',None) and args.step_dt>=0.25:
+        total_dur=open_s+med_count*pick_s+sum(U1_PHASES[:7])*pick_s
+        base_t=max(scheduler.time,_U1_PACE_T.get((floor,branch),scheduler.time))
+        tgt_t=base_t+total_dur
+        _U1_PACE_T[(floor,branch)]=tgt_t
+        await engine.until(tgt_t)
+        placed=[]
+        updates={}
+        for m,m_name in enumerate(med_names):
+            box_i=1 if med_count==1 else m
+            target_on_rack=LG.u1_med_on_rack(rack_pose,box_i,tray_slot)
+            updates[m_name]=target_on_rack
+            placed.append((m_name,box_i,tray_slot))
+            loose_event('MED_BOX_PLACED_IN_TRAY',carton=carton,med_box=m_name,box_index=m,floor=floor,branch=branch)
+        t_pose=LG.u1_trolley_pose(floor,branch)
+        updates[carton]=LG.trolley_carton_pose(t_pose,trolley_slot)
+        send(updates,transmit=False)
+        loose_event('EMPTY_CARTON_IN_TROLLEY',carton=carton,floor=floor,branch=branch,slot=trolley_slot)
+        return placed
     c_pose=poses[carton]
     state={'x':sx,'y':sy,'yaw':syaw,'bend':0.,'arm':0.}
     async def phase(dur,x=None,y=None,yaw=None,bend=None,arm=None,carry_item=None,item_to=None,walk=False):
@@ -2084,8 +2189,14 @@ async def u1_trolley_swap_cycle(floor,branch,cartons_in_trolley):
     """When the U1 trolley holds 5 empty cartons, a pooled U1 AGV takes it to Khu 06 and brings a waiting trolley back."""
     st=U1_STATE[(floor,branch)];trolley=st['active_trolley']
     def drop():
-        # Keep the empty cartons visibly stacked on the trolley while parked in Khu 06.
-        K06_TROLLEY_CARTONS[floor][trolley]=('u1',list(cartons_in_trolley))
+        # Keep top 2 empty cartons visibly stacked on the trolley in Khu 06; return any extras immediately to FREE_CARTONS.
+        kept=list(cartons_in_trolley[-2:])
+        for extra_c in cartons_in_trolley[:-2]:
+            send({extra_c:(0.,0.,-5.,0.)},transmit=not args.fast)
+            FREE_CARTONS.put_nowait(extra_c)
+        if cartons_in_trolley[:-2] and CONTINUOUS_MODE:
+            SLOT_COORD.wake_all()
+        K06_TROLLEY_CARTONS[floor][trolley]=('u1',kept)
         loose_event('U1_TROLLEY_DELIVERED_TO_K06',floor=floor,branch=branch,trolley=trolley)
     hp=u1_home(floor,branch)
     tp=LG.u1_trolley_pose(floor,branch)
@@ -2148,12 +2259,19 @@ async def carton_trip(name,dest,branch):
         rack=st['active_rack']
         rack_idx=st['active_rack_idx']
         tray_slot=len(st['cartons'])
-        trolley_slot=len(st['trolley_cartons'])
+        trolley_slot=len(st['trolley_cartons'])%max(1,min(6,TROLLEY_CAP))
         rack_pose=LG.u1_rack_pose(dest,b)
         loose_event('WORKER_OPEN_CARTON',carton=name,floor=dest,branch=b,rack=rack)
         placed_meds=await u1_operator_cycle(dest,b,name,rack_pose,rack_idx,trolley_slot,tray_slot)
         st['cartons'].append((name,placed_meds))
         st['trolley_cartons'].append(name)
+        st['trolley_total']=st.get('trolley_total',0)+1
+        # Keep top 2 empty cartons visible in the U1 trolley; recycle buried ones immediately so 30-carton odd pallets never starve FREE_CARTONS.
+        while len(st['trolley_cartons'])>2:
+            recycled_c=st['trolley_cartons'].pop(0)
+            send({recycled_c:(0.,0.,-5.,0.)},transmit=not args.fast)
+            FREE_CARTONS.put_nowait(recycled_c)
+            if CONTINUOUS_MODE:SLOT_COORD.wake_all()
         loose_event('CARTON_PLACED_ON_RACK',carton=name,floor=dest,branch=b,rack=rack,slot=tray_slot,med_boxes=[m[0] for m in placed_meds])
         if len(st['cartons'])>=U1_PER_RACK:
             store_cell=st['empty_cell']
@@ -2171,7 +2289,8 @@ async def carton_trip(name,dest,branch):
             st['empty_cell']=spare_cell
             st['cartons']=[]
             st['swaps']+=1
-        if len(st['trolley_cartons'])>=TROLLEY_CAP:
+        if st.get('trolley_total',0)>=TROLLEY_CAP:
+            st['trolley_total']=0
             t_swap0=scheduler.time
             await u1_trolley_swap_cycle(dest,b,list(st['trolley_cartons']))
             t_swap1=scheduler.time
@@ -2210,6 +2329,8 @@ async def _z05_move_worker(floor,worker_idx,dur,x=None,y=None,yaw=None,bend=None
     await engine.move(end,duration=max(.04,dur),transform=at,shape=(lambda t:t) if walk else blend,exact=True)
     state.update(b)
 
+_Z05_PACE_T={}
+
 async def _z05_operator_deliver_one(floor,worker_idx,batch,carton,stack_pos,u2_idx,wait_intervals=None):
     """Zone 05 worker_idx (0 or 1) walks at constant speed z05_walk_speed to batch['spot_xy'] (whichever Zone 05
     unpack zone has goods), picks carton, walks at constant speed z05_walk_speed to U2 station u2_idx (0..5),
@@ -2221,6 +2342,46 @@ async def _z05_operator_deliver_one(floor,worker_idx,batch,carton,stack_pos,u2_i
     dx_stand,dy_stand,dyaw=raw_drop[0]+.52,raw_drop[1],math.pi
     reach=LG.reach_for(stack_pos[2]-z0)
     drop_bend,drop_arm=.84,.54
+    if args.fast and getattr(args,'step_dt',None) and args.step_dt>=0.25:
+        walk_speed=max(.1,float(C.get('z05_walk_speed',1.1)))
+        d1=math.hypot(px-state['x'],py-state['y'])
+        t_pick=(0.22+d1/walk_speed if d1>1e-3 else 0.0)+0.18+0.55+0.25+0.40
+        base_t=max(scheduler.time,_Z05_PACE_T.get((floor,worker_idx),scheduler.time))
+        tgt1=base_t+t_pick
+        _Z05_PACE_T[(floor,worker_idx)]=tgt1
+        await engine.until(tgt1)
+        if not batch['items']:
+            if not batch.get('is_partial') and batch.get('hide_deck_on_picked',True):
+                send({batch['deck']:(batch['spot_xy'][0],batch['spot_xy'][1],-5,0)},transmit=False)
+            pe=batch.get('picked_event')
+            if pe is not None:
+                pe.set()
+        d2=math.hypot(dx_stand-px,dy_stand-py)
+        t_walk=0.22+(d2/walk_speed if d2>1e-3 else 0.04)+0.18
+        tgt2=max(scheduler.time,tgt1+t_walk)
+        _Z05_PACE_T[(floor,worker_idx)]=tgt2
+        await engine.until(tgt2)
+        t_u2w0=scheduler.time
+        async with U2_DELIVERY_LOCKS[(floor,u2_idx)]:
+            t_u2w1=scheduler.time
+            if wait_intervals is not None and t_u2w1>t_u2w0:
+                wait_intervals.append((t_u2w0,t_u2w1))
+            tgt3=max(scheduler.time,_Z05_PACE_T[(floor,worker_idx)]+0.95)
+            _Z05_PACE_T[(floor,worker_idx)]=tgt3
+            await engine.until(tgt3)
+            slot_off=(0.0,-0.28,0.28)[Z05_FLOOR_STATE[floor]['u2_queued'][u2_idx]%3]
+            drop_pose=(raw_drop[0],raw_drop[1]+slot_off,raw_drop[2],raw_drop[3])
+            send({carton:drop_pose},transmit=False)
+            state.update({'x':dx_stand,'y':dy_stand,'yaw':dyaw,'bend':0.,'arm':0.})
+            Z05_FLOOR_STATE[floor]['u2_queued'][u2_idx]+=1
+            loose_event('Z05_CARTON_DELIVERED_TO_U2',job=batch['job'],floor=floor,zone=batch['zone'],worker=worker_idx,carton=carton,u2_station=u2_idx)
+            t=asyncio.create_task(u2_carton_trip(floor,u2_idx,carton,batch['job']))
+            Z05_FLOOR_STATE[floor]['u2_active_task'][u2_idx]=t
+            background_tasks.append(t)
+            batch['u2_tasks'].append(t)
+            if len(batch['u2_tasks'])>=batch['total_items']:
+                batch['done_event'].set()
+        return
     if math.hypot(px-state['x'],py-state['y'])>1e-3:
         head_to_pallet=math.atan2(py-state['y'],px-state['x'])
         await _z05_move_worker(floor,worker_idx,.22,yaw=head_to_pallet)
@@ -2352,6 +2513,8 @@ async def z05_worker_loop(floor,worker_idx):
         finally:
             fst['u2_reserved'][u2_idx]=False
 
+_U2_PACE_T={}
+
 async def _u2_operator_cycle(floor,u2_idx,carton,rack_pose,rack_idx,trolley_slot,tray_slot=0):
     """U2 put-away worker at (floor, u2_idx):
     1. Bends down and opens the carton placed on the floor in front of them, revealing 3 yellow medicine boxes inside.
@@ -2367,6 +2530,23 @@ async def _u2_operator_cycle(floor,u2_idx,carton,rack_pose,rack_idx,trolley_slot
     med_count=int(C.get('u2_med_boxes_per_carton',LG.U1_MED_PER_CARTON))
     med_offset=tray_slot*med_count
     med_names=[f'u2_med_{floor}_{u2_idx}_{rack_idx}_{med_offset+m}' for m in range(med_count)]
+    if args.fast and getattr(args,'step_dt',None) and args.step_dt>=0.25:
+        total_dur=open_s+med_count*pick_s+sum(U1_PHASES[:7])*pick_s
+        base_t=max(scheduler.time,_U2_PACE_T.get((floor,u2_idx),scheduler.time))
+        tgt_t=base_t+total_dur
+        _U2_PACE_T[(floor,u2_idx)]=tgt_t
+        await engine.until(tgt_t)
+        placed=[];updates={}
+        for m,m_name in enumerate(med_names):
+            box_i=1 if med_count==1 else m
+            updates[m_name]=LG.u1_med_on_rack(rack_pose,box_i,tray_slot)
+            placed.append((m_name,box_i,tray_slot))
+            loose_event('U2_MED_BOX_PLACED_IN_TRAY',carton=carton,med_box=m_name,box_index=m,floor=floor,u2_station=u2_idx)
+        t_pose=LG.u2_trolley_pose(floor,u2_idx)
+        updates[carton]=LG.trolley_carton_pose(t_pose,trolley_slot)
+        send(updates,transmit=False)
+        loose_event('U2_EMPTY_CARTON_IN_TROLLEY',carton=carton,floor=floor,u2_station=u2_idx,slot=trolley_slot)
+        return placed
     c_pose=poses[carton]
     state={'x':sx,'y':sy,'yaw':syaw,'bend':0.,'arm':0.}
     async def phase(dur,x=None,y=None,yaw=None,bend=None,arm=None,carry_item=None,item_to=None,walk=False):
@@ -2435,8 +2615,12 @@ async def u2_trolley_swap_cycle(floor,u2_idx,cartons_in_trolley):
     """When the U2 trolley holds 5 empty cartons, a pooled U2 AGV takes it to Khu 06 and brings a waiting trolley back."""
     st=U2_STATE[(floor,u2_idx)];trolley=st['active_trolley']
     def drop():
-        # Keep the empty cartons visibly stacked on the trolley while parked in Khu 06.
-        K06_TROLLEY_CARTONS[floor][trolley]=('u2',list(cartons_in_trolley))
+        # Keep top 2 empty cartons visibly stacked on the trolley in Khu 06; return extras immediately to FREE_Z05_CARTONS.
+        kept=list(cartons_in_trolley[-2:])
+        for extra_c in cartons_in_trolley[:-2]:
+            send({extra_c:(0.,0.,-5.,0.)},transmit=not args.fast)
+            FREE_Z05_CARTONS[floor].put_nowait(extra_c)
+        K06_TROLLEY_CARTONS[floor][trolley]=('u2',kept)
         loose_event('U2_TROLLEY_DELIVERED_TO_K06',floor=floor,u2_station=u2_idx,trolley=trolley)
     hp=u2_home(floor,u2_idx)
     tp=LG.u2_trolley_pose(floor,u2_idx)
@@ -2497,12 +2681,17 @@ async def u2_carton_trip(floor,u2_idx,carton,job):
             rack=st['active_rack']
             rack_idx=st['active_rack_idx']
             tray_slot=len(st['cartons'])
-            trolley_slot=len(st['trolley_cartons'])
+            trolley_slot=len(st['trolley_cartons'])%max(1,min(6,TROLLEY_CAP))
             rack_pose=LG.u2_rack_pose(floor,u2_idx)
             loose_event('U2_WORKER_OPEN_CARTON',job=job,carton=carton,floor=floor,u2_station=u2_idx,rack=rack)
             placed_meds=await u2_operator_cycle(floor,u2_idx,carton,rack_pose,rack_idx,trolley_slot,tray_slot)
             st['cartons'].append((carton,placed_meds))
             st['trolley_cartons'].append(carton)
+            st['trolley_total']=st.get('trolley_total',0)+1
+            while len(st['trolley_cartons'])>2:
+                recycled_c=st['trolley_cartons'].pop(0)
+                send({recycled_c:(0.,0.,-5.,0.)},transmit=not args.fast)
+                FREE_Z05_CARTONS[floor].put_nowait(recycled_c)
             loose_event('U2_CARTON_PLACED_ON_RACK',job=job,carton=carton,floor=floor,u2_station=u2_idx,rack=rack,slot=tray_slot,med_boxes=[m[0] for m in placed_meds])
             if len(st['cartons'])>=U2_PER_RACK:
                 store_cell=st['empty_cell']
@@ -2520,7 +2709,8 @@ async def u2_carton_trip(floor,u2_idx,carton,job):
                 st['empty_cell']=spare_cell
                 st['cartons']=[]
                 st['swaps']+=1
-            if len(st['trolley_cartons'])>=TROLLEY_CAP:
+            if st.get('trolley_total',0)>=TROLLEY_CAP:
+                st['trolley_total']=0
                 t_swap0=scheduler.time
                 await u2_trolley_swap_cycle(floor,u2_idx,list(st['trolley_cartons']))
                 t_swap1=scheduler.time
@@ -2534,6 +2724,8 @@ async def u2_carton_trip(floor,u2_idx,carton,job):
                 cond.notify_all()
 
 # ---------------------------------------------------------------- Khu P1 (14 Picking Stations: North 0..6 & West 7..13) <-> Kho 04 & Khu 06
+_P1_PACE_T={}
+
 async def _p1_operator_cycle(floor,st_idx,carton,rack_idx,tray_slot=0):
     """P1 picking worker at (floor, st_idx):
     1. Turns to the P1 Trolley (at st['mark']), picks 1 empty carton shell, and places it onto the working edge of the desk.
@@ -2554,6 +2746,16 @@ async def _p1_operator_cycle(floor,st_idx,carton,rack_idx,tray_slot=0):
     med_count=int(C.get('p1_med_boxes_per_carton',LG.U1_MED_PER_CARTON))
     med_offset=tray_slot*med_count
     med_names=[f'p1_med_{floor}_{st_idx}_{med_offset+m}' for m in range(med_count)]
+    if args.fast and getattr(args,'step_dt',None) and args.step_dt>=0.25:
+        total_dur=(med_count+2)*sum(U1_PHASES[:5])*pick_s
+        base_t=max(scheduler.time,_P1_PACE_T.get((floor,st_idx),scheduler.time))
+        tgt_t=base_t+total_dur
+        _P1_PACE_T[(floor,st_idx)]=tgt_t
+        await engine.until(tgt_t)
+        send({carton:aside_c_pose,**{m_name:LG.p1_med_in_carton(aside_c_pose,m) for m,m_name in enumerate(med_names)}},transmit=False)
+        loose_event('P1_PACKED_CARTON_COMPLETED',floor=floor,p1_station=st_idx,carton=carton)
+        st['aside_carton']=(carton,list(med_names))
+        return
     state={'x':sx,'y':sy,'yaw':syaw,'bend':0.,'arm':0.}
     async def phase(dur,x=None,y=None,yaw=None,bend=None,arm=None,carry_item=None,item_to=None,walk=False,pack_meds=False):
         a=dict(state);b={'x':a['x'] if x is None else x,'y':a['y'] if y is None else y,
@@ -3092,7 +3294,7 @@ async def z05_unpack_pallet(floor,zone,spot_xy,pallet_model,job,spot_idx=None,le
                 deck=f'z05_deck_{floor}_{zone}'
             else:
                 deck=pallet_model
-            cartons=[await FREE_Z05_CARTONS[floor].get() for _ in range(z05_per)]
+            cartons=_alloc_z05_cartons(floor,z05_per)
             stack=LG.z05_stack_positions(spot_xy,floor,z05_per)
             if deck!=pallet_model:
                 send({pallet_model:(spot_xy[0],spot_xy[1],-5,0),deck:(spot_xy[0],spot_xy[1],z0,0.),
@@ -3168,13 +3370,23 @@ async def z05_unpack_pallet(floor,zone,spot_xy,pallet_model,job,spot_idx=None,le
 OP_PHASES=(.05,.18,.04,.12,.05,.10,.04,.22,.04,.06,.04,.06)
 CARRY=(.1,1.0);PLACE=(.3,1.0);STEP=.6   # (bend, arm raise) when carrying / placing; step length (m)
 
+_OP_PACE_T={}
+
 async def _operator_cycle(i,op,spot,carton,stack_pos,dy=0.):
     """One carton: the operator walks to the pallet, bends, picks the carton, carries it back and puts it
     on the carton belt in front of the station. Timing scales to loose_unpack_s."""
     T=C['loose_unpack_s'];d=[f*T for f in OP_PHASES]
     sx,sy,syaw=LG.station(op);px,py,pyaw=LG.pallet_side(op,spot);py+=dy
     head_out=math.atan2(py-sy,px-sx);head_back=math.atan2(sy-py,sx-px)
-    belt=(op['x'],LG.Y758,LG.zc(1),syaw);reach=LG.reach_for(stack_pos[2])
+    belt=(op['x'],LG.Y758,LG.zc(1),syaw)
+    if args.fast and getattr(args,'step_dt',None) and args.step_dt>=0.25:
+        base_t=max(scheduler.time,_OP_PACE_T.get(i,scheduler.time))
+        tgt_t=base_t+float(T)
+        _OP_PACE_T[i]=tgt_t
+        await engine.until(tgt_t)
+        send({carton:belt},transmit=False)
+        return
+    reach=LG.reach_for(stack_pos[2])
     state={'x':sx,'y':sy,'yaw':syaw,'bend':0.,'arm':0.}
     async def phase(dur,x=None,y=None,yaw=None,bend=None,arm=None,carry=False,carton_to=None,walk=False):
         a=dict(state);b={'x':a['x'] if x is None else x,'y':a['y'] if y is None else y,
@@ -3249,7 +3461,8 @@ async def requests(total):
     request=0
     full_dispatched=0
     out_release_times=build_hourly_release_times(HOURLY_OUTBOUND_SCHEDULE) if (HOURLY_OUTBOUND_SCHEDULE and total is None) else None
-    req_limit=total if total is not None else (OUTBOUND_TARGET if OUTBOUND_TARGET>0 else (len(out_release_times) if out_release_times is not None else None))
+    _out_days=max(1,int(round(CYCLE_DURATION_S/DAY_DURATION_S))) if CYCLE_DURATION_S>0 else 1
+    req_limit=total if total is not None else (OUTBOUND_TARGET*_out_days if OUTBOUND_TARGET>0 else (len(out_release_times) if out_release_times is not None else None))
     z05_per=int(C.get('z05_cartons_per_pallet',LG.Z05_CARTONS_PER_PALLET))
     partial_enabled=(Z05_PARTIAL_EVERY>0 and 0<Z05_PARTIAL_CARTONS<z05_per)
     # Keep outbound pipeline fed up to outbound_prefill_limit without dumping 16 requests at t=0

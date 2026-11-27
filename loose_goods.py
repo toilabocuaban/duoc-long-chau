@@ -37,14 +37,16 @@ def zc(f, belt=FF.BELT_Z):
 def floors():
     return list(range(1, len(LEVELS) + 1))
 
-def stack_positions(spot, n):
-    """Carton centres on a pallet at spot (x, y, yaw), top layer first (unpack order)."""
+def stack_positions(spot, n, total_height=None):
+    """Carton centres on a pallet at spot (x, y, yaw), top layer first (unpack order).
+    When total_height is set (e.g. 1.70 m for odd pallets), distributes layers evenly up to total_height."""
     x, y, yaw = spot; c, s = math.cos(yaw), math.sin(yaw)
-    per = STACK[0] * STACK[1]; layers = math.ceil(n / per); out = []
+    per = STACK[0] * STACK[1]; layers = max(1, math.ceil(n / per)); out = []
+    dz = ((total_height - 0.15) / layers) if total_height and total_height > 0.15 else CARTON[2]
     for k in range(n):
         layer, i = divmod(k, per); a, b = divmod(i, STACK[1])
         lx, ly = (a - (STACK[0] - 1) / 2) * CARTON[0], (b - (STACK[1] - 1) / 2) * CARTON[1]
-        out.append((x + lx * c - ly * s, y + lx * s + ly * c, .15 + CARTON[2] * (layer + .5)))
+        out.append((x + lx * c - ly * s, y + lx * s + ly * c, .15 + dz * layer + CARTON[2] * .5))
     return list(reversed(out))   # last stacked (top) first
 
 def _spiral(sp):
@@ -240,7 +242,7 @@ def u1_agv_route(start_xyz, end_xyz, branch):
 
 # ---------------------------------------------------------------- Zone 05 (Unpack Pallet) -> U2 -> Kho 04
 Z05_WORKERS = sorted((w for w in FF.people() if w['area'] == 'unpack'), key=lambda w: -w['y'])
-Z05_CARTONS_PER_PALLET = 18
+Z05_CARTONS_PER_PALLET = 30
 U2_WORKERS = FF.U2_WORKERS
 U2_RACK_X = FF.U2_RACK_X
 U2_RACKS_Y = FF.U2_RACKS_Y

@@ -24,7 +24,12 @@ echo "[CÁCH 4] Cửa sổ Gazebo Sim đã mở riêng (chưa chạy controller.
 echo "  1. Hãy quan sát cửa sổ Gazebo Sim cho tới khi kho 3D hiện lên đầy đủ."
 echo "  2. Sau khi kho 3D đã hiện xong, NHẤN PHÍM ENTER tại đây để chạy mô phỏng!"
 echo "=========================================================================="
-read -r -p ">>> Nhấn ENTER khi kho 3D đã hiển thị để bắt đầu chạy controller.py: " _ </dev/tty || true
+if [[ -t 0 ]]; then
+    read -r -p ">>> Nhấn ENTER khi kho 3D đã hiển thị để bắt đầu chạy controller.py: " _ || true
+elif [[ -r /dev/tty ]]; then
+    read -r -p ">>> Nhấn ENTER khi kho 3D đã hiển thị để bắt đầu chạy controller.py: " _ </dev/tty || true
+fi
+echo ""
 echo "Đang khởi động controller.py..."
 python3 controller.py > >(tee controller.log) 2>&1 &
 ctl_pid=$!

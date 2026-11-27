@@ -78,10 +78,10 @@ def pallet(name, xyz):
     v=pallet_deck()
     for a in range(3):
         for b in range(2):
-            for c in range(3):
-                bx,by,bz=(a-1)*.39,(b-.5)*.49,.15+(c+.5)*1.25/3
-                v.append(box(f'box{a}{b}{c}',bx,by,bz,.38,.48,1.25/3-.012,CARTON))
-                v.append(box(f'tape{a}{b}{c}',bx,by,bz+1.25/6-.005,.055,.478,.004,'.9 .8 .57 1'))
+            for c in range(5):
+                bx,by,bz=(a-1)*.39,(b-.5)*.49,.15+(c+.5)*1.25/5
+                v.append(box(f'box{a}{b}{c}',bx,by,bz,.38,.48,1.25/5-.012,CARTON))
+                v.append(box(f'tape{a}{b}{c}',bx,by,bz+1.25/10-.005,.055,.478,.004,'.9 .8 .57 1'))
                 if b==0:
                     v.append(box(f'label{a}{c}',bx,by-.242,bz,.14,.004,.1,'.86 .86 .79 1'))
                     for q in range(6): v.append(box(f'barcode{a}{c}{q}',bx-.05+q*.018,by-.245,bz,.006,.003,.065,'.12 .12 .12 1'))

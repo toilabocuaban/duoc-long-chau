@@ -16,8 +16,8 @@ from cad_navigation import LAYOUT
 _C = json.loads((Path(__file__).resolve().parent / 'config.json').read_text())
 # Facing north (forks away from the lanes). An AGV waiting at its park column on the return lane must stay
 # clear of a loaded AGV turning east under the easternmost spot (load sweep up to x ~ -27.65): forks reach px - 2.4.
-PARKS = [(22.0, -4.5, 0, math.pi / 2), (36.6, -4.5, 0, math.pi / 2)]
-LOAD_Y = -8.4
+PARKS = [(12.8, -4.5, 0, math.pi / 2), (17.3, -4.5, 0, math.pi / 2)]
+LOAD_Y = -8.8
 RETURN_Y = -6.4
 TRANSIT_Y = LOAD_Y
 PALLET_CLEARANCE = .03   # CAD spot pitch 1.045 m for 1.0 m pallets: 22 mm per side; chassis keeps 120 mm

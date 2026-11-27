@@ -24,10 +24,10 @@ class LooseGoodsChecks(unittest.TestCase):
                 G.route(f, -8.5, b)   # every branch is upstream of every floor's loop end
 
     def test_stack_unpacks_top_layer_first(self):
-        pos = G.stack_positions((-10.7, -2.2, 0), 18)
-        self.assertEqual(len(pos), 18)
+        pos = G.stack_positions((-10.7, -2.2, 0), 30)
+        self.assertEqual(len(pos), 30)
         self.assertGreater(pos[0][2], pos[-1][2])
-        self.assertEqual(len({(round(p[0], 3), round(p[1], 3), round(p[2], 3)) for p in pos}), 18)
+        self.assertEqual(len({(round(p[0], 3), round(p[1], 3), round(p[2], 3)) for p in pos}), 30)
 
     def test_operator_reaches_pallet_and_carries_at_chest_height(self):
         self.assertEqual(len(G.OPERATORS), 2)
@@ -103,8 +103,8 @@ class LooseGoodsChecks(unittest.TestCase):
                     self.assertGreater(math.hypot(jacks[i][0] - jacks[j][0], jacks[i][1] - jacks[j][1]), 0.8)
             for z_idx in range(2):
                 spot_xy = (-1.705, 37.19 if z_idx == 0 else 30.27)
-                stack = G.z05_stack_positions(spot_xy, f, 18)
-                self.assertEqual(len(stack), 18)
+                stack = G.z05_stack_positions(spot_xy, f, 30)
+                self.assertEqual(len(stack), 30)
                 self.assertGreater(stack[0][2], stack[-1][2])
                 p0 = G.z05_pallet_side(spot_xy, 0)
                 p1 = G.z05_pallet_side(spot_xy, 1)
