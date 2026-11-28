@@ -31,7 +31,8 @@ elif [[ -r /dev/tty ]]; then
 fi
 echo ""
 echo "Đang khởi động controller.py..."
-python3 controller.py > >(tee controller.log) 2>&1 &
+# 10 days x 8 h shifts = 288000 s of simulated time (one shift = cycle_duration_s in config.json).
+python3 controller.py --duration 288000 > >(tee controller.log) 2>&1 &
 ctl_pid=$!
 # Closing the Gazebo window must also end this session's controller; otherwise it keeps running and
 # attaches to the next window opened on the same partition (two controllers driving one world).

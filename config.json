@@ -26,7 +26,7 @@
         1.0,
         1.4
     ],
-    "speed_multiplier": 40.0,
+    "speed_multiplier": 4.0,
     "sim_substep_s": 0.1,
     "agv_speed": 1.8,
     "lift_speed": 0.6,
@@ -47,7 +47,7 @@
         [8.07, -2.765, 0, 1.5707963268],
         [9.115, -2.765, 0, 1.5707963268]
     ],
-    "initial_outbound_pallets": 160,
+    "initial_outbound_pallets": 50,
     "agv_acceleration": 0.5,
     "agv_jerk": 1,
     "agv_angular_speed": 0.45,
@@ -106,13 +106,31 @@
             -4.7,
             -2.2,
             0
+        ],
+        [
+            -13.7,
+            -2.2,
+            0
+        ],
+        [
+            -15.2,
+            -2.2,
+            0
         ]
     ],
     "loose_pallet_interval_s": 12.0,
     "loose_pallets": 12,
     "loose_carton_pool": 480,
     "loose_cartons_per_pallet": 30,
-    "loose_unpack_s": 2.8,
+    "loose_unpack_s": 4.0,
+    "loose_unpack_s_range": [
+        3.0,
+        5.0
+    ],
+    "worker_walk_speed_range_mps": [
+        0.6,
+        0.8
+    ],
     "u1_cartons_per_rack": 8,
     "u1_med_boxes_per_carton": 1,
     "u1_open_carton_s": 1.2,
@@ -125,7 +143,7 @@
     "z05_partial_unpack_cartons": 20,
     "z05_carton_pool": 150,
     "z05_unpack_s": 0.9,
-    "z05_walk_speed": 2.8,
+    "z05_walk_speed": 0.7,
     "u2_cartons_per_rack": 8,
     "u2_med_boxes_per_carton": 1,
     "u2_open_carton_s": 0.6,
@@ -165,6 +183,20 @@
     "dock_pallet_scan_s": 10.0,
     "dock_sku_entry_s": 20.0,
     "dock_wrap_s": 30.0,
+    "dock_unload_carton_s": 3.75,
+    "dock_stack_carton_s": 3.75,
+    "dock_carton_s_range": [
+        5.0,
+        10.0
+    ],
+    "dock_max_cartons_per_pallet": 34,
+    "truck_mode": true,
+    "shift_end_full_charge": true,
+    "inbound_truck_interval_s": 420.0,
+    "dock_worker_pool": 7,
+    "odd_return_ratio": 0.3,
+    "odd_return_cartons_per_pallet": 30,
+    "odd_return_stack_carton_s": 5.0,
     "inbound_scan_s": 8.5,
     "inbound_scan_min_s": 7.0,
     "inbound_scan_max_s": 10.0,
@@ -173,11 +205,11 @@
     "inbound_cartons_per_truck": 200,
     "inbound_trucks_per_day": 60,
     "p1_pick_box_s": 12.0,
-    "dock_unload_s": 8.0,
-    "dock_worker_speed": 1.8,
+    "dock_unload_s": 7.5,
+    "dock_worker_speed": 0.7,
     "dock_flow_enabled": true,
     "truck_decorative_pallet_rows": 2,
-    "dock_pallet_speed": 1.6,
+    "dock_pallet_speed": 1.0,
     "dock_pick_s": 0.35,
     "dock_place_s": 0.35,
     "inbound_classification": "barcode",
@@ -208,8 +240,8 @@
         "min_weight_kg": 0.23,
         "max_weight_kg": 42.0
     },
-    "continuous_extra_pallets": 20,
-    "max_stored_inflight": 220,
+    "continuous_extra_pallets": 120,
+    "max_stored_inflight": 3400,
     "agv_initial_battery_pct": 100.0,
     "agv_drain_loaded_pct_per_m": 0.0075,
     "agv_drain_empty_pct_per_m": 0.003,

@@ -13,6 +13,7 @@ then along the lower sorting belt to a sorting branch (*U632) and up to the sort
 Every point is (x, y, z) of the carton centre in the world frame; geometry comes from
 four_floor_scene so the cartons ride exactly on the modelled belts and spirals.
 """
+import bisect
 import math
 import four_floor_scene as FF
 
@@ -516,42 +517,66 @@ def p1_k06_route(start_xyz, end_xyz, st_idx):
 def length(pts):
     return sum(math.dist(a, b) for a, b in zip(pts, pts[1:]))
 
+class PolyPath:
+    """A polyline with its segments precomputed once.
+
+    Cartons on belts/spirals are re-posed every engine sub-step; rebuilding every segment (spirals have hundreds)
+    on each call took ~66% of CPU in the 40x visual run. Build one PolyPath per trip and call .at(s).
+    """
+    __slots__ = ('pts', 'segs', 'ends', 'starts')
+
+    def __init__(self, pts):
+        self.pts = pts
+        self.segs = []
+        self.ends = []
+        self.starts = []
+        prev_th = 0.
+        total = 0.
+        for a, b in zip(pts, pts[1:]):
+            d = math.dist(a, b)
+            h = math.hypot(b[0] - a[0], b[1] - a[1])
+            th = math.atan2(b[1] - a[1], b[0] - a[0]) if h > 1e-6 else prev_th
+            prev_th = th
+            self.segs.append((a, b, d, th))
+            self.starts.append(total)
+            total += d
+            self.ends.append(total)
+
+    def at(self, s):
+        """Pose (x, y, z, yaw) at arc length s (yaw = horizontal heading with smooth corner blending)."""
+        segs = self.segs
+        if not segs:
+            return tuple(self.pts[-1]) + (0.,)
+        i = min(bisect.bisect_left(self.ends, s), len(segs) - 1)
+        return _seg_pose(segs, i, s - self.starts[i])
+
 def along(pts, s):
     """Pose (x, y, z, yaw) at arc length s along the polyline (yaw = horizontal heading with smooth corner blending)."""
-    segs = []
-    prev_th = 0.
-    for a, b in zip(pts, pts[1:]):
-        d = math.dist(a, b)
-        h = math.hypot(b[0] - a[0], b[1] - a[1])
-        th = math.atan2(b[1] - a[1], b[0] - a[0]) if h > 1e-6 else prev_th
-        prev_th = th
-        segs.append((a, b, d, th))
+    return PolyPath(pts).at(s)
 
-    cur_s = s
-    for i, (a, b, d, th) in enumerate(segs):
-        if cur_s <= d or i == len(segs) - 1:
-            t = 0. if d == 0 else min(1., max(0., cur_s / d))
-            pos = tuple(a[j] + (b[j] - a[j]) * t for j in range(3))
+def _seg_pose(segs, i, cur_s):
+    """Pose at distance cur_s into segment i, blending yaw over the 0.2 m either side of a corner."""
+    a, b, d, th = segs[i]
+    t = 0. if d == 0 else min(1., max(0., cur_s / d))
+    pos = tuple(a[j] + (b[j] - a[j]) * t for j in range(3))
 
-            yaw = th
-            if i < len(segs) - 1 and cur_s > d - 0.20:
-                next_th = segs[i + 1][3]
-                dth = math.atan2(math.sin(next_th - th), math.cos(next_th - th))
-                R = min(0.20, d / 2, segs[i + 1][2] / 2)
-                if R > 1e-4 and cur_s > d - R:
-                    v = (cur_s - d) / R
-                    u = (v + 1) / 2
-                    w = 3 * u * u - 2 * u * u * u
-                    yaw = th + dth * w
-            elif i > 0 and cur_s < 0.20:
-                prev_th = segs[i - 1][3]
-                dth = math.atan2(math.sin(th - prev_th), math.cos(th - prev_th))
-                R = min(0.20, segs[i - 1][2] / 2, d / 2)
-                if R > 1e-4 and cur_s < R:
-                    v = cur_s / R
-                    u = (v + 1) / 2
-                    w = 3 * u * u - 2 * u * u * u
-                    yaw = prev_th + dth * w
-            return pos + (yaw,)
-        cur_s -= d
-    return tuple(pts[-1]) + (0.,)
+    yaw = th
+    if i < len(segs) - 1 and cur_s > d - 0.20:
+        next_th = segs[i + 1][3]
+        dth = math.atan2(math.sin(next_th - th), math.cos(next_th - th))
+        R = min(0.20, d / 2, segs[i + 1][2] / 2)
+        if R > 1e-4 and cur_s > d - R:
+            v = (cur_s - d) / R
+            u = (v + 1) / 2
+            w = 3 * u * u - 2 * u * u * u
+            yaw = th + dth * w
+    elif i > 0 and cur_s < 0.20:
+        prev_th = segs[i - 1][3]
+        dth = math.atan2(math.sin(th - prev_th), math.cos(th - prev_th))
+        R = min(0.20, segs[i - 1][2] / 2, d / 2)
+        if R > 1e-4 and cur_s < R:
+            v = cur_s / R
+            u = (v + 1) / 2
+            w = 3 * u * u - 2 * u * u * u
+            yaw = prev_th + dth * w
+    return pos + (yaw,)

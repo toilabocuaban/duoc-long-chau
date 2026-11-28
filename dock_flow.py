@@ -1,6 +1,7 @@
 """Visible dock unloading, simulated barcode manifest, reusable 2-handlift / 2-worker pipelined transfer."""
 import asyncio
 import math
+import random
 import time
 from contextlib import asynccontextmanager
 from agv_motion import PARKS as AGV_PARKS
@@ -213,6 +214,8 @@ def scene(c,model,pallet_deck):
     ])
     scanner=merge_boxes('dock_scanner',[box('stand',0,0,.5,.06,.06,1,'.3 .3 .3 1'),box('reader',0,0,1.02,.22,.16,.12,'.05 .12 .12 1'),box('light',0,-.085,1.03,.14,.01,.04,'.1 1 .2 1')])
     n=max(1,int(c.get('loose_cartons_per_pallet',30)))
+    # Carton models per dock: a truck's 200 cartons are split over 6-7 pallets, so a pallet can hold up to ~34.
+    n_dock_cartons=max(n,int(c.get('dock_max_cartons_per_pallet',n)))
     even_h=float((c.get('pallet_size') or [1.2,1.0,1.4])[2])
     odd_h=float((c.get('odd_pallet_size') or [1.2,1.0,1.7])[2])
     loaded_even_mesh=_build_loaded_pallet_mesh('dock_loaded_even',pallet_deck,n,even_h,wrapped=True)
@@ -261,7 +264,7 @@ def scene(c,model,pallet_deck):
         model(f'dock_jack_b_{i}',(jbx,jby,0,-math.pi/2),jack)
         model(f'dock_loaded_even_{i}',stage(d)[:2]+(-5.0,0),loaded_even_mesh)
         model(f'dock_loaded_odd_{i}',stage(d)[:2]+(-5.0,0),loaded_odd_mesh)
-        for j in range(n):
+        for j in range(n_dock_cartons):
             model(f'dock_carton_{i}_{j}',(d['x'],d['rear_y']+.62,-5.0),carton)
         model(f'dock_scanner_{i}',(d['x']+.92,d['rear_y']+.45,0),scanner)
     if staging_boxes:
@@ -280,6 +283,78 @@ class DockFlow:
         self.has_worker_b=int(c.get('dock_workers_per_truck',2))>=2
         self.fast=fast
         self.ambient_task=None
+        self._rng=random.Random(20261128)
+        # Shared dock crew (truck_mode + dock_worker_pool): workers are not tied to a door. Every docked truck takes
+        # one worker as its primary (worker A model of that door); a worker without a truck joins a busy door as
+        # helper (worker B model, max 2 per truck = 2 handlifts per truck) to unload/stack and keep the dock
+        # working while the primary pulls a finished pallet to the buffer zone. Helpers leave at a pallet boundary
+        # as soon as a newly docked truck is waiting for a worker.
+        self.pool_size=int(c.get('dock_worker_pool',0) or 0)
+        self.pool_mode=bool(c.get('truck_mode')) and self.pool_size>0
+        self.pool_free=self.pool_size
+        self.primary_waiting=0
+        self.pool_cond=None
+        self.helper={i:False for i in range(len(self.docks))}
+        self.primary_on={i:not self.pool_mode for i in range(len(self.docks))}
+
+    def _hb(self,i):
+        """True when door i currently has a second worker (fixed crew, or a pool helper)."""
+        return self.helper.get(i,False) if self.pool_mode else self.has_worker_b
+
+    def _pc(self):
+        if self.pool_cond is None:self.pool_cond=asyncio.Condition()
+        return self.pool_cond
+
+    def _show_worker(self,wid,pose,visible):
+        x,y,yaw=pose
+        self.send(LG.operator_pose(wid,x,y,yaw,z0=0. if visible else -6.))
+
+    async def acquire_primary(self,i):
+        """A truck docked at door i waits for a free crew member to become its primary worker."""
+        if not self.pool_mode:return
+        async with self._pc():
+            self.primary_waiting+=1
+            try:
+                await self._pc().wait_for(lambda:self.pool_free>0)
+                self.pool_free-=1
+            finally:
+                self.primary_waiting-=1
+        self.primary_on[i]=True
+        self._show_worker(worker_id(i),self.states[i],True)
+        self.emit('DOCK_PRIMARY_START',dock=self.docks[i]['id'])
+
+    async def release_truck_crew(self,i):
+        """Truck at door i finished: its helper and primary go back to the shared crew."""
+        if not self.pool_mode:return
+        await self._release_helper(i)
+        if self.primary_on.get(i):
+            self.primary_on[i]=False
+            self._show_worker(worker_id(i),self.states[i],False)
+            self.emit('DOCK_PRIMARY_END',dock=self.docks[i]['id'])
+            async with self._pc():
+                self.pool_free+=1
+                self._pc().notify_all()
+
+    async def _release_helper(self,i):
+        if not (self.pool_mode and self.helper.get(i)):return
+        self.helper[i]=False
+        self._show_worker(worker_b_id(i),self.states_b[i],False)
+        self.emit('DOCK_HELPER_LEAVE',dock=self.docks[i]['id'])
+        async with self._pc():
+            self.pool_free+=1
+            self._pc().notify_all()
+
+    async def rebalance_helper(self,i):
+        """At each pallet start: leave if a docked truck waits for a worker, otherwise join if someone is free."""
+        if not self.pool_mode or not self.primary_on.get(i):return
+        if self.helper.get(i):
+            if self.primary_waiting>0:await self._release_helper(i)
+            return
+        if self.pool_free>0 and self.primary_waiting==0:
+            self.pool_free-=1
+            self.helper[i]=True
+            self._show_worker(worker_b_id(i),self.states_b[i],True)
+            self.emit('DOCK_HELPER_JOIN',dock=self.docks[i]['id'])
 
     def _reset_stage_deck(self,i,count=None,keep_preload=False):
         """Reset carrier models after delivery; preserve Worker B's ongoing preload if active."""
@@ -303,16 +378,19 @@ class DockFlow:
         self.send(updates)
 
     def initialize(self):
-        cnt=max(1,int(self.c.get('loose_cartons_per_pallet',30)))
+        cnt=max(1,int(self.c.get('loose_cartons_per_pallet',30)),int(self.c.get('dock_max_cartons_per_pallet',0)))
         for i,d in enumerate(self.docks):
             self.states[i]=(d['x']+.85,d['rear_y']+.75,math.pi)
             self.states_b[i]=(d['x']-.85,d['rear_y']+.75,0.0)
             self.wrapped[i]=False
             self.pipe[i]={'staged':False,'face_scanned':False,'next_j':0,'kind':None,'stop_b':False}
             self.send(LG.operator_pose(worker_id(i),*self.states[i]))
-            if self.has_worker_b:
+            if self._hb(i):
                 self.send(LG.operator_pose(worker_b_id(i),*self.states_b[i]))
             self._reset_stage_deck(i,cnt,keep_preload=False)
+            if self.pool_mode:   # shared crew: nobody stands at a door until a truck docks there
+                self._show_worker(worker_id(i),self.states[i],False)
+                self._show_worker(worker_b_id(i),self.states_b[i],False)
         if not self.fast and (self.ambient_task is None or self.ambient_task.done()):
             self.ambient_task=asyncio.create_task(self.ambient_loop())
 
@@ -331,10 +409,10 @@ class DockFlow:
                 changes = {}
                 for i, d in enumerate(self.docks):
                     bg = self.bg_tasks.get(i)
-                    if self.locks[i].locked() or (bg is not None and not bg.done()):
+                    if self.locks[i].locked() or (bg is not None and not bg.done()) or not self.primary_on.get(i,True):
                         continue
                     for wid, st_pose, p_shift in ((worker_id(i), self.states[i], 0.0), (worker_b_id(i), self.states_b.get(i, (d['x']-.85, d['rear_y']+.75, 0.0)), 2.5)):
-                        if wid == worker_b_id(i) and not self.has_worker_b:
+                        if wid == worker_b_id(i) and not self._hb(i):
                             continue
                         wx, wy, wyaw = st_pose
                         phi = (i * 2.3999632297 + p_shift) % (len(POSTURES) * CYCLE_DUR)
@@ -381,27 +459,57 @@ class DockFlow:
         if carton:result[carton]=LG.held_carton(x,y,yaw,.12,1.0)
         return result
 
+    def _walk_speed(self):
+        rng=self.c.get('worker_walk_speed_range_mps')
+        if isinstance(rng,(list,tuple)) and len(rng)>=2:
+            lo,hi=float(rng[0]),float(rng[1])
+            if 0.05<lo<=hi:
+                return self._rng.uniform(lo,hi)
+        return max(0.2,float(self.c.get('dock_worker_speed',0.7)))
+
+    def _pallet_speed(self):
+        return max(0.2,float(self.c.get('dock_pallet_speed',1.0)))
+
+    def _sample_pallet_carton_times(self,count,stage_s=20.0):
+        """Sample per-carton (unload + stack) total time in dock_carton_s_range (e.g. 5-10 s/carton)
+        such that filling a pallet (~30 cartons) takes 3.0 - 5.0 minutes (180 - 300 s)."""
+        n=max(1,int(count))
+        rng=self.c.get('dock_carton_s_range')
+        if isinstance(rng,(list,tuple)) and len(rng)>=2 and 0.5<=float(rng[0])<=float(rng[1]):
+            lo,hi=float(rng[0]),float(rng[1])
+            if lo<=6.5 and hi>=8.5:
+                pace_lo=min(hi,max(lo,(180.0-stage_s)/n+0.20))
+                pace_hi=max(pace_lo,min(hi,(300.0-stage_s)/n-0.20))
+                base=self._rng.uniform(pace_lo,pace_hi)
+                jitter=min(0.60,(hi-lo)*0.18)
+                return [min(hi,max(lo,base+self._rng.uniform(-jitter,jitter))) for _ in range(n)]
+            return [self._rng.uniform(lo,hi) for _ in range(n)]
+        fixed=self.step_s('dock_unload_carton_s',3.75)+self.step_s('dock_stack_carton_s',3.75)
+        return [fixed]*n
+
     async def worker(self,i,target,carton=None):
         a=self.states[i];b=target;dist=math.dist(a[:2],b[:2])
         def at(q):return self._walk_interp(worker_id(i),a,b,q,carton=carton)
-        await self.e.move(at(1),duration=max(.30,dist/self.c.get('dock_worker_speed',1.0)),transform=at,exact=True)
+        await self.e.move(at(1),duration=max(.30,dist/self._walk_speed()),transform=at,exact=True)
         self.states[i]=b
 
     async def worker_b(self,i,target,carton=None,dur_override=None):
         a=self.states_b[i];b=target;dist=math.dist(a[:2],b[:2])
-        dur=dur_override if dur_override is not None else max(.30,dist/self.c.get('dock_worker_speed',1.0))
+        walk_dur=max(.30,dist/self._walk_speed())
+        dur=max(dur_override,walk_dur) if dur_override is not None else walk_dur
         def at(q):return self._walk_interp(worker_b_id(i),a,b,q,carton=carton)
         await self.e.move(at(1),duration=dur,transform=at,exact=True)
         self.states_b[i]=b
 
     async def both_workers(self,i,target_a,target_b,carton_a=None,carton_b=None,dur_override=None):
-        if not self.has_worker_b:
+        if not self._hb(i):
             await self.worker(i,target_a,carton=carton_a)
             return
         aa=self.states[i];ba=target_a
         ab=self.states_b[i];bb=target_b
         dist=max(math.dist(aa[:2],ba[:2]),math.dist(ab[:2],bb[:2]))
-        dur=dur_override if dur_override is not None else max(.30,dist/self.c.get('dock_worker_speed',1.0))
+        walk_dur=max(.30,dist/self._walk_speed())
+        dur=max(dur_override,walk_dur) if dur_override is not None else walk_dur
         def at(q):
             out=self._walk_interp(worker_id(i),aa,ba,q,carton=carton_a)
             out.update(self._walk_interp(worker_b_id(i),ab,bb,q,carton=carton_b))
@@ -421,7 +529,7 @@ class DockFlow:
             if carton:
                 held=LG.held_carton(x,y,yaw,bend,arm)
                 out[carton]=(held[0],held[1]-.04,held[2]+.015,held[3])
-            if self.has_worker_b and not solo_a:
+            if self._hb(i) and not solo_a:
                 bb=(.16-.03*sway) if carton_b else -.025*sway
                 ba=(1.02-.03*sway) if carton_b else .08-.025*sway
                 out.update(LG.operator_pose(worker_b_id(i),xb,yb,yawb,bb,ba,-.035*sway))
@@ -430,6 +538,33 @@ class DockFlow:
                     out[carton_b]=(held_b[0],held_b[1]-.04,held_b[2]+.015,held_b[3])
             return out
         await self.e.move(at(1),duration=max(.1,duration),transform=at,exact=True)
+
+    async def idle_b(self,i,duration,carton=None):
+        """Keep Worker B alone visibly working (Worker A may be away pulling a pallet)."""
+        if not self._hb(i) or duration<=1e-6:return
+        x,y,yaw=self.states_b[i]
+        def at(q):
+            sway=math.sin(q*math.pi*4)
+            bend=(.16-.03*sway) if carton else -.025*sway
+            arm=(1.02-.03*sway) if carton else .08-.025*sway
+            out=LG.operator_pose(worker_b_id(i),x,y,yaw,bend,arm,-.035*sway)
+            if carton:
+                held=LG.held_carton(x,y,yaw,bend,arm)
+                out[carton]=(held[0],held[1]-.04,held[2]+.015,held[3])
+            return out
+        await self.e.move(at(1),duration=duration,transform=at,exact=True)
+
+    def step_s(self,key,default):
+        """Process time of a dock step from config.json (Excel 'Zone 03 Inbound Docking')."""
+        return max(0.0,float(self.c.get(key,default)))
+
+    async def pad_to(self,i,t0,total_s,carton=None,carton_b=None,only_b=False):
+        """Hold the step until total_s simulated seconds have passed since t0.
+        The 3D motions are short animations; this makes each step last its real process time."""
+        rem=total_s-(self.e_time()-t0)
+        if rem<=1e-6:return
+        if only_b:await self.idle_b(i,rem,carton=carton_b)
+        else:await self.idle(i,rem,carton=carton,carton_b=carton_b)
 
     def transfer_waypoints(self,i,target,returning=False):
         """Remain inside: cross AGV lanes at own dock X, then use the internal corridor (-5.35 outbound, -4.15 return)."""
@@ -492,13 +627,15 @@ class DockFlow:
                 out=LG.operator_pose(worker_b_id(i),jx,wy,-math.pi/2,.08,.65,sw)
                 out[jack_b]=(jx,jy,0.,-math.pi/2)
                 return out
-            await self.e.move(move_jack_b(1),duration=0.95,transform=move_jack_b,exact=True)
+            jb_dist=math.hypot(st[0]-jbx,st[1]-jby)
+            await self.e.move(move_jack_b(1),duration=max(0.95,jb_dist/self._walk_speed()),transform=move_jack_b,exact=True)
             self.states_b[i]=(st[0],st[1]+.92,-math.pi/2)
 
             # 2. Worker B walks to north side of the vertical blue pallet stack (zero clipping!) and carries a fresh empty pallet onto stage(d)
             pick_b=(psx,psy+.82,-math.pi/2)
+            t_st0=self.e_time();stage_s=self.step_s('dock_stage_pallet_s',20.0)
             await self.worker_b(i,pick_b)
-            self.emit('DOCK_STAGE_EMPTY_PALLET',dock=d['id'],classification=next_kind,batch=next_k,duration_s=20.0)
+            self.emit('DOCK_STAGE_EMPTY_PALLET',dock=d['id'],classification=next_kind,batch=next_k,duration_s=stage_s)
             def lift_b(q):
                 u=3*q*q-2*q*q*q
                 pz=0.62+0.18*u
@@ -516,15 +653,18 @@ class DockFlow:
                 out=LG.operator_pose(worker_b_id(i),wx,wy,wyaw,.14,.95,sw)
                 out[deck]=(px,py,0.80*(1.-0.85*max(0.,(q-.65)/.35)),0.0)
                 return out
-            await self.e.move(carry_b(1),duration=1.10,transform=carry_b,exact=True)
+            cb_dist=math.hypot(drop_b[0]-pick_b[0],drop_b[1]-pick_b[1])
+            await self.e.move(carry_b(1),duration=max(1.10,cb_dist/self._walk_speed()),transform=carry_b,exact=True)
             self.send({deck:(st[0],st[1],0.,0.)})
             self.poses[deck]=st[:2]+(0.,0.)
             self.states_b[i]=drop_b
+            await self.pad_to(i,t_st0,stage_s,only_b=True)
             pstate['staged']=True
             pstate['kind']=next_kind
 
             if next_kind=='even' and not pstate['stop_b']:
-                self.emit('DOCK_SCAN_PALLET_FACE',dock=d['id'],classification='even',batch=next_k,duration_s=10.0)
+                t_sc0=self.e_time();scan_s=self.step_s('dock_pallet_scan_s',10.0)
+                self.emit('DOCK_SCAN_PALLET_FACE',dock=d['id'],classification='even',batch=next_k,duration_s=scan_s)
                 scan_pt=(st[0]-.25,st[1]+.80,-math.pi/2)
                 await self.worker_b(i,scan_pt)
                 def sf_b(q):
@@ -532,11 +672,16 @@ class DockFlow:
                     return LG.operator_pose(worker_b_id(i),scan_pt[0]+.15*sw,scan_pt[1],scan_pt[2],.28,.92)
                 await self.e.move(sf_b(1),duration=0.9,transform=sf_b,exact=True)
                 self.states_b[i]=scan_pt
+                await self.pad_to(i,t_sc0,scan_s,only_b=True)
                 pstate['face_scanned']=True
 
             # 3. Continuously unload cartons from trailer & stack onto the new pallet while Worker A is away!
+            carton_times=self._sample_pallet_carton_times(count,stage_s=stage_s)
+            pstate['carton_times']=carton_times
             while pstate['next_j']<count and not pstate['stop_b']:
+                t_c0=self.e_time()
                 j=pstate['next_j']
+                tot_c_s=carton_times[j];unload_s=0.5*tot_c_s;stack_s=tot_c_s-unload_s
                 nb,pb,outb=local[j],src[j],dst[j]
                 self.send({nb:pb+(0,)})
                 pick_pos=(d['x']-.36,d['rear_y']+.26,-math.pi/2)
@@ -556,6 +701,7 @@ class DockFlow:
                     out_p[nb]=cb_p
                     return out_p
                 await self.e.move(pick_one(1),duration=max(.35,float(self.c.get('dock_pick_s',0.5))),transform=pick_one,exact=True)
+                await self.pad_to(i,t_c0,unload_s,carton_b=nb,only_b=True)
                 # Quick barcode pass (no frozen pause!) -> step outside pallet footprint and place immediately
                 pl_b=self._place_stand_pose(d,outb,-1)
                 await self.worker_b(i,pl_b,carton=nb)
@@ -569,6 +715,7 @@ class DockFlow:
                     out_p[nb]=(cs_b[0]+(ct_b[0]-cs_b[0])*u,cs_b[1]+(ct_b[1]-cs_b[1])*u,cs_b[2]+(ct_b[2]-cs_b[2])*u,0)
                     return out_p
                 await self.e.move(place_one(1),duration=max(.35,float(self.c.get('dock_place_s',0.5))),transform=place_one,exact=True)
+                await self.pad_to(i,t_c0,unload_s+stack_s,only_b=True)
                 pstate['next_j']=j+1
         except asyncio.CancelledError:
             raise
@@ -594,7 +741,7 @@ class DockFlow:
                 ctrl_pts=[start_xy,(start_xy[0],lane_y),(slot_pt[0],lane_y),(slot_pt[0],approach_y)]
                 samples=_smooth_curve_samples(ctrl_pts,radius=1.15,step=0.22)
                 total_len,eval_curve=_arc_table(samples)
-                speed=self.c.get('dock_worker_speed',1.0) if without_deck else self.c.get('dock_pallet_speed',.7)
+                speed=self._walk_speed() if without_deck else self._pallet_speed()
                 dur=max(.5,total_len/speed)
                 def at_pull(q):
                     px,py,yaw=eval_curve(q)
@@ -628,9 +775,10 @@ class DockFlow:
                     if not without_deck and carrier_model:out[carrier_model]=(a[0],a[1],.05,cur_dy)
                     out.update(LG.operator_pose(worker_id(i),wx,wy,wyaw,.05,.55,.18*math.sin(q*math.pi*2)))
                     return out
-                await self.e.move(align_push(1),duration=.55,transform=align_push,exact=True)
+                align_dist=math.hypot(0.85,w_prep[1]-w_start[1])
+                await self.e.move(align_push(1),duration=max(.55,align_dist/self._walk_speed()),transform=align_push,exact=True)
 
-                push_dur=max(.45,length/self.c.get('dock_pallet_speed',.7))
+                push_dur=max(.45,length/self._pallet_speed())
                 def at_push(q):
                     px=a[0]+(b[0]-a[0])*q;py=a[1]+(b[1]-a[1])*q
                     out={jack:(px,py,.05,slot_yaw)}
@@ -666,7 +814,7 @@ class DockFlow:
                     swing=.20*math.sin(q*math.pi*max(1,withdraw_len/.6))
                     out.update(LG.operator_pose(worker_id(i),last_jack[0],cur_wy,slot_yaw,.05,-.40,swing))
                     return out
-                await self.e.move(withdraw(1),duration=max(.4,withdraw_len/.9),transform=withdraw,exact=True)
+                await self.e.move(withdraw(1),duration=max(.4,withdraw_len/self._walk_speed()),transform=withdraw,exact=True)
                 self.poses[jack]=(last_jack[0],withdraw_y,0.,slot_yaw)
                 self.states[i]=(last_jack[0],withdraw_y-1.10,slot_yaw)
             else:
@@ -677,7 +825,7 @@ class DockFlow:
                 ctrl_pts=[start_xy,(start_xy[0],ret_y),(end_pt[0],ret_y),end_pt]
                 samples=_smooth_curve_samples(ctrl_pts,radius=1.05,step=0.22)
                 total_len,eval_curve=_arc_table(samples)
-                speed=self.c.get('dock_worker_speed',1.0)
+                speed=self._walk_speed()
                 dur=max(.5,total_len/speed)
                 def at_ret(q):
                     px,py,yaw=eval_curve(q)
@@ -699,7 +847,8 @@ class DockFlow:
         """Visible step: take an empty pallet off the vertical stack (north approach, zero clipping) and place at stage(d)."""
         st=stage(d);psx,psy=pallet_stack_xy(d);deck=f'dock_deck_{i}'
         self.wrapped[i]=False
-        self.emit('DOCK_STAGE_EMPTY_PALLET',dock=d['id'],classification=kind,batch=k,duration_s=20.0)
+        t0=self.e_time();step=self.step_s('dock_stage_pallet_s',20.0)
+        self.emit('DOCK_STAGE_EMPTY_PALLET',dock=d['id'],classification=kind,batch=k,duration_s=step)
         self.send({deck:(psx,psy,-5.,0.),f'dock_wrap_{i}':(st[0],st[1],-5.,0.),f'dock_roll_{i}':(st[0],st[1],-5.,0.)})
         pick_a=(psx+.32,psy+.84,-math.pi/2)
         pick_b=(psx-.32,psy+.84,-math.pi/2)
@@ -709,7 +858,7 @@ class DockFlow:
             bend=0.28*(1.0-0.5*u);arm=0.95
             pz=0.62+0.20*u
             out=LG.operator_pose(worker_id(i),*pick_a,bend,arm)
-            if self.has_worker_b:out.update(LG.operator_pose(worker_b_id(i),*pick_b,bend,arm))
+            if self._hb(i):out.update(LG.operator_pose(worker_b_id(i),*pick_b,bend,arm))
             out[deck]=(psx,psy,pz,0.0)
             return out
         await self.e.move(lift_pallet(1),duration=0.65,transform=lift_pallet,exact=True)
@@ -722,41 +871,46 @@ class DockFlow:
             wxb=pick_b[0]+(drop_b[0]-pick_b[0])*u;wyb=pick_b[1]+(drop_b[1]-pick_b[1])*u
             sw=.22*math.sin(q*math.pi*4)
             out=LG.operator_pose(worker_id(i),wxa,wya,-math.pi/2*(1.-u)+math.pi*u,.14,.95,sw)
-            if self.has_worker_b:out.update(LG.operator_pose(worker_b_id(i),wxb,wyb,-math.pi/2*(1.-u),.14,.95,-sw))
+            if self._hb(i):out.update(LG.operator_pose(worker_b_id(i),wxb,wyb,-math.pi/2*(1.-u),.14,.95,-sw))
             out[deck]=(px,py,0.82,0.0)
             return out
-        await self.e.move(carry_pallet(1),duration=1.10,transform=carry_pallet,exact=True)
+        cp_dist=max(math.hypot(drop_a[0]-pick_a[0],drop_a[1]-pick_a[1]),math.hypot(drop_b[0]-pick_b[0],drop_b[1]-pick_b[1]))
+        await self.e.move(carry_pallet(1),duration=max(1.10,cp_dist/self._walk_speed()),transform=carry_pallet,exact=True)
         self.states[i]=drop_a;self.states_b[i]=drop_b
         def lower_pallet(q):
             u=3*q*q-2*q*q*q
             pz=0.82*(1.0-u)
             bend=0.14+0.24*math.sin(q*math.pi);arm=0.95*(1.0-0.6*u)
             out=LG.operator_pose(worker_id(i),*drop_a,bend,arm)
-            if self.has_worker_b:out.update(LG.operator_pose(worker_b_id(i),*drop_b,bend,arm))
+            if self._hb(i):out.update(LG.operator_pose(worker_b_id(i),*drop_b,bend,arm))
             out[deck]=(st[0],st[1],pz,0.0)
             return out
         await self.e.move(lower_pallet(1),duration=0.55,transform=lower_pallet,exact=True)
         self.poses[deck]=st[:2]+(0.,0.)
+        await self.pad_to(i,t0,step)
 
     async def _scan_pallet_face(self,i,d,k):
         """Visible step (even pallets): scan the empty pallet ID barcode & register manifest."""
         st=stage(d)
-        self.emit('DOCK_SCAN_PALLET_FACE',dock=d['id'],classification='even',batch=k,duration_s=10.0)
+        t0=self.e_time();step=self.step_s('dock_pallet_scan_s',10.0)
+        self.emit('DOCK_SCAN_PALLET_FACE',dock=d['id'],classification='even',batch=k,duration_s=step)
         pos_a=(st[0]+.25,st[1]+.80,-math.pi/2)
         pos_b=(d['x']+.92,d['rear_y']+.80,-math.pi/2)
         await self.both_workers(i,pos_a,pos_b,dur_override=0.6)
         def scan_face_anim(q):
             sw=math.sin(q*math.pi*4)
             out=LG.operator_pose(worker_id(i),pos_a[0]+.18*sw,pos_a[1],pos_a[2],.32+.05*sw,.95+.06*sw)
-            if self.has_worker_b:
+            if self._hb(i):
                 out.update(LG.operator_pose(worker_b_id(i),pos_b[0],pos_b[1],pos_b[2],.14,.78+.08*math.cos(q*math.pi*6)))
             return out
         await self.e.move(scan_face_anim(1),duration=1.2,transform=scan_face_anim,exact=True)
+        await self.pad_to(i,t0,step)
 
     async def _scan_sku_and_input(self,i,d,k):
         """Visible step (even pallets): scan SKU barcodes on stacked cartons and input quantities on terminal."""
         st=stage(d)
-        self.emit('DOCK_SCAN_SKU_ENTRY',dock=d['id'],classification='even',batch=k,duration_s=20.0)
+        t0=self.e_time();step=self.step_s('dock_sku_entry_s',20.0)
+        self.emit('DOCK_SCAN_SKU_ENTRY',dock=d['id'],classification='even',batch=k,duration_s=step)
         scan_pts=[
             (st[0]-.82,st[1],0.0),
             (st[0],st[1]+.80,-math.pi/2),
@@ -768,18 +922,21 @@ class DockFlow:
             def sku_anim(q,pa=pt_a):
                 sw=math.sin(q*math.pi*4)
                 out=LG.operator_pose(worker_id(i),pa[0],pa[1],pa[2],.10+.05*sw,1.08+.12*sw)
-                if self.has_worker_b:
+                if self._hb(i):
                     out.update(LG.operator_pose(worker_b_id(i),term_b[0],term_b[1],term_b[2],.16,.80+.10*math.sin(q*math.pi*8)))
                 return out
             await self.e.move(sku_anim(1),duration=0.75,transform=sku_anim,exact=True)
+        await self.pad_to(i,t0,step)
 
     async def _wrap_even_pallet(self,i,d,k):
         """Visible step: Worker A carries a stretch-film roll around the full even pallet for 3 smooth laps while wrap rises."""
         st=stage(d);wrap=f'dock_wrap_{i}';roll=f'dock_roll_{i}'
-        self.emit('DOCK_WRAP_START',dock=d['id'],classification='even',batch=k,duration_s=30.0)
+        t0=self.e_time();step=self.step_s('dock_wrap_s',30.0)
+        self.emit('DOCK_WRAP_START',dock=d['id'],classification='even',batch=k,duration_s=step)
         start_a=(st[0]+.94,st[1],math.pi)
         hold_b=(st[0]-.86,st[1]+.35,-0.35)
         await self.both_workers(i,start_a,hold_b,dur_override=0.6)
+        orbit_s=max(4.2,step-(self.e_time()-t0))   # the wrapping laps fill the whole manual-wrap time
         laps=3
         rx,ry=0.94,0.84
         def wrap_orbit(q):
@@ -795,11 +952,11 @@ class DockFlow:
             out[roll]=(rx_h,ry_h,rz,inward)
             wz=-0.62+0.62*min(1.0,q*1.12)
             out[wrap]=(st[0],st[1],wz,0.0)
-            if self.has_worker_b:
+            if self._hb(i):
                 bsw=0.05*math.sin(q*math.pi*10)
                 out.update(LG.operator_pose(worker_b_id(i),hold_b[0],hold_b[1],hold_b[2],.12+bsw,.85-bsw,0.0))
             return out
-        await self.e.move(wrap_orbit(1),duration=4.2,transform=wrap_orbit,exact=True)
+        await self.e.move(wrap_orbit(1),duration=orbit_s,transform=wrap_orbit,exact=True)
         self.send({roll:(st[0],st[1],-5.,0.),wrap:(st[0],st[1],0.,0.)})
         self.wrapped[i]=True
         self.states[i]=(st[0]+.94,st[1],math.pi)
@@ -820,12 +977,17 @@ class DockFlow:
                 await bg
             except BaseException:
                 pass
+        # Shared crew, at a pallet boundary (helper's pre-staging finished): a free worker joins this truck,
+        # or the helper leaves because a newly docked truck is waiting for a worker.
+        await self.rebalance_helper(i)
         local=[f'dock_carton_{i}_{j}' for j in range(count)]
         odd_h=float((self.c.get('odd_pallet_size') or [1.2,1.0,1.7])[2])
         src=source_stack(d,count)
         dst=list(reversed(even_stack_positions(stage(d),count))) if kind!='odd' else list(reversed(LG.stack_positions(stage(d),count,total_height=odd_h)))
         self.emit('TRUCK_BATCH_READY',dock=d['id'],classification=kind,batch=k,cartons=count)
 
+        stage_s=self.step_s('dock_stage_pallet_s',20.0)
+        saved_times=pstate.get('carton_times')
         start_j=0
         if pstate.get('staged'):
             # Worker B already staged the new pallet & stacked 0..next_j-1 while Worker A was away!
@@ -843,94 +1005,98 @@ class DockFlow:
             if kind=='even':
                 await self._scan_pallet_face(i,d,k)
 
-        pstate.update({'staged':False,'face_scanned':False,'next_j':0,'kind':None,'stop_b':False})
+        carton_times=(saved_times if (start_j>0 and saved_times and len(saved_times)==count)
+                      else self._sample_pallet_carton_times(count,stage_s=stage_s))
+        pstate.update({'staged':False,'face_scanned':False,'next_j':0,'kind':None,'stop_b':False,'carton_times':None})
 
-        # Both Worker A and Worker B immediately stack the remaining cartons start_j..count-1 together without freezing!
-        step=2 if self.has_worker_b else 1
-        for j in range(start_j,count,step):
-            has_pair=self.has_worker_b and (j+1)<count
+        # Option A relay: 1 carton per 5-10s cycle (unload from trailer + stack onto pallet) so every ~30-carton
+        # pallet fills in 3.0 - 5.0 minutes. With 2 workers, Worker B unloads at the trailer rear & hands to Worker A
+        # who stacks onto the pallet; with 1 worker, Worker A performs both phases sequentially.
+        for j in range(start_j,count):
+            t_c0=self.e_time()
+            tot_c_s=carton_times[j];unload_s=0.5*tot_c_s;stack_s=tot_c_s-unload_s
             na,pa,outa=local[j],src[j],dst[j]
-            poses_init={na:pa+(0,)}
-            if has_pair:
-                nb,pb,outb=local[j+1],src[j+1],dst[j+1]
-                poses_init[nb]=pb+(0,)
-            else:
-                nb=pb=outb=None
-            self.send(poses_init)
-            # 1. Both workers step to right/left halves of the rear trailer opening
-            pick_pos_a=(d['x']+.38,d['rear_y']+.26,-math.pi/2)
-            pick_pos_b=(d['x']-.38,d['rear_y']+.26,-math.pi/2) if has_pair else self.states_b.get(i,(d['x']-.85,d['rear_y']+.75,0.0))
-            await self.both_workers(i,pick_pos_a,pick_pos_b)
-            self.emit('WORKER_PICK_FROM_TRUCK',dock=d['id'],carton=j,batch=k)
-            if has_pair:
-                self.emit('WORKER_PICK_FROM_TRUCK',dock=d['id'],carton=j+1,batch=k)
+            self.send({na:pa+(0,)})
             pick_dur=max(.30,float(self.c.get('dock_pick_s',0.45)))
+            place_dur=max(.30,float(self.c.get('dock_place_s',0.45)))
             p_ca=pa+(0,)
-            p_cb=pb+(0,) if has_pair else None
-            def pick_pair_anim(q,wxa=pick_pos_a[0],wya=pick_pos_a[1],wyawa=pick_pos_a[2],p_ca=p_ca,na=na,
-                               has_pair=has_pair,wxb=pick_pos_b[0],wyb=pick_pos_b[1],wyawb=pick_pos_b[2],p_cb=p_cb,nb=nb):
-                if q<0.40:
-                    u=q/0.40;w=3*u*u-2*u*u*u
-                    bend=0.22*w;arm=0.95*w
-                    ca_pose=p_ca;cb_pose=p_cb
-                else:
-                    u=(q-0.40)/0.60;w=3*u*u-2*u*u*u
-                    bend=0.22-0.07*w;arm=0.95
-                    ca_tgt=LG.held_carton(wxa,wya,wyawa,bend,arm)
-                    ca_pose=tuple(p_ca[m]+(ca_tgt[m]-p_ca[m])*w for m in range(4))
-                    if has_pair:
-                        cb_tgt=LG.held_carton(wxb,wyb,wyawb,bend,arm)
-                        cb_pose=tuple(p_cb[m]+(cb_tgt[m]-p_cb[m])*w for m in range(4))
+            has_relay=self._hb(i)
+            if has_relay:
+                pick_pos_b=(d['x']-.32,d['rear_y']+.26,-math.pi/2)
+                handoff_a=(d['x']+.38,d['rear_y']+.44,-2.35)
+                await self.both_workers(i,handoff_a,pick_pos_b)
+                self.emit('WORKER_PICK_FROM_TRUCK',dock=d['id'],carton=j,batch=k)
+                def pick_relay_anim(q,wxa=handoff_a[0],wya=handoff_a[1],wyawa=handoff_a[2],
+                                    wxb=pick_pos_b[0],wyb=pick_pos_b[1],wyawb=pick_pos_b[2],p_ca=p_ca,na=na):
+                    if q<0.45:
+                        u=q/0.45;w=3*u*u-2*u*u*u
+                        bb=0.24*w;ab=0.95*w;byaw=wyawb
+                        ca_pose=p_ca
                     else:
-                        cb_pose=None
-                out_p=LG.operator_pose(worker_id(i),wxa,wya,wyawa,bend,arm)
-                out_p[na]=ca_pose
-                if has_pair:
-                    out_p.update(LG.operator_pose(worker_b_id(i),wxb,wyb,wyawb,bend,arm))
-                    out_p[nb]=cb_pose
-                return out_p
-            await self.e.move(pick_pair_anim(1),duration=pick_dur,transform=pick_pair_anim,exact=True)
+                        u=(q-0.45)/0.55;w=3*u*u-2*u*u*u
+                        bb=0.24-0.10*w;ab=0.95
+                        byaw=wyawb+(0.95)*w
+                        cb_tgt=LG.held_carton(wxb,wyb,byaw,bb,ab)
+                        ca_pose=tuple(p_ca[m]+(cb_tgt[m]-p_ca[m])*w for m in range(4))
+                    out_p=LG.operator_pose(worker_id(i),wxa,wya,wyawa,.08,.75+.15*q)
+                    out_p.update(LG.operator_pose(worker_b_id(i),wxb,wyb,byaw,bb,ab))
+                    out_p[na]=ca_pose
+                    return out_p
+                await self.e.move(pick_relay_anim(1),duration=pick_dur,transform=pick_relay_anim,exact=True)
+                self.states_b[i]=(pick_pos_b[0],pick_pos_b[1],pick_pos_b[2]+0.95)
+                await self.pad_to(i,t_c0,unload_s,carton_b=na)
+            else:
+                pick_pos_a=(d['x']+.32,d['rear_y']+.26,-math.pi/2)
+                await self.worker(i,pick_pos_a)
+                self.emit('WORKER_PICK_FROM_TRUCK',dock=d['id'],carton=j,batch=k)
+                def pick_solo_anim(q,wxa=pick_pos_a[0],wya=pick_pos_a[1],wyawa=pick_pos_a[2],p_ca=p_ca,na=na):
+                    if q<0.40:
+                        u=q/0.40;w=3*u*u-2*u*u*u
+                        bend=0.22*w;arm=0.95*w;ca_pose=p_ca
+                    else:
+                        u=(q-0.40)/0.60;w=3*u*u-2*u*u*u
+                        bend=0.22-0.07*w;arm=0.95
+                        ca_tgt=LG.held_carton(wxa,wya,wyawa,bend,arm)
+                        ca_pose=tuple(p_ca[m]+(ca_tgt[m]-p_ca[m])*w for m in range(4))
+                    out_p=LG.operator_pose(worker_id(i),wxa,wya,wyawa,bend,arm)
+                    out_p[na]=ca_pose
+                    return out_p
+                await self.e.move(pick_solo_anim(1),duration=pick_dur,transform=pick_solo_anim,exact=True)
+                await self.pad_to(i,t_c0,unload_s,carton=na)
 
             if emit_classified:
-                n_done=2 if has_pair else 1
-                self.stats['scanned_'+kind]+=n_done
+                self.stats['scanned_'+kind]+=1
                 self.emit('BARCODE_CLASSIFIED',barcode=f'{kind.upper()}-{k:04d}-{j:03d}',classification=kind,dock=d['id'])
-                if has_pair:
-                    self.emit('BARCODE_CLASSIFIED',barcode=f'{kind.upper()}-{k:04d}-{j+1:03d}',classification=kind,dock=d['id'])
 
-            # 2. Walk directly outside the pallet's right/left edges and place immediately (fluid continuous motion!)
             pl_a=self._place_stand_pose(d,outa,+1)
-            pl_b=self._place_stand_pose(d,outb,-1) if has_pair else pick_pos_b
-            await self.both_workers(i,pl_a,pl_b,carton_a=na,carton_b=nb)
+            ready_b=(d['x']-.36,d['rear_y']+.30,-math.pi/2)
+            if has_relay:
+                await self.both_workers(i,pl_a,ready_b,carton_a=na)
+            else:
+                await self.worker(i,pl_a,carton=na)
             benda,arma=LG.reach_for(outa[2])
-            bendb,armb=LG.reach_for(outb[2]) if has_pair else (0.0,0.0)
-            place_dur=max(.30,float(self.c.get('dock_place_s',0.45)))
             cs_a=LG.held_carton(*self.states[i],.12,1.0)
             ct_a=outa+(0,)
-            cs_b=LG.held_carton(*self.states_b[i],.12,1.0) if has_pair else None
-            ct_b=(outb+(0,)) if has_pair else None
-            def place_pair_anim(q,benda=benda,arma=arma,cs_a=cs_a,ct_a=ct_a,na=na,
-                                has_pair=has_pair,bendb=bendb,armb=armb,cs_b=cs_b,ct_b=ct_b,nb=nb):
+            def place_one_anim(q,benda=benda,arma=arma,cs_a=cs_a,ct_a=ct_a,na=na,has_relay=has_relay):
                 u=3*q*q-2*q*q*q
                 ba=.12+(benda-.12)*u;aa=1.0+(arma-1.0)*u
                 out_p=LG.operator_pose(worker_id(i),*self.states[i],ba,aa)
                 out_p[na]=(cs_a[0]+(ct_a[0]-cs_a[0])*u,cs_a[1]+(ct_a[1]-cs_a[1])*u,cs_a[2]+(ct_a[2]-cs_a[2])*u,0)
-                if has_pair:
-                    bb=.12+(bendb-.12)*u;ab=1.0+(armb-1.0)*u
-                    out_p.update(LG.operator_pose(worker_b_id(i),*self.states_b[i],bb,ab))
-                    out_p[nb]=(cs_b[0]+(ct_b[0]-cs_b[0])*u,cs_b[1]+(ct_b[1]-cs_b[1])*u,cs_b[2]+(ct_b[2]-cs_b[2])*u,0)
+                if has_relay:
+                    out_p.update(LG.operator_pose(worker_b_id(i),*self.states_b[i],.06,.45))
                 return out_p
-            await self.e.move(place_pair_anim(1),duration=place_dur,transform=place_pair_anim,exact=True)
-            def straighten_pair(q,benda=benda,arma=arma,has_pair=has_pair,bendb=bendb,armb=armb):
+            await self.e.move(place_one_anim(1),duration=place_dur,transform=place_one_anim,exact=True)
+            def straighten_one(q,benda=benda,arma=arma,has_relay=has_relay):
                 u=3*q*q-2*q*q*q
                 out_p=LG.operator_pose(worker_id(i),*self.states[i],benda*(1-u),arma*(1-u))
-                if has_pair:
-                    out_p.update(LG.operator_pose(worker_b_id(i),*self.states_b[i],bendb*(1-u),armb*(1-u)))
+                if has_relay:
+                    out_p.update(LG.operator_pose(worker_b_id(i),*self.states_b[i],.04,.35))
                 return out_p
-            await self.e.move(straighten_pair(1),duration=0.22,transform=straighten_pair,exact=True)
+            await self.e.move(straighten_one(1),duration=0.22,transform=straighten_one,exact=True)
+            await self.pad_to(i,t_c0,unload_s+stack_s)
         return local
 
-    async def _deliver_staged_pallet(self,i,d,kind,k,target,local,consume,acquire_target=None,staged_cartons=0,next_kind=None):
+    async def _deliver_staged_pallet(self,i,d,kind,k,target,local,consume,acquire_target=None,staged_cartons=0,next_kind=None,next_count=None):
         if kind=='even':
             await self._scan_sku_and_input(i,d,k)
             await self._wrap_even_pallet(i,d,k)
@@ -960,10 +1126,10 @@ class DockFlow:
             })
 
         def _start_worker_b():
-            if self.has_worker_b and next_kind is not None:
+            if self._hb(i) and next_kind is not None:
                 pstate=self.pipe.setdefault(i,{})
                 pstate.update({'staged':False,'face_scanned':False,'next_j':0,'kind':next_kind,'stop_b':False})
-                self.bg_tasks[i]=asyncio.create_task(self._worker_b_solo_preload(i,d,k+1,next_kind,len(local)))
+                self.bg_tasks[i]=asyncio.create_task(self._worker_b_solo_preload(i,d,k+1,next_kind,next_count or len(local)))
 
         try:
             if acquire_target is not None:
@@ -999,12 +1165,15 @@ class DockFlow:
             local=await self._unload_at_dock(i,d,kind,k,len(names),emit_classified=True)
             await self._deliver_staged_pallet(i,d,kind,k,target,local,consume,acquire_target=acquire_target,next_kind=None)
 
-    async def prestage_and_deliver(self,i,k,count,claim_slot_fn,desired_kind='odd',next_desired_kind='odd'):
+    async def prestage_and_deliver(self,i,k,count,claim_slot_fn,desired_kind='odd',next_desired_kind='odd',next_count=None,on_unloaded=None):
         """Pipelined 2-worker dock cycle: Worker A & B finish current pallet together, then while Worker A delivers
-        to the buffer zone, Worker B immediately pulls a fresh pallet onto stage(d) and stacks the next batch!"""
+        to the buffer zone, Worker B immediately pulls a fresh pallet onto stage(d) and stacks the next batch!
+        next_desired_kind=None: no next pallet on this truck, so Worker B does not pre-stage one.
+        on_unloaded(): called once every carton of this pallet is off the truck and stacked."""
         d=self.docks[i]
         async with self.locks[i]:
             local=await self._unload_at_dock(i,d,desired_kind,k,count,emit_classified=False)
+            if on_unloaded is not None:on_unloaded()
             t_sw0=self.e_time()
             claimed=await claim_slot_fn(i,d['id'],k,count)
             t_sw1=self.e_time()
@@ -1017,7 +1186,7 @@ class DockFlow:
             self.stats['scanned_'+kind]+=count
             for j in range(count):
                 self.emit('BARCODE_CLASSIFIED',barcode=f'{kind.upper()}-{k:04d}-{j:03d}',classification=kind,dock=d['id'])
-            await self._deliver_staged_pallet(i,d,kind,k,target,local,consume,acquire_target=acquire_target,staged_cartons=count,next_kind=next_desired_kind)
+            await self._deliver_staged_pallet(i,d,kind,k,target,local,consume,acquire_target=acquire_target,staged_cartons=count,next_kind=next_desired_kind,next_count=next_count)
 
     def stop_all_bg(self):
         for pstate in self.pipe.values():

@@ -146,7 +146,7 @@ class ReportExporterTests(unittest.TestCase):
             wb = load_workbook(latest)
             self.assertEqual(
                 wb.sheetnames,
-                ["Tong_Quan", "Kho_ASRS_Shuttle", "Khu_Unpack_AGV", "Khu_Vuc_Dock", "Cong_Nhan_Unpack", "Chi_Tiet_Nhiem_Vu_AGV_Kho"],
+                ["Bao_Cao_Theo_Ngay", "Ghi_Chu_Kich_Ban", "Tong_Quan", "Kho_ASRS_Shuttle", "Khu_Unpack_AGV", "Khu_Vuc_Dock", "Cong_Nhan_Unpack", "Chi_Tiet_Nhiem_Vu_AGV_Kho"],
             )
             ws_sh = wb["Kho_ASRS_Shuttle"]
             self.assertEqual(len(ws_sh._charts), 3)
@@ -206,7 +206,7 @@ class ReportExporterTests(unittest.TestCase):
             p2 = export_excel(tracker, tmp)
             self.assertEqual(p1["timestamped"], p2["timestamped"])
             wb = load_workbook(p2["latest"])
-            self.assertEqual(len(wb.sheetnames), 6)
+            self.assertEqual(len(wb.sheetnames), 8)   # + Bao_Cao_Theo_Ngay, Ghi_Chu_Kich_Ban (Xe_Tai_Dock only with trucks)
 
     def test_staged_prestage_and_pallet_ready_metrics(self):
         tracker = SimulationTracker(self.config, total_jobs=0, continuous_mode=True)
@@ -466,9 +466,8 @@ class ReportExporterTests(unittest.TestCase):
             self.config["warehouse_outbound_target"],
         )
         self.assertGreater(self.config["max_stored_inflight"], self.config["initial_outbound_pallets"])
-        from cad_navigation import LAYOUT
-        n_js = len(LAYOUT.job_slots)
-        cells = {((i + 4) % 9, LAYOUT.job_slots[(i // 9) % n_js]) for i in range(self.config["initial_outbound_pallets"])}
+        from cad_navigation import initial_stock_cell
+        cells = {initial_stock_cell(i) for i in range(self.config["initial_outbound_pallets"])}
         self.assertEqual(len(cells), self.config["initial_outbound_pallets"])
 
     def test_all_remaining_sheets_match_asrs_dashboard_style(self):
@@ -701,12 +700,12 @@ class ReportExporterTests(unittest.TestCase):
             wb = load_workbook(export_excel(tracker, tmp)["latest"])
             ov_text = "\n".join(str(c.value) for r in wb["Tong_Quan"].iter_rows(values_only=False) for c in r if c.value is not None)
             self.assertIn("2 unpack hết", ov_text)
-            self.assertIn("1 hoàn kho", ov_text)
+            self.assertIn("1 xuất tạm", ov_text)
 
             ws_sh = wb["Kho_ASRS_Shuttle"]
             sh_text = "\n".join(str(c.value) for r in ws_sh.iter_rows(values_only=False) for c in r if c.value is not None)
             self.assertIn("Hoàn kho (Hàng dư Z05)", sh_text)
-            self.assertIn("2 unpack hết & 1 hoàn kho", sh_text)
+            self.assertIn("2 unpack hết & 1 xuất tạm", sh_text)
             sh_sec1_vals = {
                 ws_sh.cell(r, 2).value: ws_sh.cell(r, 3).value
                 for r in range(1, ws_sh.max_row + 1)
@@ -720,7 +719,7 @@ class ReportExporterTests(unittest.TestCase):
             self.assertIn("Đội P1-Tây-1", agv_text)
             wrk_text = "\n".join(str(c.value) for r in wb["Cong_Nhan_Unpack"].iter_rows(values_only=False) for c in r if c.value is not None)
             self.assertIn("Kéo pallet từ Thang Xuất về Z05", wrk_text)
-            self.assertIn("2 unpack hết & 1 hoàn kho", wrk_text)
+            self.assertIn("2 unpack hết & 1 xuất tạm", wrk_text)
             self.assertNotIn("F4", wrk_text)
 
     def test_agv_and_forklift_duty_and_charge_specs(self):

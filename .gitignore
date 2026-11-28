@@ -17,3 +17,5 @@ previews/truck-review/review.sdf
 previews/truck-review/detail/
 previews/truck-review/layout/
 reports/
+.venv/
+**/.venv/

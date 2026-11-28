@@ -96,6 +96,16 @@ class DesignLayout:
 
 LAYOUT=DesignLayout()
 
+# Initial stock cells: the 18 job slots first (as before), then every other shuttle-reachable (front-access)
+# slot. 9 levels per slot, one pallet per (slot, level), so up to (front slots - 2 parking) x 9 pallets.
+INITIAL_STOCK_SLOTS=LAYOUT.job_slots+[s for s in LAYOUT.front_slots if s not in LAYOUT.reserved]
+
+def initial_stock_cell(i):
+    """(slot_id, level 0..8) of initial pallet i."""
+    if i>=len(INITIAL_STOCK_SLOTS)*9:
+        raise ValueError(f'initial_outbound_pallets exceeds the {len(INITIAL_STOCK_SLOTS)*9} reachable cells')
+    return INITIAL_STOCK_SLOTS[i//9],(i+4)%9
+
 if __name__=='__main__':
     print('Slots:',len(LAYOUT.slots),'Front-access slots:',len(LAYOUT.front_slots),'Graph nodes:',len(LAYOUT.graph),'Edges:',len(LAYOUT.edges))
     for j,sid in enumerate(LAYOUT.job_slots):

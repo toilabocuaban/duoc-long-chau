@@ -1,5 +1,5 @@
 param(
-    [ValidateSet('Run','Inspect','View','Test','FourFloor')][string]$Mode='Run',
+    [ValidateSet('Run','Inspect','View','Test','FourFloor','Fast10')][string]$Mode='Run',
     [string]$View='rack',
     [switch]$SoftwareRendering
 )
@@ -11,7 +11,7 @@ try {
     & wsl.exe -d $distro -u gazebo -- test -d $linuxRoot
     if ($LASTEXITCODE -ne 0) { throw 'Run 01-Setup-Windows.cmd first.' }
 
-    $focusJob = if ($Mode -ne 'Test') {
+    $focusJob = if ($Mode -notin @('Test','Fast10')) {
         Start-Job -ScriptBlock {
             Add-Type -TypeDefinition @"
             using System;
@@ -94,6 +94,8 @@ try {
             & wsl.exe -d $distro -u gazebo -- env "GZ_PARTITION=$partition" python3 "$linuxRoot/view.py" $View
         } elseif ($Mode -eq 'Test') {
             & wsl.exe -d $distro -u gazebo -- bash "$linuxRoot/test.sh"
+        } elseif ($Mode -eq 'Fast10') {
+            & wsl.exe -d $distro -u gazebo -- bash "$linuxRoot/run-fast-10days.sh"
         } else {
             $script=if ($Mode -eq 'Inspect') {'inspect-equipment.sh'} elseif ($Mode -eq 'FourFloor') {'four-floor.sh'} else {'run.sh'}
             $software=if ($SoftwareRendering) {'1'} else {'0'}

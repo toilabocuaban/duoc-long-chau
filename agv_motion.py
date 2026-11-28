@@ -63,7 +63,8 @@ def overlaps(a,b,clearance=.12):
         if abs((b[0]-a[0])*ux+(b[1]-a[1])*uy)>=ra+rb: return False
     return True
 
-def check_pose(i,base,poses,payload=None,pickup=None):
+def check_pose(i,base,poses,payload=None,pickup=None,pallet_names=None):
+    # pallet_names: optional precomputed pallet keys of `poses`, so the hot loop skips scanning every model.
     body=rect(base,.83,.65)
     moving=[body]
     if payload: moving.append(rect(assembly(i,base,.2,payload)[payload],.6,.5))
@@ -75,9 +76,13 @@ def check_pose(i,base,poses,payload=None,pickup=None):
             for a in moving:
                 if any(overlaps(a,b,.25) for b in peer_parts):
                     raise RuntimeError(f'Unsafe route: AGV {i+1} intersects parked AGV {peer+1}')
-    for name,p in poses.items():
+    if pallet_names is None:pallet_names=[n for n in poses if n.startswith('pallet_')]
+    for name in pallet_names:
+        p=poses[name]
         # Only floor-level pallets are obstacles: skip racked (z>1) and hidden, not-yet-arrived loads (z<-1).
-        if not name.startswith('pallet_') or name==payload or abs(p[2])>1.0: continue
+        if name==payload or abs(p[2])>1.0: continue
+        # Forks and load reach under 3 m from the AGV centre: skip far pallets (thousands of floor-level stock).
+        if abs(p[0]-base[0])>6.0 or abs(p[1]-base[1])>6.0: continue
         obstacle=rect(p,.6,.5)
         # The chassis is never permitted to enter even the intended pickup load.
         if overlaps(body,obstacle): raise RuntimeError(f'AGV {i+1} chassis intersects {name}')

@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import copy
 import os
+import shutil
 from datetime import datetime
 import math
 from pathlib import Path
@@ -352,6 +353,18 @@ class SimulationTracker:
             did: self._blank_dock(did) for did in self.dock_order
         }
         self.dock_events: list[dict[str, Any]] = []
+        # truck_mode: one record per inbound truck (arrival -> docked -> released) and odd pallet types.
+        self.trucks: dict[int, dict[str, Any]] = {}
+        self.odd_types: dict[str, dict[str, int]] = {"gt10": {"pallets": 0, "cartons": 0}, "lt10": {"pallets": 0, "cartons": 0}}
+        # Per-day counters for the "Bao_Cao_Theo_Ngay" sheet (day = simulated time // cycle_duration_s).
+        self.day_s: float = max(1.0, float(config.get("cycle_duration_s", 28800.0) or 28800.0))
+        self.daily: dict[int, dict[str, Any]] = {}
+        self.occ_steps: list[tuple[float, int]] = []   # (+1 stored / -1 taken out) for warehouse occupancy
+        # Shared dock crew: time each helper spends assisting another door (join -> leave).
+        self.helper_spans: list[tuple[float, float]] = []
+        self._helper_open: dict[int, float] = {}
+        self._barcode_pending: dict[int, int] = {}
+        self._odd_return_info: dict[int, tuple[int, int]] = {}   # odd-return job -> (floor, cartons)
         self._dock_batch_t0: dict[tuple[int, str, Any], float] = {}
         self._dock_batch_wait: dict[tuple[int, Any], float] = {}
         self._dock_batch_wait_spans: dict[tuple[int, Any], list[tuple[float, float]]] = {}
@@ -763,6 +776,33 @@ class SimulationTracker:
         sh["battery_remaining_pct"] = self.init_battery_pct
         sh["status"] = "Hoạt động bình thường"
 
+    def shift_end_recharge(self, t: float) -> None:
+        """End of shift: every shuttle and AGV goes to its charger overnight and starts the next shift at 100%.
+        The night is outside the simulated 8 h shifts, so this charge takes no shift time; an interrupted
+        daytime charge is closed at t and its time so far is kept in charge_s."""
+        t = float(t)
+        for sh in self.shuttles.values():
+            if sh.get("charging_active") and sh.get("_charge_start_s") is not None:
+                sh["charge_s"] = sh.get("charge_s", 0.0) + max(0.0, t - float(sh["_charge_start_s"]))
+            sh["_charge_start_s"] = None
+            sh["charging_active"] = False
+            sh["night_charges"] = sh.get("night_charges", 0) + 1
+            sh["_last_chg_dist_m"] = sh["distance_m"]
+            sh["_last_chg_idle_s"] = max(0.0, t - sh["busy_s"])
+            sh["battery_remaining_pct"] = self.init_battery_pct
+            sh["status"] = "Hoạt động bình thường"
+        for agv in self.agvs.values():
+            if agv.get("charging_active") and agv.get("_charge_start_s") is not None:
+                agv["charge_s"] = agv.get("charge_s", 0.0) + max(0.0, t - float(agv["_charge_start_s"]))
+            agv["_charge_start_s"] = None
+            agv["charging_active"] = False
+            agv["night_charges"] = agv.get("night_charges", 0) + 1
+            agv["_last_chg_loaded_m"] = agv["loaded_distance_m"]
+            agv["_last_chg_empty_m"] = agv["empty_distance_m"]
+            agv["_last_chg_idle_s"] = max(0.0, t - agv["busy_s"])
+            agv["battery_remaining_pct"] = self.init_battery_pct
+            agv["status"] = "Sẵn sàng (Đã sạc đầy cuối ca)"
+
     def get_shuttle_battery_pct(self, shuttle_id: str, t_now: float) -> float:
         if shuttle_id not in self.shuttles:
             return self.init_battery_pct
@@ -773,7 +813,8 @@ class SimulationTracker:
         since_d = max(0.0, float(sh["distance_m"]) - float(sh.get("_last_chg_dist_m", 0.0)))
         since_id = max(0.0, idle_s - float(sh.get("_last_chg_idle_s", 0.0)))
         used = since_d * self.shuttle_drain_per_m + since_id * self.shuttle_drain_idle_per_s
-        base_pct = self.init_battery_pct if sh.get("charge_completed_count", 0) > 0 else float(sh.get("init_battery_pct", self.init_battery_pct))
+        charged = sh.get("charge_completed_count", 0) > 0 or sh.get("night_charges", 0) > 0
+        base_pct = self.init_battery_pct if charged else float(sh.get("init_battery_pct", self.init_battery_pct))
         return round(max(0.0, base_pct - used), 2)
 
     def get_agv_battery_pct(self, agv_id: str, t_now: float) -> float:
@@ -791,7 +832,8 @@ class SimulationTracker:
             + since_em * self.drain_empty_per_m
             + since_id * self.drain_idle_per_s
         )
-        base_pct = self.init_battery_pct if agv.get("charge_completed_count", 0) > 0 else float(agv.get("init_battery_pct", self.init_battery_pct))
+        charged = agv.get("charge_completed_count", 0) > 0 or agv.get("night_charges", 0) > 0
+        base_pct = self.init_battery_pct if charged else float(agv.get("init_battery_pct", self.init_battery_pct))
         return round(max(0.0, base_pct - used), 2)
 
     def start_agv_charge(self, agv_id: str, t_start: float, t_until: float, is_forklift: bool = False) -> None:
@@ -932,11 +974,263 @@ class SimulationTracker:
         if w is not None:
             _append_span(w["wait_spans"], t_start, t_end)
 
+    def record_truck_arrival(self, truck: dict[str, Any], t: float) -> None:
+        pallets = truck.get("pallets") or []
+        self.trucks[int(truck["truck_id"])] = {
+            "truck_id": int(truck["truck_id"]),
+            "day": int(truck.get("day", 0)) + 1,
+            "planned_s": float(truck.get("arrival_s", t)),
+            "arrival_s": float(t),
+            "docked_s": None,
+            "released_s": None,
+            "dock": None,
+            "cartons": int(truck.get("cartons", 0)),
+            "even_pallets": sum(1 for p in pallets if p.get("kind") == "even"),
+            "odd_gt10_pallets": sum(1 for p in pallets if p.get("odd_type") == "gt10"),
+            "odd_lt10_pallets": sum(1 for p in pallets if p.get("odd_type") == "lt10"),
+        }
+
+    def record_truck_docked(self, truck_id: int, dock_id: int, t: float) -> None:
+        rec = self.trucks.get(int(truck_id))
+        if rec is not None:
+            rec["dock"] = dock_id
+            rec["docked_s"] = float(t)
+
+    def record_truck_departure(self, truck_id: int, t: float) -> None:
+        rec = self.trucks.get(int(truck_id))
+        if rec is not None:
+            rec["released_s"] = float(t)
+
+    def record_odd_pallet(self, odd_type: str, cartons: int) -> None:
+        bucket = self.odd_types.setdefault(str(odd_type), {"pallets": 0, "cartons": 0})
+        bucket["pallets"] += 1
+        bucket["cartons"] += int(cartons)
+
+    def truck_summary(self) -> dict[str, Any]:
+        """Truck KPIs: wait for a dock (arrival -> docked), unloading at the dock (docked -> released)
+        and release time (arrival -> released, i.e. the time to free one truck)."""
+        recs = list(self.trucks.values())
+        done = [r for r in recs if r["released_s"] is not None]
+        def stats(vals: list[float]) -> tuple[float, float, float]:
+            return (round(sum(vals) / len(vals), 1), round(min(vals), 1), round(max(vals), 1)) if vals else (0.0, 0.0, 0.0)
+        wait = [r["docked_s"] - r["arrival_s"] for r in recs if r["docked_s"] is not None]
+        unload = [r["released_s"] - r["docked_s"] for r in done if r["docked_s"] is not None]
+        release = [r["released_s"] - r["arrival_s"] for r in done]
+        per_day: dict[int, dict[str, int]] = {}
+        for r in recs:
+            d = per_day.setdefault(r["day"], {"arrived": 0, "released": 0})
+            d["arrived"] += 1
+            d["released"] += 1 if r["released_s"] is not None else 0
+        return {
+            "arrived": len(recs),
+            "released": len(done),
+            "at_dock": sum(1 for r in recs if r["docked_s"] is not None and r["released_s"] is None),
+            "waiting": sum(1 for r in recs if r["docked_s"] is None),
+            "wait_s": stats(wait),
+            "unload_s": stats(unload),
+            "release_s": stats(release),
+            "per_day": dict(sorted(per_day.items())),
+        }
+
+    def _day_bucket(self, t: float) -> dict[str, Any]:
+        day = int(max(0.0, float(t or 0.0)) // self.day_s)
+        if day not in self.daily:
+            self.daily[day] = {"even_pallets": 0, "odd_pallets": 0, "dock_cartons": 0, "belt_cartons": 0,
+                               "z05_cartons": {1: 0, 2: 0, 3: 0, 4: 0}}
+        return self.daily[day]
+
+    def _record_daily(self, state: str, t: float, record: dict[str, Any]) -> None:
+        if state == "PICKUP_BAY_LOADED":
+            self._day_bucket(t)["even_pallets"] += 1          # even pallet put on an even buffer zone
+        elif state == "LOOSE_PALLET_ON_SPOT":
+            self._day_bucket(t)["odd_pallets"] += 1           # odd pallet put on an odd buffer zone
+        elif state == "DOCK_PALLET_READY":
+            self._day_bucket(t)["dock_cartons"] += int(record.get("cartons", 0) or 0)
+        elif state == "CARTON_ON_BELT":
+            self._day_bucket(t)["belt_cartons"] += 1
+        elif state in ("PALLET_STORED", "PALLET_RETURNED_TO_STORAGE"):
+            self.occ_steps.append((float(t or 0.0), 1))      # pallet put into a storage slot
+            b = self._day_bucket(t)
+            key = "stored" if state == "PALLET_STORED" else "returned"
+            b[key] = b.get(key, 0) + 1
+        elif state == "OUTBOUND_DISPATCH":
+            self.occ_steps.append((float(t or 0.0), -1))     # shuttle starts taking a pallet out of its slot
+            b = self._day_bucket(t)
+            b["dispatched"] = b.get("dispatched", 0) + 1
+        if state == "PALLET_RETURNED_TO_STORAGE" and record.get("odd_return"):
+            b = self._day_bucket(t)
+            b["odd_return_pallets"] = b.get("odd_return_pallets", 0) + 1
+            info = self._odd_return_info.pop(int(record.get("job") or 0), None)
+            if info is not None:   # odd cartons of floor info[0] are now stored in the warehouse
+                of = b.setdefault("odd_back", {})
+                of[info[0]] = of.get(info[0], 0) + info[1]
+        elif state == "ODD_CARTON_SET_ASIDE":
+            b = self._day_bucket(t)
+            b["odd_returned_cartons"] = b.get("odd_returned_cartons", 0) + 1
+        elif state == "DOCK_HELPER_JOIN" and record.get("dock") is not None:
+            self._helper_open[int(record["dock"])] = float(t or 0.0)
+            b = self._day_bucket(t)
+            b["helper_joins"] = b.get("helper_joins", 0) + 1
+        elif state == "DOCK_HELPER_LEAVE" and record.get("dock") is not None:
+            t0 = self._helper_open.pop(int(record["dock"]), None)
+            if t0 is not None:
+                _append_span(self.helper_spans, t0, float(t or 0.0))
+        elif state == "Z05_CARTON_DELIVERED_TO_U2" and record.get("floor") is not None:
+            z = self._day_bucket(t)["z05_cartons"]
+            fl = int(record["floor"])
+            z[fl] = z.get(fl, 0) + 1
+            # Even (dock) goods only: odd-return pallets carry job ids from 900000 up (controller ODD_RETURN_JOB_BASE).
+            if int(record.get("job") or 0) < 900000:
+                ze = self._day_bucket(t).setdefault("z05_even", {})
+                ze[fl] = ze.get(fl, 0) + 1
+        elif state == "ODD_RETURN_PALLET_READY" and record.get("floor") is not None:
+            self._odd_return_info[int(record["job"])] = (int(record["floor"]), int(record.get("cartons", 0) or 0))
+
+    def daily_kpis(self) -> dict[str, Any]:
+        """Per-day KPI table (one column per simulated day) for the Bao_Cao_Theo_Ngay sheet."""
+        cfg = self.config
+        sim = max(0.0, float(self.sim_duration_s))
+        n_days = max(1, math.ceil(sim / self.day_s - 1e-9)) if sim > 0 else 1
+        days = list(range(n_days))
+        win = [(d * self.day_s, min((d + 1) * self.day_s, sim if sim > 0 else (d + 1) * self.day_s)) for d in days]
+
+        def busy_in(spans: list[tuple[float, float]], a: float, b: float) -> float:
+            return sum(max(0.0, min(hi, b) - max(lo, a)) for lo, hi in _merge_intervals(list(spans)))
+
+        def day_of(t: float | None) -> int | None:
+            return None if t is None else int(max(0.0, float(t)) // self.day_s)
+
+        # --- Dock
+        trucks_done = [r for r in self.trucks.values() if r["released_s"] is not None]
+        trucks_per_day = [sum(1 for r in trucks_done if day_of(r["released_s"]) == d) for d in days]
+        rel_min = []
+        for d in days:
+            vals = [(r["released_s"] - r["docked_s"]) / 60.0 for r in trucks_done
+                    if day_of(r["released_s"]) == d and r["docked_s"] is not None]
+            rel_min.append(round(sum(vals) / len(vals), 2) if vals else None)
+        bucket = [self.daily.get(d, {}) for d in days]
+        even_pal = [b.get("even_pallets", 0) for b in bucket]
+        odd_pal = [b.get("odd_pallets", 0) for b in bucket]
+        dock_cartons = [b.get("dock_cartons", 0) for b in bucket]
+        belt_cartons = [b.get("belt_cartons", 0) for b in bucket]
+
+        dock_keys = [k for k in self.workers if k.startswith("dock_")]
+        op_keys = [k for k in self.workers if k.startswith("op_")]
+        per_dock = max(1, int(cfg.get("dock_workers_per_truck", 2)))
+        pool = int(cfg.get("dock_worker_pool", 0) or 0) if cfg.get("truck_mode") else 0
+        n_dock_people = pool if pool > 0 else per_dock * len(dock_keys)
+        n_forklift = sum(1 for k in self.agvs if k.startswith("agv_"))
+        n_people = n_dock_people + len(op_keys) + n_forklift
+        helper_spans = list(self.helper_spans)
+        for t0 in self._helper_open.values():   # helpers still assisting when the run stopped
+            helper_spans.append((t0, sim))
+        op_eff, helper_h = [], []
+        for a, b in win:
+            cap = (n_dock_people + len(op_keys)) * max(1e-9, b - a)
+            dock_busy = sum(busy_in(self.workers[k].get("busy_spans") or [], a, b) for k in dock_keys)
+            if pool > 0:   # shared crew: primary work at each door + time helpers spend assisting
+                # helper spans of different people may overlap, so they are summed, not merged
+                h_s = sum(max(0.0, min(hi, b) - max(lo, a)) for lo, hi in helper_spans)
+                busy = dock_busy + h_s
+                helper_h.append(round(h_s / 3600.0, 2))
+            else:
+                busy = per_dock * dock_busy
+                helper_h.append(0.0)
+            busy += sum(busy_in(self.workers[k].get("busy_spans") or [], a, b) for k in op_keys)
+            op_eff.append(round(min(100.0, 100.0 * busy / cap), 2) if cap > 0 else 0.0)
+        helper_joins = [b.get("helper_joins", 0) for b in [self.daily.get(d, {}) for d in days]]
+        odd_ret_cartons = [self.daily.get(d, {}).get("odd_returned_cartons", 0) for d in days]
+        odd_ret_pallets = [self.daily.get(d, {}).get("odd_return_pallets", 0) for d in days]
+        belt_speed = float(cfg.get("carton_conveyor_speed", 2.0) or 2.0)
+        belt_pitch = max(0.1, float(cfg.get("carton_belt_pitch_m", 0.6) or 0.6))
+        belt_cap_h = belt_speed * 3600.0 / belt_pitch
+        belt_eff = [round(min(100.0, 100.0 * c / (belt_cap_h * max(1e-9, (b - a) / 3600.0))), 2)
+                    for c, (a, b) in zip(belt_cartons, win)]
+
+        # --- Warehouse occupancy: initial stock, +1 PALLET_STORED / PALLET_RETURNED_TO_STORAGE, -1 OUTBOUND_DISPATCH.
+        steps = sorted(self.occ_steps)
+        occ0 = int(cfg.get("initial_outbound_pallets", 0) or 0)
+        occ_avg, occ_max, occ_max_t = [], [], []
+        cur, k = occ0, 0
+        for a, b in win:
+            while k < len(steps) and steps[k][0] < a:
+                cur += steps[k][1]; k += 1
+            area, last, mx, mx_t = 0.0, a, cur, a
+            while k < len(steps) and steps[k][0] < b:
+                t, dv = steps[k]
+                area += cur * (t - last); last = t; cur += dv; k += 1
+                if cur > mx:
+                    mx, mx_t = cur, t
+            area += cur * (b - last)
+            occ_avg.append(round(area / max(1e-9, b - a), 1))
+            occ_max.append(mx)
+            occ_max_t.append(round((mx_t - a) / 3600.0, 2))
+        # --- Stock left on the shelves at the end of each day (carried over to the next one), pallet by pallet.
+        per_full = int(cfg.get("z05_cartons_per_pallet", 30) or 30)
+        per_partial = max(0, per_full - int(cfg.get("z05_partial_unpack_cartons", 20) or 0))
+        per_odd = int(cfg.get("odd_return_cartons_per_pallet", 30) or 30)
+        moves: list[tuple[float, int, str, int | None]] = []   # (time, order, pallet, cartons or None = taken out)
+        for n, tsk in enumerate(self.warehouse_tasks):
+            dirn, pid = str(tsk.get("direction", "")), str(tsk.get("pallet_id"))
+            if dirn.startswith("Xuất"):
+                moves.append((float(tsk.get("start_s") or 0.0), n, pid, None))
+            elif tsk.get("end_s") is not None:
+                if dirn == "Nhập kho":
+                    moves.append((float(tsk["end_s"]), n, pid, per_full))
+                elif dirn.startswith("Hoàn kho"):
+                    moves.append((float(tsk["end_s"]), n, pid, per_odd if "lẻ" in dirn else per_partial))
+        moves.sort(key=lambda m: (m[0], m[1]))
+        shelf = {f"pallet_out_{i}": per_full for i in range(occ0)}
+        end_pallets, end_cartons, k = [], [], 0
+        for a, b in win:
+            while k < len(moves) and moves[k][0] < b:
+                _, _, pid, qty = moves[k]
+                if qty is None:
+                    shelf.pop(pid, None)
+                else:
+                    shelf[pid] = qty
+                k += 1
+            end_pallets.append(len(shelf))
+            end_cartons.append(sum(shelf.values()))
+        wh_done = [t for t in self.warehouse_tasks if t.get("end_s") is not None]
+        in_target = max(1, int(cfg.get("warehouse_inbound_target", 150) or 150))
+        stored = [b.get("stored", 0) for b in bucket]
+        dispatched = [b.get("dispatched", 0) for b in bucket]
+        returned = [b.get("returned", 0) for b in bucket]
+        in_eff = [round(100.0 * s / in_target, 2) for s in stored]
+        z05 = {fl: [b.get("z05_cartons", {}).get(fl, 0) for b in bucket] for fl in (1, 2, 3, 4)}
+        z05_even = {fl: [b.get("z05_even", {}).get(fl, 0) for b in bucket] for fl in (1, 2, 3, 4)}
+        odd_back = {fl: [b.get("odd_back", {}).get(fl, 0) for b in bucket] for fl in (1, 2, 3, 4)}
+        shuttles = [s for s in self.shuttles.values() if s.get("index", 0) <= 9]
+        sh_eff = []
+        for a, b in win:
+            cap = len(shuttles) * max(1e-9, b - a)
+            busy = sum(busy_in(s.get("busy_spans") or [], a, b) for s in shuttles)
+            sh_eff.append(round(min(100.0, 100.0 * busy / cap), 2) if cap > 0 else 0.0)
+        cycles = [sum(1 for t in wh_done if day_of(t["end_s"]) == d) for d in days]
+        cycle_h = [round(sum(float(t.get("duration_s") or 0.0) for t in wh_done if day_of(t["end_s"]) == d) / 3600.0, 2)
+                   for d in days]
+        return {
+            "days": n_days, "full_days": int(sim // self.day_s), "day_s": self.day_s,
+            "trucks": trucks_per_day, "release_min": rel_min, "even_pallets": even_pal, "odd_pallets": odd_pal,
+            "dock_cartons": dock_cartons, "op_eff": op_eff, "belt_eff": belt_eff, "belt_cap_h": belt_cap_h,
+            "people": [n_people] * n_days, "people_split": (n_dock_people, len(op_keys), n_forklift),
+            "helper_joins": helper_joins, "helper_h": helper_h, "pool": pool,
+            "odd_ret_cartons": odd_ret_cartons, "odd_ret_pallets": odd_ret_pallets,
+            "odd_ret_pct": [round(100.0 * r / c, 2) if c else 0.0 for r, c in zip(odd_ret_cartons, belt_cartons)],
+            "belt_cartons": belt_cartons, "occ_avg": occ_avg, "occ_max": occ_max, "occ_max_t": occ_max_t,
+            "z05_even": z05_even, "odd_back": odd_back,
+            "end_pallets": end_pallets, "end_cartons": end_cartons, "per_full": per_full, "per_partial": per_partial,
+            "in_eff": in_eff, "stored": stored, "dispatched": dispatched, "returned": returned, "z05": z05, "shuttles": [len(self.shuttles)] * n_days, "sh_eff": sh_eff,
+            "cycles": cycles, "cycle_h": cycle_h,
+        }
+
     def record_event(self, record: dict[str, Any]) -> None:
         state = record.get("state", "")
         t = record.get("demo_time_s", 0.0)
         job = record.get("job")
         dock_id = record.get("dock")
+        self._record_daily(state, t, record)
 
         if state == "INBOUND_ARRIVAL" and job is not None and dock_id is not None:
             self.job_dock_map[int(job)] = int(dock_id)
@@ -974,6 +1268,8 @@ class SimulationTracker:
                 d["even_cartons"] += 1
             elif kind == "odd":
                 d["odd_cartons"] += 1
+            key = int(dock_id)
+            self._barcode_pending[key] = self._barcode_pending.get(key, 0) + 1
             self.record_worker_activity(f"dock_{int(dock_id)}", cartons=1)
             return
 
@@ -983,17 +1279,21 @@ class SimulationTracker:
             kind = record.get("classification", "")
             batch = record.get("batch")
             cartons = int(record.get("cartons", 0) or 0)
+            # Count only what the barcode / batch-open events have not counted already.
+            new_cartons = max(0, cartons - self._barcode_pending.pop(did, 0))
+            batch_counted = (did, kind, batch) in self._dock_batch_t0
             staged_t0 = self._dock_batch_t0.pop((did, "staged", batch), None)
             if staged_t0 is not None and (did, kind, batch) not in self._dock_batch_t0:
                 self._dock_batch_t0[(did, kind, batch)] = staged_t0
             if cartons > 0:
                 if kind == "even":
-                    d["even_batches"] += 1
-                    d["even_cartons"] += cartons
+                    d["even_batches"] += 0 if batch_counted else 1
+                    d["even_cartons"] += new_cartons
                 elif kind == "odd":
-                    d["odd_batches"] += 1
-                    d["odd_cartons"] += cartons
-                self.record_worker_activity(f"dock_{did}", cartons=cartons)
+                    d["odd_batches"] += 0 if batch_counted else 1
+                    d["odd_cartons"] += new_cartons
+                if new_cartons:
+                    self.record_worker_activity(f"dock_{did}", cartons=new_cartons)
             if kind == "even":
                 d["even_ready"] += 1
                 n_bays = len(self.config.get("inbound_pickup_slots") or []) or 4
@@ -1161,7 +1461,7 @@ class SimulationTracker:
             sh_dist = float(sh["distance_m"])
             sh_idle = max(0.0, float(sh.get("idle_s", 0.0)))
             sh_used = sh_dist * self.shuttle_drain_per_m + sh_idle * self.shuttle_drain_idle_per_s
-            if sh.get("charge_completed_count", 0) > 0:
+            if sh.get("charge_completed_count", 0) > 0 or sh.get("night_charges", 0) > 0:
                 since_d = max(0.0, sh_dist - float(sh.get("_last_chg_dist_m", 0.0)))
                 since_id = max(0.0, sh_idle - float(sh.get("_last_chg_idle_s", 0.0)))
                 sh_rem = max(0.0, self.init_battery_pct - (since_d * self.shuttle_drain_per_m + since_id * self.shuttle_drain_idle_per_s))
@@ -1218,7 +1518,7 @@ class SimulationTracker:
                 + empty_m * self.drain_empty_per_m
                 + idle_s * self.drain_idle_per_s
             )
-            if agv.get("charge_completed_count", 0) > 0:
+            if agv.get("charge_completed_count", 0) > 0 or agv.get("night_charges", 0) > 0:
                 since_ld = max(0.0, loaded_m - float(agv.get("_last_chg_loaded_m", 0.0)))
                 since_em = max(0.0, empty_m - float(agv.get("_last_chg_empty_m", 0.0)))
                 since_id = max(0.0, idle_s - float(agv.get("_last_chg_idle_s", 0.0)))
@@ -2009,10 +2309,10 @@ def _build_sheet_overview(
         ),
         (
             "Ca & Tần suất",
-            "Nhịp tạo đơn Nhập / Xuất (1x)",
-            f"{in_iv:.0f}s / {out_iv:.0f}s",
+            "Cách tạo lệnh Nhập / Xuất",
+            "Xe tải / Theo ô trống" if cfg.get("truck_mode") else f"{in_iv:.0f}s / {out_iv:.0f}s",
             None,
-            f"giây/pallet | Thực tế: {wh_in} nhập / {wh_out_total} xuất ({wh_out_full} unpack hết & {wh_out_part} hoàn kho)",
+            f"Nhập theo lịch xe tải; xuất khi Zone 05 có ô trống | Thực tế: {wh_in} nhập / {wh_out_total} xuất ({wh_out_full} unpack hết & {wh_out_part} xuất tạm)",
             None,
         ),
         (
@@ -2074,7 +2374,7 @@ def _build_sheet_overview(
         (
             "AGV, Dock & Unpack",
             "Cửa Dock kích hoạt & Nhân sự",
-            f"{cfg.get('dock_active_count', len(tracker.dock_order))} Dock / {len(tracker.workers)} CN",
+            f"{cfg.get('dock_active_count', len(tracker.dock_order))} Dock / {len(tracker.workers)} vị trí",
             None,
             f"Cửa vật lý: {cfg.get('dock_physical_count', 11)} | Công nhân 6 khu vực (Dock -> P1)",
             None,
@@ -2092,7 +2392,7 @@ def _build_sheet_overview(
             "Hoàn kho ngay pallet dư Zone 05",
             f"{cfg.get('z05_partial_unpack_cartons', 12)}/{cfg.get('z05_cartons_per_pallet', 18)} thùng",
             None,
-            f"thùng/pallet | Mỗi {cfg.get('z05_partial_return_every', 3)} pallet xuất có 1 pallet đẩy ngược về Kho 01 khi lấy {cfg.get('z05_partial_unpack_cartons', 12)}/{cfg.get('z05_cartons_per_pallet', 18)} thùng (tính hoàn kho trong {wh_out_total} lượt xuất, không tính vào mục tiêu {out_target} unpack hết)",
+            f"thùng/pallet | Mỗi {cfg.get('z05_partial_return_every', 3)} pallet xuất có 1 pallet đẩy ngược về Kho 01 khi lấy {cfg.get('z05_partial_unpack_cartons', 12)}/{cfg.get('z05_cartons_per_pallet', 18)} thùng (lượt xuất tạm nằm trong {wh_out_total} lượt xuất, không tính vào mục tiêu {out_target} unpack hết)",
             None,
         ),
     ]
@@ -2109,21 +2409,23 @@ def _build_sheet_overview(
         ("Thời gian", "Tổng thời gian vận hành kho (1x chuẩn)", summary["sim_duration_hms"], None, "1x chuẩn nhà máy"),
         ("Thời gian", "Thời gian mở mô phỏng (Wall-clock)", summary["wall_duration_hms"], None, f"Tốc độ tua {speed_x:.2f}x"),
         ("Kho AS/RS", "Tổng nhiệm vụ Shuttle - Nhập kho", wh_in, "#,##0", f"Mục tiêu ca: {cfg.get('warehouse_inbound_target', '-')} nhập"),
-        ("Kho AS/RS", "Tổng nhiệm vụ Shuttle - Xuất kho", wh_out_total, "#,##0", f"{wh_out_full} unpack hết (Mục tiêu ca: {out_target}) & {wh_out_part} hoàn kho"),
+        ("Kho AS/RS", "Tổng nhiệm vụ Shuttle - Hoàn kho", wh_ret, "#,##0", "Hàng dư Z05 + pallet gom hàng lẻ cất lại vào kệ"),
+        ("Kho AS/RS", "Tổng nhiệm vụ Shuttle - Xuất kho", wh_out_total, "#,##0", f"{wh_out_full} unpack hết (Mục tiêu ca: {out_target}) & {wh_out_part} xuất tạm"),
+        ("Kho AS/RS", "TỔNG NHIỆM VỤ SHUTTLE (Nhập + Hoàn + Xuất)", wh_in + wh_ret + wh_out_total, "#,##0", f"Đưa vào kệ (Nhập + Hoàn): {wh_in + wh_ret}"),
         ("Kho AS/RS", "Tỉ lệ TB 9 Shuttle hoạt động", round(summary["shuttle_avg_active_pct"], 2), '0.00"%"', f"Quãng đường 10 xe: {summary['shuttle_total_distance_m']:,.2f} m"),
         ("Kho AS/RS", "Tỉ lệ TB 9 Shuttle có lệnh chờ hàng", round(summary["shuttle_avg_cmd_wait_pct"], 2), '0.00"%"', f"Nghỉ rảnh: {summary['shuttle_avg_pure_idle_pct']:.2f}% | Chờ pallet: {_fmt_vi_hms(summary['shuttle_total_wait_s'])}"),
         ("4 Thang nâng", "Tổng hàng qua 4 Thang nâng - Nhập kho", int(summary["lift_inbound_tasks"]), "#,##0", "Lượt qua 2 Thang Nhập"),
-        ("4 Thang nâng", "Tổng hàng qua 4 Thang nâng - Xuất kho", lf_out_total, "#,##0", f"{lf_out_full} unpack hết & {lf_out_part} hoàn kho Z05 (Đẩy trả kệ: {wh_ret} lượt)"),
+        ("4 Thang nâng", "Tổng hàng qua 4 Thang nâng - Xuất kho", lf_out_total, "#,##0", f"{lf_out_full} unpack hết & {lf_out_part} xuất tạm | Lượt hoàn kho riêng: {wh_ret}"),
         ("4 Thang nâng", "Tỉ lệ TB 4 Thang nâng hoạt động", round(summary["lift_avg_active_pct"], 2), '0.00"%"', "Chạy nâng-hạ cabin thực tế"),
         ("4 Thang nâng", "Tỉ lệ TB 4 Thang nâng có lệnh chờ hàng", round(summary["lift_avg_cmd_wait_pct"], 2), '0.00"%"', f"Nghỉ rảnh: {summary['lift_avg_pure_idle_pct']:.2f}% | Chờ đơn: {_fmt_vi_hms(summary['lift_total_wait_s'])}"),
         (f"Đội AGV ({len(tracker.agvs)} xe)", "Tổng nhiệm vụ toàn đội AGV", int(summary["agv_total_tasks"]), "#,##0", f"Dock: {summary['agv_dock_tasks']} | Unpack: {summary['agv_unpack_tasks']} | P1: {summary['agv_p1_tasks']}"),
         (f"Đội AGV ({len(tracker.agvs)} xe)", "Tổng quãng đường toàn đội AGV", round(summary["agv_total_distance_m"], 2), "#,##0.00", "mét di chuyển toàn nhà máy"),
         (f"Đội AGV ({len(tracker.agvs)} xe)", "Tỉ lệ TB AGV chạy có ích", round(summary["agv_avg_active_pct"], 2), '0.00"%"', f"Pin TB còn: {summary['agv_avg_battery_pct']:.2f}%"),
         (f"Đội AGV ({len(tracker.agvs)} xe)", "Tỉ lệ TB AGV có lệnh chờ Traffic", round(summary["agv_avg_wait_pct"], 2), '0.00"%"', f"Nghỉ rảnh hoàn toàn: {summary['agv_avg_pure_idle_pct']:.2f}%"),
-        (f"Nhân sự ({len(tracker.workers)})", "Tỉ lệ TB Công nhân làm việc", round(summary["worker_avg_active_pct"], 2), '0.00"%"', f"Chờ hàng/AGV: {summary['worker_avg_cmd_wait_pct']:.2f}% | Nghỉ: {summary['worker_avg_pure_idle_pct']:.2f}%"),
+        (f"Nhân sự ({len(tracker.workers)} vị trí, gồm {len(tracker.dock_order)} cửa dock)", "Tỉ lệ TB Công nhân làm việc", round(summary["worker_avg_active_pct"], 2), '0.00"%"', f"Chờ hàng/AGV: {summary['worker_avg_cmd_wait_pct']:.2f}% | Nghỉ: {summary['worker_avg_pure_idle_pct']:.2f}%"),
         ("Khu Dock", "Pallet chẵn hoàn tất phân loại", int(summary["dock_even_pallets"]), "#,##0", f"Barcode quét: {summary['dock_scanned_even']} kiện chẵn"),
         ("Khu Dock", "Pallet lẻ hoàn tất phân loại", int(summary["dock_odd_pallets"]), "#,##0", f"Barcode quét: {summary['dock_scanned_odd']} kiện lẻ"),
-        ("Unpack T1", "Pallet lẻ unpack lên băng tải", loose_pallets, "#,##0", f"Tổng thùng lên băng tải: {loose_cartons} thùng"),
+        ("Unpack T1", "Pallet lẻ unpack lên băng tải", loose_pallets, "#,##0", f"Thùng lên băng tải: {tracker.loose_stats.get('cartons_on_belt', 0)} | Thùng đã unpack tại tầng: {loose_cartons} (còn lại để riêng hoàn kho / đang trên băng)"),
         ("An toàn", "Tổng số lỗi toàn hệ thống", tot_sys_faults, "#,##0", f"Shuttle: {summary['shuttle_fault_count']} | Thang: {summary['lift_fault_count']} | AGV: {summary['agv_fault_count']}"),
     ]
     row = _write_kpi_cards(
@@ -2142,8 +2444,8 @@ def _build_sheet_overview(
     cfg_rows = [
         ["Chế độ vận hành & Lý do dừng", mode_desc, "-", summary["stop_reason"]],
         ["Số pallet cấu hình (tắt liên tục)", tracker.total_jobs if not tracker.continuous_mode else "Không giới hạn (Liên tục)", "pallet", "Tự động tái chế pallet khi bật continuous_mode"],
-        ["Giới hạn chu trình (cycle_duration_s)", _fmt_vi_hms(tracker.cycle_duration_s) if tracker.cycle_duration_s > 0 else "0 (Không giới hạn)", "giờ:phút:giây", "0 = chạy mãi; > 0 = tự dừng đúng mốc chuẩn 1x"],
-        ["Nhịp nhập / xuất & Dock", f"{cfg.get('inbound_even_interval_s', cfg.get('inbound_interval_s'))}s / {cfg.get('outbound_interval_s')}s", "giây (1x)", f"Mục tiêu ca: {cfg.get('warehouse_inbound_target', '-')} nhập / {cfg.get('warehouse_outbound_target', '-')} unpack hết | Tồn đầu: {cfg.get('initial_outbound_pallets', 0)} | Dock: {cfg.get('dock_active_count')}"],
+        ["Thời lượng cả phiên chạy (số ca x cycle_duration_s)", _fmt_vi_hms(tracker.cycle_duration_s) if tracker.cycle_duration_s > 0 else "0 (Không giới hạn)", "giờ:phút:giây", "0 = chạy mãi; > 0 = tự dừng đúng mốc chuẩn 1x"],
+        ["Cách tạo lệnh nhập / xuất & Dock", "Nhập theo xe tải / Xuất theo ô trống Zone 05" if cfg.get("truck_mode") else f"{cfg.get('inbound_even_interval_s', cfg.get('inbound_interval_s'))}s / {cfg.get('outbound_interval_s')}s", "-", f"Mục tiêu ca: {cfg.get('warehouse_inbound_target', '-')} nhập / {cfg.get('warehouse_outbound_target', '-')} unpack hết | Tồn đầu: {cfg.get('initial_outbound_pallets', 0)} | Dock: {cfg.get('dock_active_count')}"],
         ["Thông số Shuttle cài đặt (tốc độ / gia tốc / pin)", f"{float(cfg.get('shuttle_speed', 1.0)):.2f} m/s | Pin {sh_cont_h:.1f}h / Sạc {sh_chg_h:.1f}h", "m/s | giờ", f"Rẽ bánh: {float(cfg.get('shuttle_turn_s', 5.0)):.1f}s | Định vị: {float(cfg.get('shuttle_positioning_s', 5.0)):.1f}s | Nâng: {float(cfg.get('shuttle_lift_s', 2.5)):.1f}s | Avail/Util: {float(cfg.get('shuttle_availability', 0.7))*100:.0f}%/{float(cfg.get('shuttle_utilization', 0.7))*100:.0f}%"],
         ["Thông số Thang nâng cài đặt (tốc độ / gia tốc / jerk)", f"{float(cfg.get('lift_speed', 0.6)):.2f} / {float(cfg.get('lift_acceleration', 0.3)):.2f} / {float(cfg.get('lift_jerk', 0.8)):.2f}", "m/s | m/s² | m/s³", f"Ổn định dừng: {float(cfg.get('lift_settle_s', 2.0)):.1f}s | Avail/Util: {float(cfg.get('lift_availability', 0.8))*100:.0f}%/{float(cfg.get('lift_utilization', 0.8))*100:.0f}% | Băng tải: {float(cfg.get('conveyor_speed', 0.6)):.2f} m/s"],
         ["Thông số AGV, Trolley & Pin", f"AGV: {agv_d_h}h (sạc {agv_c_h}h) | Forklift: {fl_d_h}h (sạc {fl_c_h}h)", f"Trolley {trolley_cap} thùng | Pin {tracker.init_battery_pct:.0f}%", f"U1/U2/P1: {float(cfg.get('u1_agv_speed', 2.0)):.1f}/{float(cfg.get('u2_agv_speed', 3.0)):.1f}/{float(cfg.get('p1_agv_speed', 2.0)):.1f} m/s | Hao tải/rỗng/chờ: {tracker.drain_loaded_per_m}%/{tracker.drain_empty_per_m}%/m, {tracker.drain_idle_per_s}%/s | Gap: {cfg.get('agv_following_gap_m', 1)} m"],
@@ -2362,7 +2664,7 @@ def _build_asrs_input_table(
             in_target,
             "#,##0",
             "pallet",
-            f"Nhịp tạo: {in_iv:.0f}s/pallet | Thực tế: {wh_in} lượt nhập",
+            (f"Theo lịch xe tải {cfg.get('inbound_trucks_per_day', 60)} xe/ca" if cfg.get("truck_mode") else f"Nhịp tạo: {in_iv:.0f}s/pallet") + f" | Thực tế: {wh_in} lượt nhập",
             None,
         ),
         (
@@ -2380,7 +2682,7 @@ def _build_asrs_input_table(
             out_target,
             "#,##0",
             "pallet",
-            f"Tồn đầu: {init_stock} | Nhịp: {out_iv:.0f}s | Thực tế: {wh_out_total} xuất ({wh_out_full} unpack hết & {wh_out_part} hoàn kho)",
+            f"Tồn đầu: {init_stock} | Lệnh xuất phát khi Zone 05 có ô trống | Thực tế: {wh_out_total} xuất ({wh_out_full} unpack hết & {wh_out_part} xuất tạm)",
             None,
         ),
         (
@@ -2398,7 +2700,7 @@ def _build_asrs_input_table(
             10,
             "#,##0",
             "xe",
-            f"{n_levels} tầng kệ | Thực tế chạy: {active_sh_count}/10 xe ({sh_avail:.0f}% avail)",
+            f"{n_levels} tầng kệ | Thực tế chạy: {active_sh_count}/10 xe (thiết kế {sh_avail:.0f}% khả dụng, tham khảo)",
             FILL_INPUT_SHUTTLE,
         ),
         (
@@ -2443,7 +2745,7 @@ def _build_asrs_input_table(
             lf_out_cnt,
             "#,##0",
             "thang",
-            f"Thang Xuất 1 & 2 (8 cửa xuất T1..T4) | Thực tế: {lf_out_tasks} xuất ({lf_out_full} unpack hết & {lf_out_part} hoàn kho; đẩy trả kệ: {lf_ret_tasks})",
+            f"Thang Xuất 1 & 2 (8 cửa xuất T1..T4) | Thực tế: {lf_out_tasks} xuất ({lf_out_full} unpack hết & {lf_out_part} xuất tạm; lượt hoàn kho riêng: {lf_ret_tasks})",
             None,
         ),
         (
@@ -2537,7 +2839,10 @@ def _build_asrs_sheet(wb: Workbook, tracker: SimulationTracker, summary: dict[st
     sh_kpi_specs = [
         ("Kho AS/RS", "Tổng thời gian vận hành kho (1x chuẩn)", summary["sim_duration_hms"], None, "Thời gian mô phỏng chuẩn 1x"),
         ("Đội Shuttle (1..10)", "Tổng nhiệm vụ Shuttle - Nhập kho", int(summary["warehouse_inbound_tasks"]), "#,##0", "nhiệm vụ nhập kho"),
-        ("Đội Shuttle (1..10)", "Tổng nhiệm vụ Shuttle - Xuất kho", wh_out_total, "#,##0", f"{wh_out_full} unpack hết & {wh_out_part} hoàn kho (Đẩy trả kệ Z05: {wh_ret})"),
+        ("Đội Shuttle (1..10)", "Tổng nhiệm vụ Shuttle - Hoàn kho", wh_ret, "#,##0", "cất lại vào kệ: hàng dư Z05 + pallet gom hàng lẻ"),
+        ("Đội Shuttle (1..10)", "Tổng đưa hàng vào kệ (Nhập + Hoàn)", int(summary["warehouse_inbound_tasks"]) + wh_ret, "#,##0", "nhiệm vụ nhập kho + hoàn kho"),
+        ("Đội Shuttle (1..10)", "Tổng nhiệm vụ Shuttle - Xuất kho", wh_out_total, "#,##0", f"{wh_out_full} xuất unpack hết & {wh_out_part} xuất tạm (sẽ hoàn kho)"),
+        ("Đội Shuttle (1..10)", "TỔNG NHIỆM VỤ SHUTTLE (Nhập + Hoàn + Xuất)", int(summary["warehouse_inbound_tasks"]) + wh_ret + wh_out_total, "#,##0", "toàn bộ nhiệm vụ của đội shuttle"),
         ("Đội Shuttle (1..10)", "Tổng quãng đường 10 Shuttle", round(summary["shuttle_total_distance_m"], 2), "#,##0.00", "m (mét di chuyển)"),
         ("Shuttle chính (1..9)", "Tỉ lệ TB Shuttle hoạt động", round(summary["shuttle_avg_active_pct"], 2), '0.00"%"', "% chạy nhiệm vụ trên ray"),
         ("Shuttle chính (1..9)", "Tỉ lệ TB Shuttle có lệnh chờ hàng", round(summary["shuttle_avg_cmd_wait_pct"], 2), '0.00"%"', "% giữ lệnh chờ thang / bàn đệm"),
@@ -2545,7 +2850,7 @@ def _build_asrs_sheet(wb: Workbook, tracker: SimulationTracker, summary: dict[st
         ("Đội Shuttle (1..10)", "Tổng thời gian hàng chờ Shuttle", _fmt_vi_hms(summary["shuttle_total_wait_s"]), None, "Cộng dồn TG xếp hàng của pallet"),
         ("Đội Shuttle (1..10)", "Tổng số lỗi Shuttle", int(summary["shuttle_fault_count"]), "#,##0", "lỗi toàn đội Shuttle"),
         ("4 Thang nâng", "Tổng hàng qua 4 Thang nâng - Nhập kho", int(summary["lift_inbound_tasks"]), "#,##0", "lượt qua 2 Thang Nhập"),
-        ("4 Thang nâng", "Tổng hàng qua 4 Thang nâng - Xuất kho", lf_out_total, "#,##0", f"{lf_out_full} unpack hết & {lf_out_part} hoàn kho qua 2 Thang Xuất (Đẩy trả kệ: {lf_ret})"),
+        ("4 Thang nâng", "Tổng hàng qua 4 Thang nâng - Xuất kho", lf_out_total, "#,##0", f"{lf_out_full} unpack hết & {lf_out_part} xuất tạm qua 2 Thang Xuất | Lượt hoàn kho riêng: {lf_ret}"),
         ("4 Thang nâng", "Tỉ lệ TB 4 Thang nâng hoạt động", round(summary["lift_avg_active_pct"], 2), '0.00"%"', "% cabin chạy nâng-hạ thực tế"),
         ("4 Thang nâng", "Tỉ lệ TB 4 Thang nâng có lệnh chờ hàng", round(summary["lift_avg_cmd_wait_pct"], 2), '0.00"%"', "% chờ Z05 / Shuttle / bàn giao"),
         ("4 Thang nâng", "Tỉ lệ TB 4 Thang nâng nghỉ rảnh", round(summary["lift_avg_pure_idle_pct"], 2), '0.00"%"', "% thang rảnh không có đơn"),
@@ -2572,12 +2877,12 @@ def _build_asrs_sheet(wb: Workbook, tracker: SimulationTracker, summary: dict[st
         ["Shuttle - Thời gian chuyển hướng bánh X/Y (shuttle_turn_s)", f"{float(cfg.get('shuttle_turn_s', 5.0)):.2f}", "giây/lần", "Thời gian nâng-hạ bộ bánh xe khi rẽ góc 90° trên ray"],
         ["Shuttle - Thời gian định vị tinh tại ô kệ (shuttle_positioning_s)", f"{float(cfg.get('shuttle_positioning_s', 5.0)):.2f}", "giây/lần", "Thời gian căn chỉnh vị trí trước khi nâng/hạ pallet"],
         ["Shuttle - Thời gian nâng / hạ bàn nâng (shuttle_lift_s)", f"{float(cfg.get('shuttle_lift_s', 2.5)):.2f}", "giây/lần", "Thời gian kích thủy lực nâng/hạ pallet trên thân Shuttle"],
-        ["Shuttle - Hệ số sẵn sàng & Sử dụng (availability / utilization)", f"{float(cfg.get('shuttle_availability', 0.7))*100:.1f}% / {float(cfg.get('shuttle_utilization', 0.7))*100:.1f}%", "%", "Hệ số khả dụng & hiệu suất thiết kế theo bảng tính 4-way Shuttle"],
+        ["Shuttle - Hệ số sẵn sàng & Sử dụng (availability / utilization)", f"{float(cfg.get('shuttle_availability', 0.7))*100:.1f}% / {float(cfg.get('shuttle_utilization', 0.7))*100:.1f}%", "%", "Giá trị tham khảo theo bảng tính 4-way Shuttle, KHÔNG dùng trong chuyển động mô phỏng"],
         ["Thang nâng - Vận tốc nâng-hạ (lift_speed)", f"{float(cfg.get('lift_speed', 0.6)):.2f}", "m/s", "Tốc độ nâng/hạ cabin của 2 Thang Nhập & 2 Thang Xuất"],
         ["Thang nâng - Gia tốc / Độ giật (lift_acceleration / lift_jerk)", f"{float(cfg.get('lift_acceleration', 0.3)):.2f} / {float(cfg.get('lift_jerk', 0.8)):.2f}", "m/s² | m/s³", "Đồ thị chuyển động S-curve khi nâng/hạ cabin thang"],
         ["Thang nâng - Thời gian ổn định dừng tầng (lift_settle_s)", f"{float(cfg.get('lift_settle_s', 2.0)):.2f}", "giây/lần", "Thời gian cabin cân bằng chính xác trước khi chuyển pallet"],
-        ["Thang nâng - Hệ số sẵn sàng & Sử dụng (availability / utilization)", f"{float(cfg.get('lift_availability', 0.8))*100:.1f}% / {float(cfg.get('lift_utilization', 0.8))*100:.1f}%", "%", "Hệ số khả dụng & hiệu suất khai thác thiết kế của hệ Thang nâng"],
-        ["Quy mô Kho AS/RS & Băng tải (conveyor_speed)", f"10 Shuttle | 4 Thang | BT {float(cfg.get('conveyor_speed', 0.6)):.2f} m/s", "9 tầng (0.3m..16.3m)", f"9 Shuttle chính + 1 Standby T1 | Mục tiêu {_fmt_vi_hms(tracker.cycle_duration_s).split(' (')[0] if tracker.cycle_duration_s > 0 else 'Liên tục'}: {cfg.get('warehouse_inbound_target', '-')} nhập / {cfg.get('warehouse_outbound_target', '-')} unpack hết (Tồn: {cfg.get('initial_outbound_pallets', 0)} | Nhịp: {cfg.get('inbound_even_interval_s', cfg.get('inbound_interval_s'))}s/{cfg.get('outbound_interval_s')}s)"],
+        ["Thang nâng - Hệ số sẵn sàng & Sử dụng (availability / utilization)", f"{float(cfg.get('lift_availability', 0.8))*100:.1f}% / {float(cfg.get('lift_utilization', 0.8))*100:.1f}%", "%", "Giá trị tham khảo thiết kế thang nâng, KHÔNG dùng trong chuyển động mô phỏng"],
+        ["Quy mô Kho AS/RS & Băng tải (conveyor_speed)", f"10 Shuttle | 4 Thang | BT {float(cfg.get('conveyor_speed', 0.6)):.2f} m/s", "9 tầng (0.3m..16.3m)", f"9 Shuttle chính + 1 Standby T1 | Mục tiêu {_fmt_vi_hms(tracker.cycle_duration_s).split(' (')[0] if tracker.cycle_duration_s > 0 else 'Liên tục'}: {cfg.get('warehouse_inbound_target', '-')} nhập / {cfg.get('warehouse_outbound_target', '-')} unpack hết (Tồn: {cfg.get('initial_outbound_pallets', 0)} | Nhập theo xe tải, xuất theo ô trống Zone 05)"],
     ]
     row = _write_table(
         ws2, row,
@@ -2592,7 +2897,7 @@ def _build_asrs_sheet(wb: Workbook, tracker: SimulationTracker, summary: dict[st
     row += 1
     sec3_start_row = row
 
-    row = _style_section(ws2, row, 16, "3. BẢNG TỔNG HỢP TRẠNG THÁI & HÀNG CHỜ 10 SHUTTLE (TỪ SHUTTLE 1 ĐẾN SHUTTLE 10)")
+    row = _style_section(ws2, row, 17, "3. BẢNG TỔNG HỢP TRẠNG THÁI & HÀNG CHỜ 10 SHUTTLE (TỪ SHUTTLE 1 ĐẾN SHUTTLE 10)")
     shuttle_rows = []
     tot_in = tot_out = tot_out_full = tot_out_part = tot_ret_sh_sum = tot_faults = 0
     tot_busy = tot_cw = tot_pid = tot_wait = 0.0
@@ -2615,18 +2920,18 @@ def _build_asrs_sheet(wb: Workbook, tracker: SimulationTracker, summary: dict[st
         avg_wait = round(sh["wait_s"] / cnt, 2) if cnt > 0 else 0.0
         shuttle_rows.append([
             sh["code"], sh["role"],
-            sh["inbound_count"], sh_out, cnt,
+            sh["inbound_count"], sh_out, sh_ret, cnt,
             _excel_days(sh["busy_s"]), _excel_days(sh["cmd_wait_s"]), _excel_days(sh["pure_idle_s"]),
             _excel_days(sh["wait_s"]), avg_wait,
             sh["active_pct"], sh["cmd_wait_pct"], sh["pure_idle_pct"], sh["fault_count"],
             sh["status"], _fmt_codes(sh["task_codes"], 10),
         ])
-    tot_sh_cnt = sum(r[4] for r in shuttle_rows)
+    tot_sh_cnt = sum(r[5] for r in shuttle_rows)
     row = _write_table(
         ws2, row,
         [
             "Mã Shuttle", "Vai trò vận hành",
-            "Lượt nhập", "Lượt xuất", "Tổng NV",
+            "Lượt nhập", "Lượt xuất", "Lượt hoàn kho", "Tổng NV",
             "TG hoạt động", "TG có lệnh chờ hàng", "TG nghỉ rảnh",
             "TG hàng chờ (cộng dồn)", "Chờ TB / NV (s)",
             "Tỉ lệ chạy (%)", "Tỉ lệ chờ hàng/lệnh (%)", "Tỉ lệ nghỉ rảnh (%)", "Số lỗi",
@@ -2634,20 +2939,20 @@ def _build_asrs_sheet(wb: Workbook, tracker: SimulationTracker, summary: dict[st
         ],
         shuttle_rows,
         col_formats={
-            3: "#,##0", 4: "#,##0", 5: "#,##0",
-            6: FMT_HMS_TENTH, 7: FMT_HMS_TENTH, 8: FMT_HMS_TENTH, 9: FMT_HMS_TENTH, 10: "#,##0.00",
-            11: "0.00", 12: "0.00", 13: "0.00", 14: "#,##0",
+            3: "#,##0", 4: "#,##0", 5: "#,##0", 6: "#,##0",
+            7: FMT_HMS_TENTH, 8: FMT_HMS_TENTH, 9: FMT_HMS_TENTH, 10: FMT_HMS_TENTH, 11: "#,##0.00",
+            12: "0.00", 13: "0.00", 14: "0.00", 15: "#,##0",
         },
-        right_cols={3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14},
-        center_cols={1, 15},
-        status_col=15,
+        right_cols={3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15},
+        center_cols={1, 16},
+        status_col=16,
         total_row=[
             "TỔNG / TB 10 SHUTTLE", "",
-            tot_in, tot_out, tot_sh_cnt,
+            tot_in, tot_out, tot_ret_sh_sum, tot_sh_cnt,
             _excel_days(tot_busy), _excel_days(tot_cw), _excel_days(tot_pid), _excel_days(tot_wait),
             round(tot_wait / tot_sh_cnt, 2) if tot_sh_cnt > 0 else 0.0,
             summary["shuttle_avg_active_pct"], summary["shuttle_avg_cmd_wait_pct"], summary["shuttle_avg_pure_idle_pct"],
-            tot_faults, f"(*) TB % tính trên 9 Shuttle chính | Xuất: {tot_out_full} unpack hết & {tot_out_part} hoàn kho (Đẩy trả kệ: {tot_ret_sh_sum})", "",
+            tot_faults, f"(*) TB % tính trên 9 Shuttle chính | Xuất: {tot_out_full} unpack hết & {tot_out_part} xuất tạm | Lượt hoàn kho: {tot_ret_sh_sum}", "",
         ],
         auto_filter=False,
     )
@@ -2673,7 +2978,7 @@ def _build_asrs_sheet(wb: Workbook, tracker: SimulationTracker, summary: dict[st
         lf_tot_wait_cnt += denom
         avg_lf_wait = round(lf["wait_s"] / denom, 2) if denom > 0 else 0.0
         lf_desc = (
-            f"{lf['direction']} ({lf['station']} | {lf_out_cnt_row} xuất: {lf['outbound_count']} unpack hết & {lf_part_out} hoàn kho, {lf_ret_row} đẩy trả kệ)"
+            f"{lf['direction']} ({lf['station']} | {lf_out_cnt_row} xuất: {lf['outbound_count']} unpack hết & {lf_part_out} xuất tạm, {lf_ret_row} lượt hoàn kho)"
             if lf["id"].startswith("out_lift_")
             else f"{lf['direction']} ({lf['station']})"
         )
@@ -2769,7 +3074,7 @@ def _build_asrs_sheet(wb: Workbook, tracker: SimulationTracker, summary: dict[st
     h_last_data_row = h_hdr_row + len(hourly_rows)
     row = _write_table(
         ws2, row,
-        ["Khung giờ (1x)", "Lượt nhập", "Lượt xuất", "Lượt đẩy trả Z05", "Tổng nhiệm vụ", "Tỉ trọng (%)", "Đánh giá cao/thấp điểm"],
+        ["Khung giờ (1x)", "Lượt nhập", "Lượt xuất", "Lượt hoàn kho", "Tổng nhiệm vụ", "Tỉ trọng (%)", "Đánh giá cao/thấp điểm"],
         hourly_rows,
         col_formats={2: "#,##0", 3: "#,##0", 4: "#,##0", 5: "#,##0", 6: "0.00"},
         right_cols={2, 3, 4, 5, 6},
@@ -2808,7 +3113,7 @@ def _build_asrs_sheet(wb: Workbook, tracker: SimulationTracker, summary: dict[st
         [
             "Đang hoạt động (Chạy nhiệm vụ)",
             round(active9_busy / 60.0, 2), pct9_act,
-            f"{active_sh_count}/10 Shuttle tham gia | {tot_in} nhập, {tot_out} xuất ({tot_out_full} unpack hết & {tot_out_part} hoàn kho)",
+            f"{active_sh_count}/10 Shuttle tham gia | {tot_in} nhập, {tot_out} xuất ({tot_out_full} unpack hết & {tot_out_part} xuất tạm)",
         ],
         [
             "Có lệnh - Chờ hàng / Bàn đệm",
@@ -2877,7 +3182,7 @@ def _build_asrs_sheet(wb: Workbook, tracker: SimulationTracker, summary: dict[st
     )
 
     ws2.add_chart(_make_bar_chart(
-        ws2, "Tần suất Nhập / Xuất / Đẩy trả Z05 theo giờ (Kho AS/RS)", "Khung giờ (1x)", "Số nhiệm vụ",
+        ws2, "Tần suất Nhập / Xuất / Hoàn kho theo giờ (Kho AS/RS)", "Khung giờ (1x)", "Số nhiệm vụ",
         17.2, 11.5, 2, 4, h_hdr_row, h_last_data_row,
     ), f"F{sec0_tbl_start}")
     ws2.add_chart(_make_pie_chart(
@@ -3449,7 +3754,10 @@ def _build_dock_sheet(wb: Workbook, tracker: SimulationTracker, summary: dict[st
         tot_odd_ready += d["odd_ready"]
         tot_empty_ret += d["empty_returns"]
         d_cartons = (d["even_cartons"] + d["odd_cartons"]) or ((d["even_ready"] + d["odd_ready"]) * cartons_per_pallet)
-        d_trucks = round(d_cartons / cartons_per_truck, 2)
+        if tracker.trucks:   # truck_mode: real trucks released at this dock
+            d_trucks = sum(1 for r in tracker.trucks.values() if r["dock"] == did and r["released_s"] is not None)
+        else:
+            d_trucks = round(d_cartons / cartons_per_truck, 2)
         tot_trucks_handled += d_trucks
         per_dock_rows.append([
             f"Dock {did:02d}", d["worker_code"],
@@ -3472,6 +3780,30 @@ def _build_dock_sheet(wb: Workbook, tracker: SimulationTracker, summary: dict[st
     avg_dock_cw = round(min(max(0.0, 100.0 - avg_dock_act), _pct(tot_d_cw, tot_d_cap)), 2) if tot_d_cap > 0 else 0.0
     avg_dock_pid = round(max(0.0, 100.0 - avg_dock_act - avg_dock_cw), 2) if tot_d_cap > 0 else 0.0
 
+    # Dock crew (per PERSON). The door figures above count a door as busy whether 1 or 2 people work there,
+    # so with a shared crew the people's efficiency is: (primary work at the doors + helper time) / (crew x shift).
+    pool = int(cfg.get("dock_worker_pool", 0) or 0) if cfg.get("truck_mode") else 0
+    per_door = max(1, int(cfg.get("dock_workers_per_truck", 2)))
+    n_crew = pool if pool else per_door * len(tracker.dock_order)
+    helper_s = sum(max(0.0, min(b, sim_dur) - a) for a, b in tracker.helper_spans)
+    helper_s += sum(max(0.0, sim_dur - a) for a in tracker._helper_open.values())
+    crew_busy = (tot_d_busy + helper_s) if pool else per_door * tot_d_busy
+    crew_wait = tot_d_cw if pool else per_door * tot_d_cw
+    crew_cap = max(1e-9, n_crew * sim_dur)
+    crew_idle = max(0.0, crew_cap - crew_busy - crew_wait)
+    crew_pct = _pct(crew_busy, crew_cap)
+    crew_rows = [
+        ("Nhân công Dock", "Số công nhân dock", n_crew, "#,##0",
+         f"nhóm chung cho {len(tracker.dock_order)} cửa, ai rảnh đi hỗ trợ cửa khác" if pool else f"{per_door} người cố định mỗi cửa"),
+        ("Nhân công Dock", "Tổng TG làm việc của công nhân dock", _fmt_vi_hms(crew_busy), None,
+         f"{crew_pct:.2f}% quỹ thời gian {n_crew} người | làm chính tại xe {_fmt_vi_hms(tot_d_busy)}"
+         + (f" + đi hỗ trợ {_fmt_vi_hms(helper_s)}" if pool else "")),
+        ("Nhân công Dock", "Tổng TG công nhân chờ ô & làn AGV", _fmt_vi_hms(crew_wait), None, "Có hàng nhưng đợi buffer / FloorGate"),
+        ("Nhân công Dock", "Tổng TG công nhân rảnh", _fmt_vi_hms(crew_idle), None,
+         f"{_pct(crew_idle, crew_cap):.2f}% | không có xe để dỡ hoặc hỗ trợ"),
+        ("Hiệu suất Dock", "Hiệu suất công nhân dock", crew_pct, '0.00"%"', f"= TG làm việc / ({n_crew} người x thời gian chạy)"),
+    ]
+
     shift_s = float(cfg.get("cycle_duration_s", 0) or 0)
     shift_h = shift_s / 3600.0
     run_h = float(summary.get("sim_duration_s", 0.0) or 0.0) / 3600.0
@@ -3482,6 +3814,8 @@ def _build_dock_sheet(wb: Workbook, tracker: SimulationTracker, summary: dict[st
     n_dock_agvs = sum(1 for k in tracker.agvs if k.startswith("agv_"))
     _, _, fl_d_h, fl_c_h = _agv_duty_charge_labels(cfg)
 
+    truck_mode = bool(cfg.get("truck_mode")) and bool(tracker.trucks)
+    n_odd_spots = len(cfg.get("loose_pallet_spots") or [])
     dock_inputs = [
         (
             "Lịch nhập Dock",
@@ -3492,12 +3826,18 @@ def _build_dock_sheet(wb: Workbook, tracker: SimulationTracker, summary: dict[st
             None,
         ),
         (
-            "Lịch nhập Dock",
-            "Nhịp tạo đơn Pallet Chẵn / Lẻ (1x)",
-            f"{in_even_iv:.0f}s / {'Liên tục' if tracker.continuous_mode else f'{in_odd_iv:.0f}s'}",
-            None,
-            f"giây/pallet | Kế hoạch ca ({shift_h:.2f}h): {in_target} pallet chẵn vào AS/RS; Pallet lẻ cấp liên tục theo ô T1",
-            None,
+            ("Lịch nhập Dock", "Lịch xe tải (1x)",
+             f"{cfg.get('inbound_trucks_per_day', 60)} xe/ngày, {float(cfg.get('inbound_truck_interval_s', 480)):.0f}s/xe",
+             None,
+             f"{cfg.get('inbound_cartons_per_truck', 200)} thùng/xe | Ngày: {in_target} pallet chẵn + "
+             f"{cfg.get('warehouse_inbound_odd_gt10_target', 130)} lẻ >10 + {cfg.get('warehouse_inbound_odd_lt10_target', 120)} lẻ <10 thùng/SKU",
+             None)
+            if truck_mode else
+            ("Lịch nhập Dock", "Nhịp tạo đơn Pallet Chẵn / Lẻ (1x)",
+             f"{in_even_iv:.0f}s / {'Liên tục' if tracker.continuous_mode else f'{in_odd_iv:.0f}s'}",
+             None,
+             f"giây/pallet | Kế hoạch ca ({shift_h:.2f}h): {in_target} pallet chẵn vào AS/RS; Pallet lẻ cấp liên tục theo ô T1",
+             None)
         ),
         (
             "Lịch nhập Dock",
@@ -3510,41 +3850,59 @@ def _build_dock_sheet(wb: Workbook, tracker: SimulationTracker, summary: dict[st
         (
             "Nhân công Dock",
             "Vận tốc đi bộ & Kéo pallet tại Dock",
-            f"{float(cfg.get('dock_worker_speed', 1.8)):.2f} / {float(cfg.get('dock_pallet_speed', 1.6)):.2f}",
+            (
+                f"{cfg['worker_walk_speed_range_mps'][0]:.2f}-{cfg['worker_walk_speed_range_mps'][1]:.2f}"
+                if isinstance(cfg.get("worker_walk_speed_range_mps"), (list, tuple)) and len(cfg["worker_walk_speed_range_mps"]) >= 2
+                else f"{float(cfg.get('dock_worker_speed', 0.7)):.2f}"
+            ) + f" / {float(cfg.get('dock_pallet_speed', 1.0)):.2f}",
             None,
-            "m/s | Đi bộ không tải / Kéo pallet bằng xe nâng tay",
+            "m/s | Đi bộ không tải (0.6-0.8 m/s) / Kéo pallet bằng xe nâng tay (1.0 m/s)",
             FILL_INPUT_SHUTTLE,
         ),
         (
             "Nhân công Dock",
-            "Thời gian dỡ xe tải (dock_unload_s)",
-            round(float(cfg.get("dock_unload_s", 8.0)), 2),
-            "0.00",
-            "giây/batch | Dỡ kiện hàng từ thùng xe tải xuống đệm Dock",
+            "Dỡ thùng từ xe & Xếp lên pallet",
+            (
+                f"{cfg['dock_carton_s_range'][0]:.1f} - {cfg['dock_carton_s_range'][1]:.1f}s"
+                if isinstance(cfg.get("dock_carton_s_range"), (list, tuple)) and len(cfg["dock_carton_s_range"]) >= 2
+                else f"{float(cfg.get('dock_unload_carton_s', 3.75)):.2f}s + {float(cfg.get('dock_stack_carton_s', 3.75)):.2f}s"
+            ),
+            None,
+            "giây/thùng | Phối hợp dây chuyền dỡ & xếp lên pallet; xếp đầy pallet 30 thùng mất 3 - 5 phút",
             None,
         ),
         (
             "Nhân công Dock",
-            "Thời gian quét Barcode & Nhấc/Đặt",
-            round(float(cfg.get("inbound_scan_s", 0.4)), 2),
-            "0.00",
-            f"giây/kiện | Nhấc/Đặt pallet: {float(cfg.get('dock_pick_s', 0.35)):.2f}s / {float(cfg.get('dock_place_s', 0.35)):.2f}s",
+            "Xếp pallet trống / Scan mặt pallet / Scan SKU / Cuốn màng",
+            f"{float(cfg.get('dock_stage_pallet_s', 20)):.0f} / {float(cfg.get('dock_pallet_scan_s', 10)):.0f} / "
+            f"{float(cfg.get('dock_sku_entry_s', 20)):.0f} / {float(cfg.get('dock_wrap_s', 30)):.0f}",
+            None,
+            "giây | Scan mặt pallet, scan SKU và cuốn màng chỉ với pallet chẵn",
             None,
         ),
         (
             "Phân luồng Dock",
-            f"Luồng Chẵn (Cửa Tây -> {n_pickup_bays} Ô Pickup)",
+            f"Luồng Chẵn -> {n_pickup_bays} buffer zone hàng chẵn",
             str(cfg.get("even_flow", "storage")),
             None,
-            f"luồng | Cửa 1..6 ưu tiên {n_pickup_bays} Ô Pickup -> {n_dock_agvs} AGV Forklift (Chạy {fl_d_h}h / Sạc {fl_c_h}h) vào Kho 01",
+            f"luồng | {'Loại pallet biết từ lúc xe đến, chờ đúng buffer chẵn' if truck_mode else 'Cửa 1..6 ưu tiên Ô Pickup'}"
+            f" -> {n_dock_agvs} xe nâng (Chạy {fl_d_h}h / Sạc {fl_c_h}h) đặt lên thang nhập",
             FILL_INPUT_LIFT,
         ),
         (
             "Phân luồng Dock",
-            "Luồng Lẻ (Cửa Đông -> Bàn Unpack T1)",
+            f"Luồng Lẻ -> {n_odd_spots} buffer zone hàng lẻ",
             str(cfg.get("odd_flow", "w2_spiral")),
             None,
-            f"luồng | Cửa 7..11 ưu tiên Bàn Unpack T1 -> Băng tải xoắn ({float(cfg.get('carton_conveyor_speed', 1.6)):.2f} m/s)",
+            (
+                f"luồng | Bốc lên băng chuyền {float(cfg['loose_unpack_pallet_s']):.0f} giây/pallet -> băng tải xoắn "
+                if cfg.get("loose_unpack_pallet_s")
+                else (
+                    f"luồng | Bốc lên băng chuyền {cfg['loose_unpack_s_range'][0]:.0f} - {cfg['loose_unpack_s_range'][1]:.0f} giây/thùng -> băng tải xoắn "
+                    if isinstance(cfg.get("loose_unpack_s_range"), (list, tuple)) and len(cfg["loose_unpack_s_range"]) >= 2
+                    else f"luồng | Bốc lên băng chuyền {float(cfg.get('loose_unpack_s', 4.0)):.1f} giây/thùng -> băng tải xoắn "
+                )
+            ) + f"({float(cfg.get('carton_conveyor_speed', 1.6)):.2f} m/s)",
             None,
         ),
         (
@@ -3567,7 +3925,12 @@ def _build_dock_sheet(wb: Workbook, tracker: SimulationTracker, summary: dict[st
     row = _style_section(ws4, row, 4, "1. TỔNG HỢP HOẠT ĐỘNG KHU VỰC DOCK")
     dock_kpis = [
         ("Cơ sở hạ tầng", "Số cửa Dock hoạt động", len(tracker.dock_order), "#,##0", f"Cửa Dock vật lý: {cfg.get('dock_physical_count', len(tracker.dock_order))}"),
-        ("Xe tải Dock", "Tổng số xe tải xử lý", round(tot_trucks_handled, 2), "#,##0.00", f"xe tải ({int(cartons_per_truck)} thùng/xe | 60% lẻ - 40% chẵn)"),
+        (
+            ("Xe tải Dock", "Tổng số xe tải đã giải phóng", tracker.truck_summary()["released"], "#,##0",
+             f"xe tải đã dỡ xong (đến: {tracker.truck_summary()['arrived']} xe) | chi tiết ở sheet Xe_Tai_Dock")
+            if tracker.trucks else
+            ("Xe tải Dock", "Tổng số xe tải xử lý", round(tot_trucks_handled, 2), "#,##0.00", f"xe tải ({int(cartons_per_truck)} thùng/xe | 60% lẻ - 40% chẵn)")
+        ),
         ("Pallet Chẵn", "Batch xe tải Pallet Chẵn", tot_even_batches, "#,##0", "batch xe tải chẵn"),
         ("Pallet Chẵn", "Tổng kiện chẵn quét Barcode", int(summary["dock_scanned_even"]), "#,##0", "kiện chẵn đã quét"),
         ("Pallet Chẵn", "Pallet chẵn hoàn tất tại Dock", tot_even_ready, "#,##0", f"Giao ra {n_pickup_bays} Ô Pickup: {tracker.dock_flow_stats.get('pallets_to_w1', 0)}"),
@@ -3577,12 +3940,14 @@ def _build_dock_sheet(wb: Workbook, tracker: SimulationTracker, summary: dict[st
         ("Pallet Lẻ", "Tổng kiện lẻ quét Barcode", int(summary["dock_scanned_odd"]), "#,##0", "kiện lẻ đã quét"),
         ("Pallet Lẻ", "Pallet lẻ hoàn tất tại Dock", tot_odd_ready, "#,##0", f"Sang Bàn Unpack T1: {tracker.dock_flow_stats.get('pallets_to_w2', 0)}"),
         ("Pallet Rỗng", "Tổng pallet rỗng thu hồi", tot_empty_ret, "#,##0", f"Hồi pool: {tracker.dock_flow_stats.get('empty_pallet_returns', 0)}"),
-        ("Nhân công Dock", "Tổng TG làm việc thực tế tại Dock", _fmt_vi_hms(tot_d_busy), None, f"Dỡ, quét & kéo hàng ({avg_dock_act:.2f}% quỹ thời gian)"),
-        ("Nhân công Dock", "Tổng TG có lệnh chờ ô & làn AGV", _fmt_vi_hms(tot_d_cw), None, f"FloorGate: {_fmt_vi_hms(tot_d_wait)} | Chờ ô: {_fmt_vi_hms(tot_d_slot_wait)}"),
-        ("Nhân công Dock", "Tổng TG nghỉ rảnh tại Dock", _fmt_vi_hms(tot_d_pid), None, f"TB {avg_dock_pid:.2f}% (chờ xe tải / pallet mới)"),
-        ("Hiệu suất Dock", "Tỉ lệ hoạt động TB các cửa Dock", avg_dock_act, '0.00"%"', "Đang thao tác trực tiếp (Tối đa 100%)"),
+        *crew_rows,
+        ("Cửa Dock", "Tổng TG cửa dock có người thao tác", _fmt_vi_hms(tot_d_busy), None,
+         f"{avg_dock_act:.2f}% quỹ thời gian của {len(tracker.dock_order)} cửa (tính theo cửa, không theo người)"),
+        ("Cửa Dock", "Tổng TG cửa dock chờ ô & làn AGV", _fmt_vi_hms(tot_d_cw), None, f"FloorGate: {_fmt_vi_hms(tot_d_wait)} | Chờ ô: {_fmt_vi_hms(tot_d_slot_wait)}"),
+        ("Cửa Dock", "Tổng TG cửa dock trống", _fmt_vi_hms(tot_d_pid), None, f"TB {avg_dock_pid:.2f}% (không có xe / chờ xe tải)"),
+        ("Hiệu suất Dock", "Tỉ lệ sử dụng TB các cửa Dock", avg_dock_act, '0.00"%"', "Theo cửa: thời gian có thao tác / thời gian ca"),
         ("Hiệu suất Dock", "Tỉ lệ chờ ô / làn AGV TB", avg_dock_cw, '0.00"%"', "Có hàng nhưng đợi Ô Pickup / Bàn T1 / FloorGate"),
-        ("Hiệu suất Dock", "Tỉ lệ nghỉ rảnh TB các cửa Dock", avg_dock_pid, '0.00"%"', "Trống việc (= 100% - Chạy - Chờ ô/AGV)"),
+        ("Hiệu suất Dock", "Tỉ lệ cửa Dock trống TB", avg_dock_pid, '0.00"%"', "Trống việc (= 100% - Chạy - Chờ ô/AGV)"),
         ("Traffic AGV", "Tổng TG chờ Traffic (AGV Dock)", _fmt_vi_hms(sum_dk_wait), None, "Cộng dồn từ log AGV Dock -> Kho 01"),
     ]
     row = _write_kpi_cards(
@@ -3593,15 +3958,46 @@ def _build_dock_sheet(wb: Workbook, tracker: SimulationTracker, summary: dict[st
 
     sec2_start_row = row
     row = _style_section(ws4, row, 4, "2. THÔNG SỐ CÀI ĐẶT KHU VỰC DOCK & QUÉT BARCODE")
+    _w_rng = cfg.get("worker_walk_speed_range_mps")
+    _w_spd_str = (
+        f"{float(_w_rng[0]):.2f} - {float(_w_rng[1]):.2f}"
+        if isinstance(_w_rng, (list, tuple)) and len(_w_rng) >= 2
+        else f"{float(cfg.get('dock_worker_speed', 0.7)):.2f}"
+    )
+    _dc_rng = cfg.get("dock_carton_s_range")
+    _dc_str = (
+        f"{float(_dc_rng[0]):.1f} - {float(_dc_rng[1]):.1f}"
+        if isinstance(_dc_rng, (list, tuple)) and len(_dc_rng) >= 2
+        else f"{float(cfg.get('dock_unload_carton_s', 3.75)):.2f} / {float(cfg.get('dock_stack_carton_s', 3.75)):.2f}"
+    )
+    _lu_rng = cfg.get("loose_unpack_s_range")
+    _lu_val_str = (
+        f"{float(cfg['loose_unpack_pallet_s']):.0f}"
+        if cfg.get("loose_unpack_pallet_s")
+        else (
+            f"{float(_lu_rng[0]):.1f} - {float(_lu_rng[1]):.1f}"
+            if isinstance(_lu_rng, (list, tuple)) and len(_lu_rng) >= 2
+            else f"{float(cfg.get('loose_unpack_s', 4.0)):.1f}"
+        )
+    )
+    _lu_unit_str = "giây/pallet" if cfg.get("loose_unpack_pallet_s") else "giây/thùng"
+    _lu_desc_str = (
+        f"1 công nhân bốc riêng 1 pallet | {len(cfg.get('loose_pallet_spots') or [])} chỗ buffer hàng lẻ"
+        if cfg.get("loose_unpack_pallet_s")
+        else f"~1.5 - 2.5 phút / pallet 30 thùng | {len(cfg.get('loose_pallet_spots') or [])} chỗ buffer hàng lẻ"
+    )
     dock_cfg_rows = [
         ["Số cửa Dock kích hoạt", f"{cfg.get('dock_active_count', len(tracker.dock_order))} / {cfg.get('dock_physical_count', 11)}", "cửa Dock", f"Danh sách cửa: {cfg.get('dock_active_ids', tracker.dock_order)}"],
-        ["Thời gian dỡ xe tải (dock_unload_s)", f"{float(cfg.get('dock_unload_s', 8.0)):.2f}", "giây/batch", "Thời gian công nhân dỡ hàng từ thùng xe tải"],
-        ["Vận tốc công nhân Dock (dock_worker_speed)", f"{float(cfg.get('dock_worker_speed', 1.8)):.2f}", "m/s", "Tốc độ di chuyển xe nâng tay của công nhân Dock"],
-        ["Vận tốc kéo pallet (dock_pallet_speed)", f"{float(cfg.get('dock_pallet_speed', 1.6)):.2f}", "m/s", "Tốc độ kéo pallet từ Dock ra Ô Pickup / Bàn Unpack"],
-        ["Thời gian quét Barcode (inbound_scan_s)", f"{float(cfg.get('inbound_scan_s', 0.4)):.2f}", "giây/kiện", "Quét phân loại luồng hàng Chẵn / Lẻ tại cửa Dock"],
-        ["Thao tác nhấc / đặt (pick / place)", f"{float(cfg.get('dock_pick_s', 0.35)):.2f} / {float(cfg.get('dock_place_s', 0.35)):.2f}", "giây", "Thời gian nâng và hạ pallet tại điểm nhận/trả"],
+        ["Dỡ thùng từ xe / Xếp thùng lên pallet", _dc_str, "giây/thùng", "Phối hợp dây chuyền dỡ từ xe & xếp lên pallet; đầy 1 pallet 30 thùng mất 3 - 5 phút"],
+        ["Xếp pallet trống / Scan mặt pallet", f"{float(cfg.get('dock_stage_pallet_s', 20.0)):.0f} / {float(cfg.get('dock_pallet_scan_s', 10.0)):.0f}", "giây", "Scan mặt pallet chỉ với pallet chẵn"],
+        ["Scan SKU & nhập số liệu / Cuốn màng", f"{float(cfg.get('dock_sku_entry_s', 20.0)):.0f} / {float(cfg.get('dock_wrap_s', 30.0)):.0f}", "giây", "Chỉ với pallet chẵn"],
+        ["Bốc hàng từ pallet lẻ lên băng chuyền", _lu_val_str, _lu_unit_str, _lu_desc_str],
+        ["Vận tốc công nhân Dock (dock_worker_speed)", _w_spd_str, "m/s", "Vận tốc đi bộ của công nhân & đẩy xe nâng tay không tải"],
+        ["Vận tốc kéo pallet (dock_pallet_speed)", f"{float(cfg.get('dock_pallet_speed', 1.0)):.2f}", "m/s", "Tốc độ kéo pallet có tải từ Dock ra Ô Pickup / Bàn Unpack"],
         ["AGV Forklift Khu Dock - TG chạy & Sạc", f"{fl_d_h} giờ / Sạc {fl_c_h} giờ", "giờ (1x)", f"{n_dock_agvs} xe nâng pallet ({', '.join(f'AGV-{i+1:02d}' for i in range(n_dock_agvs))}) chạy liên tục {fl_d_h}h, thời gian sạc {fl_c_h}h (120 - 180 phút)"],
-        ["Luồng phân loại (even / odd flow)", f"{cfg.get('even_flow', 'storage')} / {cfg.get('odd_flow', 'w2_spiral')}", "2 luồng", "Cửa 1..6 ưu tiên Ô Pickup (Kho AS/RS); Cửa 7..11 ưu tiên Bàn Unpack T1"],
+        ["Luồng phân loại (even / odd flow)", f"{cfg.get('even_flow', 'storage')} / {cfg.get('odd_flow', 'w2_spiral')}", "2 luồng",
+         "Loại pallet theo kế hoạch xe tải, mỗi pallet chờ đúng buffer của loại mình" if truck_mode
+         else "Cửa 1..6 ưu tiên Ô Pickup (Kho AS/RS); Cửa 7..11 ưu tiên Bàn Unpack T1"],
     ]
     row = _write_table(
         ws4, row,
@@ -3798,9 +4194,13 @@ def _build_workers_sheet(wb: Workbook, tracker: SimulationTracker, summary: dict
         (
             "Unpack T1, U1 & Z05",
             "Unpack T1 - Nhấc thùng lên băng tải",
-            round(float(cfg.get("loose_unpack_s", 1.2)), 2),
-            "0.00",
-            f"giây/thùng | {cfg.get('loose_cartons_per_pallet', 18)} thùng/pallet lẻ tại Tầng 1",
+            (
+                f"{cfg['loose_unpack_s_range'][0]:.1f} - {cfg['loose_unpack_s_range'][1]:.1f}"
+                if isinstance(cfg.get("loose_unpack_s_range"), (list, tuple)) and len(cfg["loose_unpack_s_range"]) >= 2
+                else round(float(cfg.get("loose_unpack_s", 4.0)), 2)
+            ),
+            None if (isinstance(cfg.get("loose_unpack_s_range"), (list, tuple)) and len(cfg["loose_unpack_s_range"]) >= 2) else "0.00",
+            f"giây/thùng | {cfg.get('loose_cartons_per_pallet', 30)} thùng/pallet lẻ tại Tầng 1 | Đi bộ 0.60 - 0.80 m/s",
             FILL_INPUT_SHUTTLE,
         ),
         (
@@ -3820,8 +4220,10 @@ def _build_workers_sheet(wb: Workbook, tracker: SimulationTracker, summary: dict
                 f"thùng/pallet | Mỗi {cfg.get('z05_partial_return_every', 3)} pallet xuất có 1 pallet đẩy ngược về Kho 01 "
                 f"(nằm trong tổng {int(summary.get('warehouse_outbound_tasks', 0))} lượt xuất: "
                 f"{int(summary.get('warehouse_outbound_full_tasks', summary.get('warehouse_outbound_tasks', 0)))} unpack hết & "
-                f"{int(summary.get('warehouse_outbound_partial_tasks', 0))} hoàn kho, không tính vào mục tiêu {int(cfg.get('warehouse_outbound_target', 300) or 300)} unpack hết) "
-                f"| Kéo tay: {float(cfg.get('z05_walk_speed', 2.8)):.2f} m/s"
+                f"{int(summary.get('warehouse_outbound_partial_tasks', 0))} xuất tạm, không tính vào mục tiêu {int(cfg.get('warehouse_outbound_target', 300) or 300)} unpack hết) "
+                f"| Đi bộ: {cfg['worker_walk_speed_range_mps'][0]:.2f}-{cfg['worker_walk_speed_range_mps'][1]:.2f} m/s, Kéo pallet: {float(cfg.get('dock_pallet_speed', 1.0)):.2f} m/s"
+                if isinstance(cfg.get("worker_walk_speed_range_mps"), (list, tuple)) and len(cfg["worker_walk_speed_range_mps"]) >= 2
+                else f"| Đi bộ: {float(cfg.get('z05_walk_speed', 0.7)):.2f} m/s, Kéo pallet: {float(cfg.get('dock_pallet_speed', 1.0)):.2f} m/s"
             ),
             None,
         ),
@@ -3883,18 +4285,28 @@ def _build_workers_sheet(wb: Workbook, tracker: SimulationTracker, summary: dict
 
     sec2_start_row = row
     row = _style_section(ws5, row, 4, "2. THÔNG SỐ THAO TÁC CÔNG NHÂN & BĂNG TẢI CÀI ĐẶT")
+    _w5_lu = (
+        f"{cfg['loose_unpack_s_range'][0]:.1f} - {cfg['loose_unpack_s_range'][1]:.1f}"
+        if isinstance(cfg.get("loose_unpack_s_range"), (list, tuple)) and len(cfg["loose_unpack_s_range"]) >= 2
+        else f"{float(cfg.get('loose_unpack_s', 4.0)):.2f}"
+    )
+    _w5_spd = (
+        f"{cfg['worker_walk_speed_range_mps'][0]:.2f} - {cfg['worker_walk_speed_range_mps'][1]:.2f} m/s"
+        if isinstance(cfg.get("worker_walk_speed_range_mps"), (list, tuple)) and len(cfg["worker_walk_speed_range_mps"]) >= 2
+        else f"{float(cfg.get('z05_walk_speed', 0.7)):.2f} m/s"
+    )
     wrk_cfg_rows = [
-        ["Unpack T1 - Nhấc thùng lên băng (loose_unpack_s)", f"{float(cfg.get('loose_unpack_s', 1.2)):.2f}", "giây/thùng", f"{cfg.get('loose_cartons_per_pallet', 18)} thùng/pallet lẻ"],
+        ["Unpack T1 - Nhấc thùng lên băng (loose_unpack_s)", _w5_lu, "giây/thùng", f"{cfg.get('loose_cartons_per_pallet', 30)} thùng/pallet lẻ (~1.5 - 2.5 phút/pallet)"],
         ["U1 - Mở thùng & Xếp đủ Rack (cartons/rack)", f"{float(cfg.get('u1_open_carton_s', 1.2)):.2f} / {float(cfg.get('u1_pick_box_s', 1.5)):.2f}s", "giây", f"Đủ {u1_rack_cap} khay/Rack & {trolley_cap} thùng/Trolley mới gọi AGV ({cfg.get('u1_agvs_per_floor', 2)} xe/tầng)"],
         [
-            "Zone 05 - Xe kéo tay & Hoàn kho (partial / every)",
-            f"{float(cfg.get('z05_walk_speed', 2.8)):.2f} m/s | Mỗi {cfg.get('z05_partial_return_every', 3)} pallet",
+            "Zone 05 - Đi bộ, Kéo pallet & Hoàn kho",
+            f"Đi { _w5_spd } / Kéo {float(cfg.get('dock_pallet_speed', 1.0)):.2f} m/s | Mỗi {cfg.get('z05_partial_return_every', 3)} pallet",
             "m/s | pallet",
             (
-                f"Kéo pallet từ Thang Xuất về Z05; pallet lấy không hết ({cfg.get('z05_partial_unpack_cartons', 12)}/{cfg.get('z05_cartons_per_pallet', 18)} thùng) "
+                f"Kéo pallet từ Thang Xuất về Z05; pallet lấy không hết ({cfg.get('z05_partial_unpack_cartons', 20)}/{cfg.get('z05_cartons_per_pallet', 30)} thùng) "
                 f"được đẩy ngược vào Thang Xuất hoàn Kho 01 (Thực tế tổng xuất: {int(summary.get('warehouse_outbound_tasks', 0))} = "
                 f"{int(summary.get('warehouse_outbound_full_tasks', summary.get('warehouse_outbound_tasks', 0)))} unpack hết & "
-                f"{int(summary.get('warehouse_outbound_partial_tasks', 0))} hoàn kho)"
+                f"{int(summary.get('warehouse_outbound_partial_tasks', 0))} xuất tạm)"
             ),
         ],
         ["U2 - Mở thùng & Xếp đủ Rack (cartons/rack)", f"{float(cfg.get('u2_open_carton_s', 0.6)):.2f} / {float(cfg.get('u2_pick_box_s', 0.7)):.2f}s", "giây", f"Đủ {u2_rack_cap} khay/Rack & {trolley_cap} thùng/Trolley mới gọi AGV ({cfg.get('u2_agvs_per_floor', 2)} xe/tầng)"],
@@ -4308,6 +4720,267 @@ def _build_agv_log_sheet(wb: Workbook, tracker: SimulationTracker, summary: dict
     )
 
 
+def _build_daily_sheet(wb: Workbook, tracker: SimulationTracker) -> None:
+    """Sheet Bao_Cao_Theo_Ngay: one KPI per row, average / max / min over the days and one column per day."""
+    k = tracker.daily_kpis()
+    n = k["days"]
+    ws = wb.create_sheet("Bao_Cao_Theo_Ngay", 0)
+    wb.active = 0
+    cfg = tracker.config
+    dock_people, op_people, fl_people = k["people_split"]
+    z = k["z05"]
+    pitch = float(cfg.get("carton_belt_pitch_m", 0.6) or 0.6)
+    rows: list[tuple[str, str, list[Any], str, str]] = [
+        ("Dock", "Số lượng xe xử lý / ngày", k["trucks"], "xe", "Xe đã dỡ xong thùng cuối trong ngày"),
+        ("Dock", "Thời gian giải phóng một xe tại 1 dock", k["release_min"], "phút", "TB từ lúc xe vào dock tới lúc dỡ xong thùng cuối"),
+        ("Dock", "Tổng số pallet chẵn trong một ngày", k["even_pallets"], "pallet", "Pallet chẵn đã đặt lên buffer zone hàng chẵn"),
+        ("Dock", "Tổng số pallet lẻ trong một ngày", k["odd_pallets"], "pallet", "Pallet lẻ đã đặt lên buffer zone hàng lẻ"),
+        ("Dock", "Tổng số thùng hàng trong một ngày", k["dock_cartons"], "thùng", "Thùng đã dỡ và xếp xong lên pallet tại dock"),
+        ("Dock", "Hiệu suất làm việc trong một OP", k["op_eff"], "%",
+         f"Thời gian bận / thời gian ca của {dock_people} CN dock + {op_people} CN bốc hàng lẻ"
+         + (" (CN dock: làm chính tại xe + thời gian đi hỗ trợ)" if k["pool"] else "")),
+        ("Dock", "Hiệu suất làm việc của băng tải", k["belt_eff"], "%",
+         f"Thùng lên băng / công suất {k['belt_cap_h']:,.0f} thùng/giờ (tốc độ băng / khoảng cách thùng {pitch} m)"),
+        ("Dock", "Số công nhân làm việc", k["people"], "người",
+         f"{dock_people} CN dock{' (nhóm chung, không cố định theo dock)' if k['pool'] else ''} + "
+         f"{op_people} CN bốc hàng lẻ + {fl_people} lái xe nâng"),
+        ("Dock", "Số lượng hàng băng tải vận chuyển", k["belt_cartons"], "thùng", "Thùng hàng lẻ đã đặt lên băng tải"),
+        ("Dock", "Số lần công nhân đi hỗ trợ dock khác", k["helper_joins"], "lần",
+         "CN không có xe sang dỡ / xếp cùng ở xe khác (tối đa 2 người/xe)"),
+        ("Dock", "Thời gian công nhân đi hỗ trợ", k["helper_h"], "giờ", "Cộng dồn thời gian các CN hỗ trợ trong ngày"),
+        ("Kho", "Tổng số vị trí có hàng trong kho (TB)", k["occ_avg"], "ô",
+         "TB theo thời gian, pallet động trong kho (không tính hàng minh hoạ tĩnh)"),
+        ("Kho", "Số vị trí có hàng lớn nhất", k["occ_max"], "ô", "Số pallet trong kho tại thời điểm nhiều nhất"),
+        ("Kho", "Thời điểm số hàng trong kho nhiều nhất", k["occ_max_t"], "giờ", "Giờ thứ mấy trong ca (0 = đầu ca)"),
+        ("Kho", "Năng suất nhập hàng vào kho", k["in_eff"], "%",
+         f"Pallet cất vào kho / kế hoạch {cfg.get('warehouse_inbound_target', 150)} pallet/ngày"),
+        ("Kho", "Số pallet chẵn nhập kho", k["stored"], "pallet",
+         "Pallet chẵn từ Dock đã cất vào ô kệ trong ngày (không gồm hoàn kho)"),
+        ("Kho", "Số pallet chẵn xuất kho", k["dispatched"], "pallet",
+         "Lượt shuttle lấy pallet ra khỏi kho trong ngày (gồm cả pallet đã hoàn kho được xuất lại)"),
+        ("Kho", "Số pallet hoàn kho", k["returned"], "pallet",
+         "Pallet cất lại vào kho: hàng dư từ Zone 05 + pallet gom hàng lẻ"),
+        ("Kho", "Pallet tồn ngày tiếp theo", k["end_pallets"], "pallet",
+         "Số pallet còn trên ô kệ lúc hết ca, chuyển sang ngày sau"),
+        ("Kho", "Hàng tồn ngày tiếp theo", k["end_cartons"], "thùng",
+         f"Thùng trên các pallet tồn: pallet đầy tính {k['per_full']} thùng, pallet hàng dư Z05 tính {k['per_partial']} thùng"),
+        ("Kho", "Số hàng xuất sang tầng 1 zone 05", z[1], "thùng", "Thùng đã bóc tại Zone 05 tầng 1"),
+        ("Kho", "Số hàng xuất sang tầng 2 zone 05", z[2], "thùng", "Thùng đã bóc tại Zone 05 tầng 2"),
+        ("Kho", "Số hàng xuất sang tầng 3 zone 05", z[3], "thùng", "Thùng đã bóc tại Zone 05 tầng 3"),
+        ("Kho", "Số hàng xuất sang tầng 4 zone 05", z[4], "thùng", "Thùng đã bóc tại Zone 05 tầng 4"),
+        *[("Kho", f"Số hàng chẵn được xuất sang tầng {fl}", k["z05_even"][fl], "thùng",
+           f"Thùng của pallet chẵn (nhập từ Dock / tồn đầu) đã bóc tại Zone 05 tầng {fl}; không gồm pallet gom hàng lẻ")
+          for fl in (1, 2, 3, 4)],
+        *[("Kho", f"Số hàng lẻ tầng {fl} hoàn về kho", k["odd_back"][fl], "thùng",
+           f"Thùng lẻ gom tại tầng {fl} đã cất lại vào kho tự động trong ngày")
+          for fl in (1, 2, 3, 4)],
+        ("Kho", "Số thùng hàng lẻ hoàn kho", k["odd_ret_cartons"], "thùng",
+         f"Thùng lẻ không unpack tại tầng, để riêng chờ hoàn kho (mục tiêu {float(cfg.get('odd_return_ratio', 0)) * 100:.0f}%)"),
+        ("Kho", "Tỷ lệ hoàn kho hàng lẻ", k["odd_ret_pct"], "%", "Thùng lẻ hoàn kho / thùng lẻ lên băng tải"),
+        ("Kho", "Số pallet hàng lẻ hoàn kho", k["odd_ret_pallets"], "pallet",
+         f"Pallet {cfg.get('odd_return_cartons_per_pallet', 30)} thùng đã cất lại vào kho tự động"),
+        ("Kho", "Số lượng 4 Way-Shuttle vận hành", k["shuttles"], "xe", "9 xe làm việc (1 xe/tầng) + 1 xe dự phòng"),
+        ("Kho", "Hiệu suất của 4 Way-Shuttle", k["sh_eff"], "%", "Thời gian bận / thời gian ca, TB các shuttle"),
+        ("Kho", "Số lượng chu trình vận hành", k["cycles"], "chu trình", "Nhiệm vụ kho hoàn thành (nhập + xuất + hoàn kho)"),
+        ("Kho", "Tổng thời gian chu trình một ngày", k["cycle_h"], "giờ", "Cộng dồn thời gian các chu trình hoàn thành trong ngày"),
+    ]
+    full = k["full_days"]
+    last_col = 7 + n + 1
+    green = PatternFill("solid", fgColor="92D050")
+    area_fill = {"Dock": PatternFill("solid", fgColor="FFFF00"), "Kho": PatternFill("solid", fgColor="FFC000")}
+    bold = Font(name="Calibri", size=11, bold=True)
+    body = Font(name="Calibri", size=11)
+    center = Alignment(horizontal="center", vertical="center", wrap_text=True)
+    left = Alignment(horizontal="left", vertical="center", wrap_text=True)
+
+    ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=last_col)
+    ws.cell(row=1, column=1, value=f"BÁO CÁO KPI THEO NGÀY - {n} ngày x {tracker.day_s / 3600:.0f} giờ "
+            f"(TB / Max / min tính trên {full if full else n} ngày {'đủ ca' if full else 'đã chạy'})").font = Font(bold=True, size=13)
+    for c1, c2, text in ((1, 1, "STT"), (2, 2, "Khu vực"), (3, 3, "Hạng mục"), (7, 7, "Đơn vị"), (last_col, last_col, "Cách tính")):
+        ws.merge_cells(start_row=2, start_column=c1, end_row=3, end_column=c2)
+        ws.cell(row=2, column=c1, value=text)
+    ws.merge_cells(start_row=2, start_column=4, end_row=2, end_column=6)
+    ws.cell(row=2, column=4, value="Giá trị")
+    ws.merge_cells(start_row=2, start_column=8, end_row=2, end_column=7 + n)
+    ws.cell(row=2, column=8, value="Ngày")
+    for c, text in ((4, "TB"), (5, "Max"), (6, "min")):
+        ws.cell(row=3, column=c, value=text)
+    for d in range(n):
+        ws.cell(row=3, column=8 + d, value=d + 1)
+    for r in (2, 3):
+        for c in range(1, last_col + 1):
+            cell = ws.cell(row=r, column=c)
+            cell.fill = green; cell.font = bold; cell.alignment = center; cell.border = THIN_BORDER
+
+    r0 = 4
+    for i, (area, label, vals, unit, note) in enumerate(rows):
+        r = r0 + i
+        stats_vals = [v for v in (vals[:full] if full else vals) if v is not None]
+        avg = round(sum(stats_vals) / len(stats_vals), 2) if stats_vals else None
+        vmax = max(stats_vals) if stats_vals else None
+        vmin = min(stats_vals) if stats_vals else None
+        line = [i + 1, area, label, avg, vmax, vmin, unit, *vals, note]
+        for c, v in enumerate(line, 1):
+            cell = ws.cell(row=r, column=c, value=v)
+            cell.font = body; cell.border = THIN_BORDER
+            cell.alignment = left if c in (3, last_col) else center
+            if isinstance(v, float):
+                cell.number_format = "0.00"
+            elif isinstance(v, int) and c > 3:
+                cell.number_format = "#,##0"
+    for area in ("Dock", "Kho"):
+        idx = [r0 + i for i, row in enumerate(rows) if row[0] == area]
+        if idx:
+            ws.merge_cells(start_row=idx[0], start_column=2, end_row=idx[-1], end_column=2)
+            cell = ws.cell(row=idx[0], column=2)
+            cell.fill = area_fill[area]; cell.font = bold; cell.alignment = center
+    ws.column_dimensions["A"].width = 6
+    ws.column_dimensions["B"].width = 12
+    ws.column_dimensions["C"].width = 42
+    for c in range(4, 8 + n):
+        ws.column_dimensions[get_column_letter(c)].width = 10
+    ws.column_dimensions[get_column_letter(last_col)].width = 70
+    ws.freeze_panes = "D4"
+
+
+def _build_notes_sheet(wb: Workbook, tracker: SimulationTracker) -> None:
+    """Sheet Ghi_Chu_Kich_Ban: the scenario rules this run used (from config.json), for readers of the report."""
+    cfg = tracker.config
+    ws = wb.create_sheet("Ghi_Chu_Kich_Ban", 1)
+    day_h = tracker.day_s / 3600.0
+    iv = float(cfg.get("inbound_truck_interval_s", 420) or 420)
+    trucks = int(cfg.get("inbound_trucks_per_day", 60))
+    pool = int(cfg.get("dock_worker_pool", 0) or 0)
+    ratio = float(cfg.get("odd_return_ratio", 0) or 0) * 100
+    per = int(cfg.get("odd_return_cartons_per_pallet", 30))
+    notes = [
+        ("Ca làm việc", f"Mỗi ngày 1 ca {day_h:.0f} giờ; các ngày chạy nối tiếp, không reset hàng (tồn kho, pallet, xe chưa xong "
+                        "chuyển sang ngày sau). Cuối mỗi ca AGV và shuttle được sạc đầy 100% cho ca sau."),
+        ("1. Lịch xe tải", f"{trucks} xe/ngày, đến đều {iv / 60:.0f} phút/xe từ đầu ca (xe cuối đến lúc "
+                           f"{(trucks - 1) * iv / 3600:.2f} giờ trong ca), {cfg.get('inbound_cartons_per_truck', 200)} thùng/xe trộn chẵn và lẻ. "
+                           "Xe vào dock trống bất kỳ trong 11 dock; xe được giải phóng khi thùng cuối đã dỡ khỏi xe."),
+        ("2. Công nhân dock", f"{pool} công nhân dùng chung cho 11 dock, không cố định theo dock. Mỗi xe có 1 người chính; "
+                              "người không có xe sang hỗ trợ xe khác (tối đa 2 người/xe vì mỗi xe có 2 handlift): cùng dỡ và xếp "
+                              "thùng, và tiếp tục dỡ trong lúc người chính kéo pallet ra buffer zone. Khi có xe mới vào mà "
+                              "không còn người rảnh, người đang hỗ trợ rời đi sau khi xong pallet đang làm."
+                              if pool else "Mỗi dock cố định 2 công nhân."),
+        ("3. Hoàn kho hàng lẻ", f"{ratio:.0f}% số thùng hàng lẻ (tính theo số thùng) không unpack hết tại các tầng: được để riêng, "
+                                "rồi công nhân Zone 05 xếp lên pallet trống tại khu unpack sau khi đã unpack xong hàng chẵn từ kho "
+                                f"(chờ tối đa 30 phút), {float(cfg.get('odd_return_stack_carton_s', 5)):.0f} giây/thùng."),
+        ("4. Pallet lẻ hoàn kho", f"Mỗi pallet hoàn kho chứa {per} thùng, đi ngược qua băng tải ra, thang xuất và shuttle vào kho "
+                                  "tự động, trở thành tồn kho và có thể được xuất lại sang Zone 05 như pallet khác."),
+        ("Tồn kho & lệnh xuất", f"Tồn đầu {cfg.get('initial_outbound_pallets', 0)} pallet (không gồm hàng minh hoạ tĩnh trong 3D). "
+                               f"Mục tiêu xuất {cfg.get('warehouse_outbound_target', 300)} pallet unpack hết/ca; lệnh xuất phát khi Zone 05 có ô trống."),
+        ("Pallet chẵn unpack dở", f"Cứ {cfg.get('z05_partial_return_every', 5)} pallet xuất có 1 pallet xuất tạm: chỉ unpack "
+                                  f"{cfg.get('z05_partial_unpack_cartons', 20)}/{cfg.get('z05_cartons_per_pallet', 30)} thùng, phần còn lại hoàn về kho tự động. Khi pallet đó được xuất lại, "
+                                  "Zone 05 chỉ unpack đúng số thùng còn trên pallet."),
+        ("Cách đọc số liệu", "Nhiệm vụ shuttle = Nhập (từ Dock) + Xuất (gồm xuất tạm) + Hoàn kho (hàng dư Z05 + pallet gom hàng lẻ). "
+                             "Số liệu theo 'cửa dock' khác số liệu theo 'công nhân': 11 cửa dùng chung một nhóm công nhân."),
+        ("Thời gian dock (Excel)", (
+            f"Dỡ từ xe & xếp lên pallet "
+            + (f"{cfg['dock_carton_s_range'][0]:.0f} - {cfg['dock_carton_s_range'][1]:.0f}"
+               if isinstance(cfg.get("dock_carton_s_range"), (list, tuple)) and len(cfg["dock_carton_s_range"]) >= 2
+               else f"{float(cfg.get('dock_unload_carton_s', 3.75)) + float(cfg.get('dock_stack_carton_s', 3.75)):.1f}")
+            + f" giây/thùng (~3 - 5 phút / pallet 30 thùng); xếp pallet trống {float(cfg.get('dock_stage_pallet_s', 20)):.0f} giây; "
+            + f"pallet chẵn thêm scan mặt {float(cfg.get('dock_pallet_scan_s', 10)):.0f} giây, scan SKU {float(cfg.get('dock_sku_entry_s', 20)):.0f} giây, "
+            + f"cuốn màng {float(cfg.get('dock_wrap_s', 30)):.0f} giây; bốc hàng từ pallet lẻ lên băng chuyền "
+            + (f"{float(cfg['loose_unpack_pallet_s']):.0f} giây/pallet"
+               if cfg.get("loose_unpack_pallet_s")
+               else (f"{cfg['loose_unpack_s_range'][0]:.0f} - {cfg['loose_unpack_s_range'][1]:.0f} giây/thùng"
+                     if isinstance(cfg.get("loose_unpack_s_range"), (list, tuple)) and len(cfg["loose_unpack_s_range"]) >= 2
+                     else f"{float(cfg.get('loose_unpack_s', 4.0)):.1f} giây/thùng"))
+            + f"; vận tốc đi bộ công nhân 0.6 - 0.8 m/s, kéo pallet {float(cfg.get('dock_pallet_speed', 1.0)):.1f} m/s."
+        )),
+        ("Giới hạn mô hình", "Công nhân dock và xe tải trong 3D chỉ hiện ở dock đang có xe (công nhân chuyển dock không có cảnh đi bộ). "
+                             "Vị trí kho tự động là ô minh hoạ (không kiểm tra trùng ô). Hàng minh hoạ tĩnh trong kho không được tính."),
+    ]
+    ws.merge_cells("A1:B1")
+    ws["A1"] = "GHI CHÚ KỊCH BẢN MÔ PHỎNG"
+    ws["A1"].font = Font(bold=True, size=13)
+    _write_table(ws, 3, ["Nội dung", "Ghi chú"], [list(n) for n in notes], auto_filter=False)
+    ws.column_dimensions["A"].width = 24
+    ws.column_dimensions["B"].width = 140
+    for r in range(4, 4 + len(notes)):
+        ws.cell(row=r, column=2).alignment = Alignment(wrap_text=True, vertical="center")
+        ws.row_dimensions[r].height = 48
+
+
+def _build_truck_sheet(wb: Workbook, tracker: SimulationTracker) -> None:
+    """Sheet Xe_Tai_Dock (truck_mode): trucks per day, time to free a truck, odd pallet types, truck log."""
+    if not tracker.trucks:
+        return
+    ws = wb.create_sheet("Xe_Tai_Dock")
+    cfg = tracker.config
+    ts = tracker.truck_summary()
+    row = _style_banner(
+        ws, 1, 12,
+        "BÁO CÁO XE TẢI NHẬP HÀNG KHU DOCK (ZONE 03 INBOUND)",
+        f"Kế hoạch: {cfg.get('inbound_trucks_per_day', 60)} xe/ngày x {cfg.get('inbound_cartons_per_truck', 200)} thùng/xe, "
+        f"xe đến cách nhau {float(cfg.get('inbound_truck_interval_s', 480)):.0f} giây. "
+        "Xe được giải phóng khi thùng cuối cùng đã dỡ khỏi xe.",
+    )
+
+    def hms(v: float) -> str:
+        return _fmt_vi_hms(v)
+
+    row = _style_section(ws, row, 4, "1. TỔNG HỢP XE TẢI")
+    w_avg, w_min, w_max = ts["wait_s"]
+    u_avg, u_min, u_max = ts["unload_s"]
+    r_avg, r_min, r_max = ts["release_s"]
+    summary_rows = [
+        ["Số xe đã đến", ts["arrived"], "xe", ""],
+        ["Số xe đã giải phóng (dỡ xong)", ts["released"], "xe", ""],
+        ["Số xe đang dỡ tại dock lúc kết thúc", ts["at_dock"], "xe", ""],
+        ["Số xe đang chờ dock lúc kết thúc", ts["waiting"], "xe", ""],
+        ["Thời gian chờ dock (TB / min / max)", f"{hms(w_avg)} / {hms(w_min)} / {hms(w_max)}", "giờ:phút:giây", "Từ lúc xe đến tới lúc xe vào dock"],
+        ["Thời gian dỡ tại dock (TB / min / max)", f"{hms(u_avg)} / {hms(u_min)} / {hms(u_max)}", "giờ:phút:giây", "Từ lúc vào dock tới lúc dỡ xong thùng cuối"],
+        ["Thời gian giải phóng 1 xe (TB / min / max)", f"{hms(r_avg)} / {hms(r_min)} / {hms(r_max)}", "giờ:phút:giây", "Từ lúc xe đến tới lúc xe được giải phóng"],
+    ]
+    row = _write_table(ws, row, ["Chỉ tiêu", "Giá trị", "Đơn vị", "Diễn giải"], summary_rows, center_cols={2, 3}, auto_filter=False)
+    row += 1
+
+    row = _style_section(ws, row, 4, "2. XE TẢI THEO NGÀY")
+    day_rows = [[f"Ngày {d}", v["arrived"], v["released"], v["arrived"] - v["released"]] for d, v in ts["per_day"].items()]
+    row = _write_table(ws, row, ["Ngày", "Xe đến", "Xe đã giải phóng", "Xe chưa xong"], day_rows,
+                       col_formats={2: "#,##0", 3: "#,##0", 4: "#,##0"}, right_cols={2, 3, 4}, auto_filter=False)
+    row += 1
+
+    row = _style_section(ws, row, 4, "3. PALLET LẺ THEO LOẠI (ĐÃ ĐẶT LÊN BUFFER HÀNG LẺ)")
+    ot = tracker.odd_types
+    odd_rows = [
+        ["Pallet lẻ > 10 thùng/SKU (3-5 SKU)", ot.get("gt10", {}).get("pallets", 0), ot.get("gt10", {}).get("cartons", 0),
+         int(cfg.get("warehouse_inbound_odd_gt10_target", 130))],
+        ["Pallet lẻ < 10 thùng/SKU (3-5 SKU)", ot.get("lt10", {}).get("pallets", 0), ot.get("lt10", {}).get("cartons", 0),
+         int(cfg.get("warehouse_inbound_odd_lt10_target", 120))],
+    ]
+    row = _write_table(ws, row, ["Loại pallet lẻ", "Số pallet", "Số thùng", "Kế hoạch / ngày"], odd_rows,
+                       col_formats={2: "#,##0", 3: "#,##0", 4: "#,##0"}, right_cols={2, 3, 4}, auto_filter=False)
+    row += 1
+
+    row = _style_section(ws, row, 12, "4. NHẬT KÝ TỪNG XE TẢI")
+    log_rows = []
+    for r in sorted(tracker.trucks.values(), key=lambda x: x["truck_id"]):
+        docked, rel = r["docked_s"], r["released_s"]
+        log_rows.append([
+            f"XE-{r['truck_id'] + 1:04d}", r["day"], f"Dock {r['dock']:02d}" if r["dock"] is not None else "-",
+            hms(r["arrival_s"]), hms(docked) if docked is not None else "-", hms(rel) if rel is not None else "-",
+            hms(docked - r["arrival_s"]) if docked is not None else "-",
+            hms(rel - docked) if (rel is not None and docked is not None) else "-",
+            hms(rel - r["arrival_s"]) if rel is not None else "-",
+            r["even_pallets"], r["odd_gt10_pallets"], r["odd_lt10_pallets"],
+        ])
+    _write_table(
+        ws, row,
+        ["Mã xe", "Ngày", "Cửa dock", "Giờ đến", "Giờ vào dock", "Giờ giải phóng", "Chờ dock", "Dỡ tại dock",
+         "Thời gian giải phóng", "Pallet chẵn", "Lẻ >10 thùng/SKU", "Lẻ <10 thùng/SKU"],
+        log_rows,
+        col_formats={10: "#,##0", 11: "#,##0", 12: "#,##0"},
+        right_cols={10, 11, 12}, center_cols={1, 2, 3},
+    )
+    for col, width in zip("ABCDEFGHIJKL", (34, 16, 14, 16, 16, 16, 14, 14, 18, 12, 16, 16)):
+        ws.column_dimensions[col].width = width
+
+
 def export_excel(
     tracker: SimulationTracker,
     output_dir: str | Path,
@@ -4322,7 +4995,8 @@ def export_excel(
     timestamped_path = out_dir / f"Bao_Cao_Kho_Long_Chau_{stamp}.xlsx"
     latest_path = out_dir / "Bao_Cao_Moi_Nhat.xlsx"
     sim_dur = max(0.0, tracker.sim_duration_s)
-    speed_x = float(tracker.config.get("speed_multiplier", 1.0) or 1.0)
+    wall = float(summary.get("wall_duration_s", 0.0) or 0.0)
+    speed_x = float(summary.get("sim_duration_s", 0.0)) / wall if wall > 0 else float(tracker.config.get("speed_multiplier", 1.0) or 1.0)
     tf = tracker.traffic_stats
     engine_ticks = max(1, int(tf.get("engine_ticks", 0) or 0))
 
@@ -4331,14 +5005,29 @@ def export_excel(
     _build_asrs_sheet(wb, tracker, summary)
     _build_agv_sheet(wb, tracker, summary, tf, engine_ticks)
     _build_dock_sheet(wb, tracker, summary, sim_dur)
+    _build_truck_sheet(wb, tracker)
+    _build_daily_sheet(wb, tracker)
+    _build_notes_sheet(wb, tracker)
     _build_workers_sheet(wb, tracker, summary, sim_dur)
     _build_agv_log_sheet(wb, tracker, summary)
 
     import threading
-    for target in (timestamped_path, latest_path):
-        tmp_path = out_dir / f".{target.name}.{os.getpid()}.{threading.get_ident()}.tmp"
-        wb.save(tmp_path)
-        os.replace(tmp_path, target)
+    suffix = f".{os.getpid()}.{threading.get_ident()}.tmp"
+    ts_tmp = out_dir / f".{timestamped_path.name}{suffix}"
+    latest_tmp = out_dir / f".{latest_path.name}{suffix}"
+    try:
+        wb.save(ts_tmp)                       # serialise the workbook once ...
+        shutil.copyfile(ts_tmp, latest_tmp)   # ... and copy the bytes for the "latest" name
+        os.replace(ts_tmp, timestamped_path)
+        try:
+            os.replace(latest_tmp, latest_path)
+        except PermissionError:
+            # Bao_Cao_Moi_Nhat.xlsx is open in Excel (Windows file lock): keep the timestamped report instead of
+            # failing the export and losing the run's results.
+            print(f"[CẢNH BÁO] {latest_path.name} đang mở nên không ghi đè được; báo cáo đã lưu ở {timestamped_path.name}", flush=True)
+    finally:
+        ts_tmp.unlink(missing_ok=True)
+        latest_tmp.unlink(missing_ok=True)
     return {
         "timestamped": str(timestamped_path),
         "latest": str(latest_path),
